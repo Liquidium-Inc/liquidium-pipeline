@@ -23,6 +23,7 @@ use crate::{
     swappers::model::SwapRequest,
 };
 
+mod bridge_back;
 mod bridge_out;
 mod flow;
 mod operator;
@@ -88,6 +89,30 @@ pub(super) fn registry() -> Arc<TokenRegistry> {
         (ckbtc().asset_id(), ckbtc()),
         (cketh().asset_id(), cketh()),
     ])))
+}
+
+/// A leg saved before the receive chain existed paid out on Ethereum.
+#[test]
+fn an_older_saved_leg_receives_on_ethereum() {
+    let mut saved = serde_json::to_value(state_at(RiftStep::Order)).unwrap();
+    saved.as_object_mut().unwrap().remove("receive_chain");
+    saved["order"].as_object_mut().unwrap().remove("to_address");
+
+    let state: RiftState = serde_json::from_value(saved).unwrap();
+
+    assert_eq!(state.receive_chain(), Ok(RiftChain::Ethereum));
+    assert_eq!(state.order.unwrap().to_address, None);
+}
+
+/// A state at `step` for a leg that pays ckUSDT and receives ckBTC on Bitcoin.
+pub(super) fn state_receiving_ckbtc(step: RiftStep) -> RiftState {
+    let mut state = state_at(step);
+    state.size_in = ChainTokenAmount::from_raw(ckusdt(), Nat::from(100_010_000u64));
+    state.final_asset = ckbtc();
+    state.receive_chain = "bitcoin".to_string();
+    state.pay_symbol = "USDT".to_string();
+    state.receive_symbol = "BTC".to_string();
+    state
 }
 
 /// A bridge whose withdrawal of `asset` keeps `source_fee` back, takes
@@ -215,6 +240,7 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
         final_asset: ckusdt(),
         final_destination: Principal::anonymous().to_text(),
         pay_chain: "ethereum".to_string(),
+        receive_chain: "ethereum".to_string(),
         pay_symbol: "USDC".to_string(),
         receive_symbol: "USDT".to_string(),
         amount_in: ChainTokenAmount::from_formatted(ckusdc(), 100.0),
@@ -234,6 +260,7 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
             wait_since_ts: None,
             delivered_at_ts: None,
             refund_tx: None,
+            to_address: None,
         }),
         funding: None,
         funding_txid: None,

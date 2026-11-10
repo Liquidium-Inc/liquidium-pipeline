@@ -57,6 +57,9 @@ pub struct RiftOrderRecord {
     /// The refund transaction an operator confirmed. It ends the leg.
     #[serde(default)]
     pub refund_tx: Option<String>,
+    /// Where Rift pays out, as the order was created.
+    #[serde(default)]
+    pub to_address: Option<String>,
 }
 
 fn ethereum() -> String {
@@ -75,8 +78,11 @@ pub struct RiftState {
     /// The chain Rift takes the pay asset on: `ethereum` or `bitcoin`.
     #[serde(default = "ethereum")]
     pub pay_chain: String,
-    /// The symbols on each side of Rift, `USDC` -> `USDT`. The payout is
-    /// always on Ethereum.
+    /// The chain Rift pays out on. Ethereum pays the bridge EVM wallet;
+    /// Bitcoin pays the ckBTC minter's address for the final account.
+    #[serde(default = "ethereum")]
+    pub receive_chain: String,
+    /// The symbols on each side of Rift, `USDC` -> `USDT`.
     pub pay_symbol: String,
     pub receive_symbol: String,
     /// What the order asks for, in the pay asset's units: the expected
@@ -124,6 +130,11 @@ impl RiftState {
     /// The chain the pay asset is on, as the leg saved it.
     pub(super) fn pay_chain(&self) -> Result<RiftChain, VenueStepError> {
         RiftChain::parse(&self.pay_chain)
+    }
+
+    /// The chain Rift pays out on, as the leg saved it.
+    pub(super) fn receive_chain(&self) -> Result<RiftChain, VenueStepError> {
+        RiftChain::parse(&self.receive_chain)
     }
 
     /// Records side costs, replacing any earlier entry with the same label.

@@ -95,8 +95,20 @@ Defined in `connectors/src/backend/bridge_backend/mod.rs`:
   reimbursement cancels only once `Reimbursed`, when the ckBTC is back on the
   account; `WillReimburse` and `AmountTooLow` wait.
 
+The same backend serves `BTC@BTC -> ckBTC`, the deposit side, for a payer that
+pays the minter directly:
+
+- `deposit_address` gives the minter's address for the final ICP account.
+- `track_deposit` with the Bitcoin transaction as the receipt calls
+  `update_balance`: a mint paid by that transaction is `Accepted` under
+  `ckbtc-mint:<block>:<txid>`; a deposit still confirming is `NotYet`; a
+  quarantined or dust deposit is `Held`, which only an operator moves.
+- `get_bridge_status` on a mint handle reads the ledger block and returns
+  `Minted` with the amount and the account.
+- The fee budget's destination fee is the minter's check fee.
+
 `RoutedBridgeBackend` sends `ckBTC@ICP` and `BTC@BTC` requests, and `ckbtc-`
-handles, to this backend. `BTC@BTC -> ckBTC` is not served yet.
+handles, to this backend.
 
 ## Startup wiring
 

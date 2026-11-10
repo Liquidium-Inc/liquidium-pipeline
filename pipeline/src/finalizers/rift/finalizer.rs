@@ -7,6 +7,7 @@ use candid::{Nat, Principal};
 
 use super::chain::RiftChain;
 pub use super::chain::RiftRefundAddresses;
+use crate::finalizers::bridge_planner::bridge_destination;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::BridgeRouteSpec,
     rift_backend::{RiftBackend, RiftError, RiftVenueLists},
@@ -87,6 +88,38 @@ pub(super) fn decimal_text(amount: &ChainTokenAmount) -> String {
     }
 }
 
+/// The chain and symbol Rift knows a ck asset by.
+pub(super) fn rift_asset(asset: &ChainToken) -> Option<(RiftChain, &'static str)> {
+    let symbol = asset.symbol();
+    RIFT_ASSETS
+        .iter()
+        .find(|(ck, _, _)| ck.eq_ignore_ascii_case(&symbol))
+        .map(|(_, chain, symbol)| (*chain, *symbol))
+}
+
+/// The two bridge routes of a leg: the pay asset out to its chain, and
+/// the delivered asset back from its chain to its ck form.
+pub(super) fn leg_routes(
+    pay: &ChainToken,
+    receive: &ChainToken,
+) -> Result<(&'static BridgeRouteSpec, &'static BridgeRouteSpec), String> {
+    let (_, pay_symbol) = rift_asset(pay).ok_or_else(|| format!("Rift does not carry {}", pay.symbol()))?;
+    let (receive_chain, receive_symbol) =
+        rift_asset(receive).ok_or_else(|| format!("Rift does not deliver {}", receive.symbol()))?;
+    if pay_symbol == receive_symbol {
+        return Err(format!("Rift cannot swap {} for itself", pay.symbol()));
+    }
+    let out = out_route(pay, pay_symbol)?;
+    let chain = receive_chain.catalog_chain();
+    let back = in_route(receive_symbol, chain, &receive.symbol()).ok_or_else(|| {
+        format!(
+            "bridge route not found for {receive_symbol}@{chain} -> {}",
+            receive.symbol()
+        )
+    })?;
+    Ok((out, back))
+}
+
 pub struct RiftVenueFinalizer<R: RiftBackend> {
     pub(super) backend: Arc<R>,
     pub(super) bridge: Arc<BridgeRuntime>,
@@ -143,47 +176,22 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         self
     }
 
-    /// Where Rift delivers: the bridge EVM wallet, which the leg back signs from.
-    pub(super) fn delivery_address(&self) -> &str {
-        &self.bridge.sources.evm
-    }
-
-    /// The chain and symbol Rift knows a ck asset by.
-    pub(super) fn rift_asset(asset: &ChainToken) -> Option<(RiftChain, &'static str)> {
-        let symbol = asset.symbol();
-        RIFT_ASSETS
-            .iter()
-            .find(|(ck, _, _)| ck.eq_ignore_ascii_case(&symbol))
-            .map(|(_, chain, symbol)| (*chain, *symbol))
-    }
-
-    /// The two bridge routes of a leg: the pay asset out to its chain, and
-    /// the delivered asset back from Ethereum to its ck form.
-    pub(super) fn leg_routes(
-        pay: &ChainToken,
-        receive: &ChainToken,
-    ) -> Result<(&'static BridgeRouteSpec, &'static BridgeRouteSpec), String> {
-        let (_, pay_symbol) = Self::rift_asset(pay).ok_or_else(|| format!("Rift does not carry {}", pay.symbol()))?;
-        let (receive_chain, receive_symbol) =
-            Self::rift_asset(receive).ok_or_else(|| format!("Rift does not deliver {}", receive.symbol()))?;
-        if receive_chain != RiftChain::PAYOUT {
-            return Err(format!(
-                "Rift delivers only to Ethereum in this build, not {} on {}",
-                receive.symbol(),
-                receive_chain.name()
-            ));
+    /// Where Rift pays out. On Ethereum, the bridge EVM wallet, which the leg
+    /// back signs from. On Bitcoin, the ckBTC minter's address for the final
+    /// account, so the payout mints straight into it.
+    pub(super) async fn delivery_address(&self, state: &RiftState) -> Result<String, VenueStepError> {
+        match state.receive_chain()? {
+            RiftChain::Ethereum => Ok(self.bridge.sources.evm.clone()),
+            RiftChain::Bitcoin => {
+                let back = leg_routes(&state.size_in.token, &state.final_asset)?.1;
+                let destination = bridge_destination(back.destination_kind, &state.final_destination)?;
+                self.bridge
+                    .backend
+                    .deposit_address(back.source_asset, back.source_chain, &destination)
+                    .await
+                    .map_err(VenueStepError::Other)
+            }
         }
-        if pay_symbol == receive_symbol {
-            return Err(format!("Rift cannot swap {} for itself", pay.symbol()));
-        }
-        let out = out_route(pay, pay_symbol)?;
-        let back = in_route(receive_symbol, "ETH", &receive.symbol()).ok_or_else(|| {
-            format!(
-                "bridge route not found for {receive_symbol}@ETH -> {}",
-                receive.symbol()
-            )
-        })?;
-        Ok((out, back))
     }
 
     pub(super) async fn advance_current_step(&self, state: &mut RiftState) -> Result<(), VenueStepError> {

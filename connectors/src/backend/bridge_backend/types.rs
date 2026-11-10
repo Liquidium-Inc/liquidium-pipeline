@@ -179,6 +179,9 @@ pub enum DepositNotice {
     Accepted(BridgeSubmission),
     /// The provider does not track it yet. Asking again is safe.
     NotYet { reason: String },
+    /// The provider holds the deposit and will not mint it on its own.
+    /// Only an operator, with the provider's support, moves it.
+    Held { reason: String },
 }
 
 /// High-level bridge lifecycle state from the provider/backend.
@@ -309,6 +312,18 @@ pub trait BridgeBackend: Send + Sync {
 
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError>;
+
+    /// The provider's deposit address for `destination` on a route that
+    /// watches an address, so a third party can pay the route directly.
+    async fn deposit_address(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+    ) -> Result<String, String> {
+        let _ = (asset, chain, destination);
+        Err("deposit addresses are not supported by this bridge backend".to_string())
+    }
 
     /// Checks a request and signs the send that funds it, without sending it.
     /// The outbound driver sends it, then the caller gives `track_deposit` its receipt.

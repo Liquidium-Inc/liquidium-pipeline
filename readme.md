@@ -912,7 +912,7 @@ Every Kraken order is IOC at its price limit. Kraken keeps no caller id for a wi
 
 ## Rift Venue
 
-[Rift](https://www.rift.trade) swaps one asset for another across chains and pays an address. It has no account and no order book, so it is a fallback for ckUSDC, ckUSDT, ckETH and ckBTC when MEXC's book is thin; it carries no ICP. The payout is always on Ethereum, so ckBTC is a pay asset only. Add `rift` to `ENABLED_SWAP_VENUES`; the planner asks MEXC first, Rift next, then Kraken.
+[Rift](https://www.rift.trade) swaps one asset for another across chains and pays an address. It has no account and no order book, so it is a fallback for ckUSDC, ckUSDT, ckETH and ckBTC when MEXC's book is thin; it carries no ICP. Add `rift` to `ENABLED_SWAP_VENUES`; the planner asks MEXC first, Rift next, then Kraken.
 
 A Rift leg takes these steps, each saved before it acts:
 
@@ -920,7 +920,7 @@ A Rift leg takes these steps, each saved before it acts:
 2. The order. Rift delivers to the bridge EVM wallet and refunds to the main EVM wallet.
 3. The ckERC20 bridge, or the ckBTC minter for ckBTC, pays the order's deposit address straight from the minter. Nothing passes through our wallets on the way in. The ckBTC and ckETH minters take their fee out of the amount at execution time, so those orders ask for one fee estimate less than the expected arrival; a fee rise cannot underfund them. Rift swaps a deposit above the order amount whole, so the headroom is not lost.
 4. The order status until Rift delivers. An underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide. A refunded order parks too; the operator finds the refund on Ethereum and answers `landed <tx>`, which ends the leg as refunded and reports the row failed. The funds sit at the main EVM wallet, outside the pipeline.
-5. The ckERC20 bridge brings the delivered asset back to ICP as its ck form.
+5. The ckERC20 bridge brings an Ethereum payout back to ICP as its ck form. A Bitcoin payout goes to the ckBTC minter's address for the final account, so the minter mints ckBTC straight into it once the deposit has four confirmations; the leg only asks the minter until it does. The minter takes its check fee out of the deposit, and the preview takes it off the receive.
 
 Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
 

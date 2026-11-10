@@ -6,8 +6,8 @@ use log::warn;
 
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 
-use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
-use crate::finalizers::rift::preview::order_amount;
+use super::{RiftVenueFinalizer, VenueStepError, decimal_text, leg_routes, rift_amount};
+use crate::finalizers::rift::preview::net_of;
 use crate::{
     finalizers::{
         bridge_legs::{BridgeDestinationProvider, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out},
@@ -56,7 +56,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             state.reorder();
             return Ok(());
         }
-        let route = Self::leg_routes(&state.size_in.token, &state.final_asset)?.0;
+        let route = leg_routes(&state.size_in.token, &state.final_asset)?.0;
         let funding_phase = state.funding_txid.is_none();
         let outcome = advance_bridge_out(
             &self.bridge,
@@ -89,7 +89,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 if funding_phase
                     && let Some(expected) = state.bridge_out.deposit_bridge_expected_amount
                     && let expected = ChainTokenAmount::from_formatted(state.size_in.token.clone(), expected)
-                    && let Some(asks) = order_amount(&expected, &state.arrival_headroom)
+                    && let Some(asks) = net_of(&expected, &state.arrival_headroom)
                     && asks.value != ordered.value
                 {
                     warn!(

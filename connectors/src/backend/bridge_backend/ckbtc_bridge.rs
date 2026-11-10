@@ -1,6 +1,6 @@
-//! `ckBTC@ICP -> BTC` through the ckBTC minter: an ICRC-2 approve, the burn
-//! with `retrieve_btc_with_approval`, then its status until the Bitcoin
-//! transaction confirms. The minter takes its fee out of the amount.
+//! The ckBTC minter as a bridge. Out, a burn through `retrieve_btc_with_approval`
+//! until its Bitcoin transaction is broadcast; in, a deposit a third party paid
+//! to the minter's address for the final account, minted by `update_balance`.
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
@@ -9,17 +9,20 @@ use icrc_ledger_types::icrc1::account::Account;
 use num_traits::ToPrimitive;
 
 use super::{
-    BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
-    BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, resolve_route,
-    utils::{ensure_source_matches_bridge_owner, ledger_transaction, parse_source_icp_account},
+    BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind,
+    BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, resolve_route,
+    utils::{
+        ensure_source_matches_bridge_owner, ledger_blocks, ledger_length, ledger_transaction, parse_source_icp_account,
+    },
     validate_destination_for_route,
 };
 use crate::{
     backend::{
         amount_utils::{amount_to_nat_units_strict, nat_units_to_amount_via_core},
         ckbtc_minter::{
-            BTC_DECIMALS, CkBtcMinter, RetrieveBtcStatusV2, RetrieveBtcWithApprovalArgs, RetrieveBtcWithApprovalError,
-            RetrieveBtcWithApprovalRet, display_txid,
+            BTC_DECIMALS, CkBtcMinter, OutPoint, RetrieveBtcStatusV2, RetrieveBtcWithApprovalArgs,
+            RetrieveBtcWithApprovalError, RetrieveBtcWithApprovalRet, SuspendedReason, UpdateBalanceError,
+            UpdateBalanceRet, UtxoStatus, display_txid,
         },
         icp_backend::IcpBackend,
         icp_backend_helpers::{ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_fee_with_context},
@@ -28,8 +31,29 @@ use crate::{
 };
 
 const CONTEXT: &str = "ckbtc bridge";
+/// Every handle this backend issues starts with it.
+pub const CKBTC_HANDLE_PREFIX: &str = "ckbtc-";
 /// The handle of a retrieval: the burn index the minter tracks it by.
 pub const RETRIEVE_BRIDGE_ID_PREFIX: &str = "ckbtc-retrieve:";
+/// The handle of a minted deposit: the ckBTC ledger block of the mint, then
+/// the Bitcoin transaction that paid it.
+pub const MINT_BRIDGE_ID_PREFIX: &str = "ckbtc-mint:";
+/// How far back the ckBTC ledger is searched for a mint another caller
+/// triggered. The ledger writes a few thousand blocks a day.
+const MINT_SEARCH_WINDOW: u64 = 20_000;
+const MINT_SEARCH_CHUNK: u64 = 1_000;
+
+/// A Bitcoin transaction id as the caller writes it, in the explorer's form.
+/// A Bitcoin transaction id as explorers print it. Anything else cannot
+/// match a deposit, so it is refused rather than waited on.
+fn parse_txid(text: &str) -> Result<String, String> {
+    let txid = text.trim().trim_start_matches("0x").to_ascii_lowercase();
+    if txid.len() == 64 && txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(txid)
+    } else {
+        Err(format!("{text:?} is not a Bitcoin transaction id"))
+    }
+}
 
 /// The minter's answer decides whether the burn happened. A ledger call the
 /// minter could not complete may have burned, so only the lookup decides it.
@@ -82,9 +106,125 @@ where
         }
     }
 
-    /// The one route this backend serves.
+    /// A catalog route of `kind` between these assets.
+    fn route_of(
+        kind: BridgeRouteKind,
+        asset: &str,
+        chain: &str,
+        target_asset: &str,
+    ) -> Option<&'static BridgeRouteSpec> {
+        resolve_route(asset, chain, target_asset).filter(|route| route.route_kind == kind)
+    }
+
+    /// The route out: a retrieval through the minter.
     fn retrieve_route(asset: &str, chain: &str, target_asset: &str) -> Option<&'static BridgeRouteSpec> {
-        resolve_route(asset, chain, target_asset).filter(|route| route.route_kind == BridgeRouteKind::CkBtcToBtc)
+        Self::route_of(BridgeRouteKind::CkBtcToBtc, asset, chain, target_asset)
+    }
+
+    /// The route in: a deposit to the minter's address for an ICP account.
+    fn deposit_route(asset: &str, chain: &str, target_asset: &str) -> Option<&'static BridgeRouteSpec> {
+        Self::route_of(BridgeRouteKind::BtcToCkBtc, asset, chain, target_asset)
+    }
+
+    /// The account a deposit route mints to.
+    fn deposit_account(asset: &str, chain: &str, destination: &BridgeDestination) -> Result<Account, String> {
+        let route = Self::deposit_route(asset, chain, "ckBTC")
+            .ok_or_else(|| format!("route {asset}@{chain} -> ckBTC is not served by the ckBTC minter bridge"))?;
+        validate_destination_for_route(route, destination)?;
+        match destination {
+            BridgeDestination::IcpAccount(account) => Ok(*account),
+            _ => Err("a ckBTC deposit needs an ICP account".to_string()),
+        }
+    }
+
+    /// The mint at ledger block `block_index`, as the receipt of the deposit
+    /// Bitcoin transaction `txid` paid. A block that is no mint ends the wait.
+    async fn mint_receipt(&self, block_index: u64, txid: &str) -> Result<BridgeMintReceipt, BridgeError> {
+        let mint = ledger_transaction(self.minter.agent(), self.ledger, block_index, "ckBTC")
+            .await
+            .map_err(BridgeError::Unreadable)?
+            .mint
+            .ok_or_else(|| BridgeError::Other(format!("ckBTC block {block_index} is not a mint")))?;
+        Ok(BridgeMintReceipt {
+            transaction_hash: txid.to_string(),
+            log_index: Nat::from(0u8),
+            mint_block_index: Nat::from(block_index),
+            amount: mint.amount,
+            recipient: mint.to,
+            token_symbol: "ckBTC".to_string(),
+        })
+    }
+
+    fn accepted(block_index: u64, txid: &str) -> DepositNotice {
+        DepositNotice::Accepted(BridgeSubmission {
+            bridge_id: format!("{MINT_BRIDGE_ID_PREFIX}{block_index}:{txid}"),
+        })
+    }
+
+    fn quarantined(txid: &str, value: u64) -> DepositNotice {
+        DepositNotice::Held {
+            reason: format!("the minter quarantined deposit {txid} ({value} satoshi) after its compliance check"),
+        }
+    }
+
+    fn too_small(txid: &str, value: u64) -> DepositNotice {
+        DepositNotice::Held {
+            reason: format!("the minter refuses deposit {txid}: {value} satoshi is under its deposit minimum"),
+        }
+    }
+
+    /// Anyone may run `update_balance` for any account, so a deposit this
+    /// call did not mint may be minted already. The minter's known UTXOs say
+    /// so, and the mint's ledger memo names the block.
+    async fn minted_by_another_call(&self, account: &Account, txid: &str) -> Result<DepositNotice, String> {
+        let known = self.minter.get_known_utxos(account).await?;
+        let Some(utxo) = known.into_iter().find(|utxo| display_txid(&utxo.outpoint.txid) == txid) else {
+            return Ok(DepositNotice::NotYet {
+                reason: format!("the minter does not see deposit {txid} yet"),
+            });
+        };
+        let block_index = self
+            .mint_block_of(account, &utxo.outpoint.txid)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "the minter minted deposit {txid} ({} satoshi) to {account}, but no mint in the last {MINT_SEARCH_WINDOW} ckBTC ledger blocks names it",
+                    utxo.value
+                )
+            })?;
+        log::info!(
+            "[ckbtc bridge] deposit {txid} ({} satoshi) was minted to {account} by another call, in ckBTC block {block_index}",
+            utxo.value
+        );
+        Ok(Self::accepted(block_index, txid))
+    }
+
+    /// The newest ledger block that mints to `account` with the deposit's
+    /// transaction in its memo, searched back from the tip.
+    async fn mint_block_of(&self, account: &Account, txid: &[u8]) -> Result<Option<u64>, String> {
+        let agent = self.minter.agent();
+        let tip = ledger_length(agent, self.ledger).await?;
+        let floor = tip.saturating_sub(MINT_SEARCH_WINDOW);
+        let mut end = tip;
+        while end > floor {
+            let start = end.saturating_sub(MINT_SEARCH_CHUNK).max(floor);
+            let mut blocks = ledger_blocks(agent, self.ledger, start, end - start).await?;
+            blocks.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+            let found = blocks.into_iter().find(|(_, transaction)| {
+                transaction.mint.as_ref().is_some_and(|mint| {
+                    mint.to == *account
+                        && mint
+                            .memo
+                            .as_ref()
+                            .is_some_and(|memo| memo.0.windows(txid.len()).any(|window| window == txid))
+                })
+            });
+            if let Some((index, _)) = found {
+                return Ok(Some(index));
+            }
+            end = start;
+        }
+        Ok(None)
     }
 
     fn route_for_request(request: &BridgeRequest) -> Result<&'static BridgeRouteSpec, String> {
@@ -186,6 +326,12 @@ where
             .and_then(|index| index.parse().ok())
             .ok_or_else(|| format!("invalid ckBTC bridge id '{bridge_id}'"))
     }
+
+    /// The mint block and the Bitcoin transaction of a `ckbtc-mint:` handle.
+    fn mint_handle(bridge_id: &str) -> Option<(u64, &str)> {
+        let (block_index, txid) = bridge_id.strip_prefix(MINT_BRIDGE_ID_PREFIX)?.split_once(':')?;
+        Some((block_index.parse().ok()?, txid))
+    }
 }
 
 #[async_trait]
@@ -205,9 +351,17 @@ where
         Self::btc_amount(&balance)
     }
 
-    /// The approve fee stays on the source. The minter and Bitcoin fees come
-    /// out of the amount before it reaches the destination.
+    /// Out, the approve fee stays on the source and the minter and Bitcoin
+    /// fees come out of the amount. In, the minter's check fee comes out of
+    /// the deposit before the mint.
     async fn get_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<BridgeFeeBudget, String> {
+        if Self::deposit_route(asset, chain, target_asset).is_some() {
+            let check_fee = self.minter.minter_info().await?.kyt_fee;
+            return Ok(BridgeFeeBudget {
+                destination_fee_budget: Self::btc_amount(&Nat::from(check_fee))?,
+                ..BridgeFeeBudget::default()
+            });
+        }
         if Self::retrieve_route(asset, chain, target_asset).is_none() {
             return Ok(BridgeFeeBudget::default());
         }
@@ -223,11 +377,16 @@ where
         })
     }
 
+    /// Out, the minter's retrieval minimum; in, its deposit minimum, under
+    /// which a deposit never mints.
     async fn get_minimum_bridge_amount(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
-        if Self::retrieve_route(asset, chain, target_asset).is_none() {
+        let minimum = if Self::retrieve_route(asset, chain, target_asset).is_some() {
+            self.minter.minter_info().await?.retrieve_btc_min_amount
+        } else if Self::deposit_route(asset, chain, target_asset).is_some() {
+            self.minter.minter_info().await?.deposit_btc_min_amount.unwrap_or(0)
+        } else {
             return Ok(0.0);
-        }
-        let minimum = self.minter.minter_info().await?.retrieve_btc_min_amount;
+        };
         Self::btc_amount(&Nat::from(minimum))
     }
 
@@ -242,6 +401,102 @@ where
             }),
             RetrieveBtcWithApprovalRet::Err(error) => Err(error.into()),
         }
+    }
+
+    async fn deposit_address(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+    ) -> Result<String, String> {
+        let account = Self::deposit_account(asset, chain, destination)?;
+        self.minter.get_btc_address(&account).await
+    }
+
+    /// Asks the minter to mint what Bitcoin transaction `receipt` paid to the
+    /// account's address. Nothing of ours moves, so a repeat is always safe.
+    async fn track_deposit(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+        _handle: &str,
+        receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        let account = Self::deposit_account(asset, chain, destination)?;
+        let txid = parse_txid(receipt)?;
+        let paid_by = |outpoint: &OutPoint| display_txid(&outpoint.txid) == txid;
+        let statuses = match self.minter.update_balance(&account).await? {
+            UpdateBalanceRet::Ok(statuses) => statuses,
+            UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
+                suspended_utxos,
+                pending_utxos,
+                required_confirmations,
+                ..
+            }) => {
+                if let Some(suspended) = suspended_utxos
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|entry| paid_by(&entry.utxo.outpoint))
+                {
+                    return Ok(match suspended.reason {
+                        SuspendedReason::Quarantined => Self::quarantined(&txid, suspended.utxo.value),
+                        SuspendedReason::ValueTooSmall => Self::too_small(&txid, suspended.utxo.value),
+                    });
+                }
+                if let Some(pending) = pending_utxos
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|utxo| paid_by(&utxo.outpoint))
+                {
+                    return Ok(DepositNotice::NotYet {
+                        reason: format!(
+                            "the minter sees the deposit with {} of {required_confirmations} confirmations",
+                            pending.confirmations
+                        ),
+                    });
+                }
+                return self.minted_by_another_call(&account, &txid).await;
+            }
+            // A busy or unavailable minter mints nothing; asking again is safe.
+            UpdateBalanceRet::Err(error) => {
+                return Ok(DepositNotice::NotYet {
+                    reason: format!("update_balance did not run: {error:?}"),
+                });
+            }
+        };
+        for status in statuses {
+            match status {
+                UtxoStatus::Minted {
+                    block_index,
+                    minted_amount,
+                    utxo,
+                } if paid_by(&utxo.outpoint) => {
+                    log::info!(
+                        "[ckbtc bridge] deposit {txid} minted {minted_amount} satoshi to {account} in ckBTC block {block_index}"
+                    );
+                    return Ok(Self::accepted(block_index, &txid));
+                }
+                UtxoStatus::Tainted(utxo) if paid_by(&utxo.outpoint) => {
+                    return Ok(Self::quarantined(&txid, utxo.value));
+                }
+                UtxoStatus::ValueTooSmall(utxo) if paid_by(&utxo.outpoint) => {
+                    return Ok(Self::too_small(&txid, utxo.value));
+                }
+                // The check passed and the ledger refused the mint; the next
+                // call mints it first.
+                UtxoStatus::Checked(utxo) if paid_by(&utxo.outpoint) => {
+                    return Ok(DepositNotice::NotYet {
+                        reason: format!(
+                            "the minter checked deposit {txid} ({} satoshi) and mints it next",
+                            utxo.value
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.minted_by_another_call(&account, &txid).await
     }
 
     async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
@@ -295,6 +550,10 @@ where
     /// watches the chain itself, and the minter's six confirmations are only
     /// its own bookkeeping. Only a done reimbursement cancels.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
+        if let Some((block_index, txid)) = Self::mint_handle(bridge_id) {
+            // The ledger is the proof of the mint, whoever asked for it.
+            return Ok(BridgeStatus::Minted(self.mint_receipt(block_index, txid).await?));
+        }
         let block_index = Self::retrieval_index(bridge_id)?;
         let status = self
             .minter

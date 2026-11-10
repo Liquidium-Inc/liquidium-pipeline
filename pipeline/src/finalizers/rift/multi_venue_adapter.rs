@@ -7,7 +7,7 @@ use liquidium_pipeline_connectors::backend::rift_backend::RiftBackend;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    finalizer::RiftVenueFinalizer,
+    finalizer::{RiftVenueFinalizer, leg_routes},
     state::{RiftState, RiftStep},
 };
 use crate::{
@@ -158,7 +158,7 @@ impl<R: RiftBackend + 'static> VenueLeg for RiftVenueFinalizer<R> {
         let (pay_amount, receive_token, _) = self
             .swap_request_parts(request)
             .map_err(VenueAmountError::Unavailable)?;
-        let (out, _) = Self::leg_routes(&pay_amount.token, &receive_token).map_err(VenueAmountError::Unavailable)?;
+        let (out, _) = leg_routes(&pay_amount.token, &receive_token).map_err(VenueAmountError::Unavailable)?;
         check_bridged_minimum(&self.bridge, out, &pay_amount.token, &pay_amount).await
     }
 

@@ -167,9 +167,13 @@ async fn a_bridge_minimum_before_funding_ends_the_leg_with_its_funds_in_the_trad
     bridge
         .expect_get_fee_budget()
         .returning(|_, _, _| Ok(BridgeFeeBudget::default()));
-    // The route minimum rises after the plan: zero at the preview, then above the amount.
+    // The out route minimum rises after the plan: zero at the preview, then
+    // above the amount. The leg back has none.
     let reads = Mutex::new(0u8);
-    bridge.expect_get_minimum_bridge_amount().returning(move |_, _, _| {
+    bridge.expect_get_minimum_bridge_amount().returning(move |asset, _, _| {
+        if asset != "ckUSDC" {
+            return Ok(0.0);
+        }
         let mut reads = reads.lock().unwrap();
         *reads += 1;
         Ok(if *reads == 1 { 0.0 } else { 1_000.0 })

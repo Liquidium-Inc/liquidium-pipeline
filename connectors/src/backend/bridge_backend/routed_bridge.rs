@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use super::{
     BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeProvider, BridgeRequest, BridgeSend,
-    BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, ckbtc_bridge::RETRIEVE_BRIDGE_ID_PREFIX,
+    BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, ckbtc_bridge::CKBTC_HANDLE_PREFIX,
     resolve_route_by_source,
 };
 
@@ -34,11 +34,14 @@ mod tests {
         let mut btc = MockBridgeBackend::new();
         btc.expect_get_bridge_status().with(mockall::predicate::eq("ckbtc-retrieve:9"))
             .times(1).returning(|_| Ok(BridgeStatus::Pending));
+        btc.expect_get_bridge_status().with(mockall::predicate::eq("ckbtc-mint:81:abc"))
+            .times(1).returning(|_| Ok(BridgeStatus::Completed));
         btc.expect_get_minimum_bridge_amount().with(
             mockall::predicate::eq("ckBTC"), mockall::predicate::eq("ICP"), mockall::predicate::eq("BTC"),
         ).times(1).returning(|_, _, _| Ok(0.0005));
         let backend = RoutedBridgeBackend { evm: Arc::new(evm), solana: Arc::new(solana), btc: Arc::new(btc) };
         assert_eq!(backend.get_bridge_status("ckbtc-retrieve:9").await.unwrap(), BridgeStatus::Pending);
+        assert_eq!(backend.get_bridge_status("ckbtc-mint:81:abc").await.unwrap(), BridgeStatus::Completed);
         assert_eq!(backend.get_minimum_bridge_amount("ckBTC", "ICP", "BTC").await.unwrap(), 0.0005);
         assert_eq!(backend.get_bridge_status("cksol-withdraw:8").await.unwrap(), BridgeStatus::Completed);
         assert_eq!(backend.get_bridge_status("legacy-evm-handle").await.unwrap(), BridgeStatus::Pending);
@@ -94,6 +97,15 @@ impl BridgeBackend for RoutedBridgeBackend {
         self.source(&request.asset, &request.source_chain).submit_bridge(request).await
     }
 
+    async fn deposit_address(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+    ) -> Result<String, String> {
+        self.source(asset, chain).deposit_address(asset, chain, destination).await
+    }
+
     async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, BridgeError> {
         self.source(&request.asset, &request.source_chain)
             .prepare_bridge_send(request)
@@ -135,7 +147,7 @@ impl BridgeBackend for RoutedBridgeBackend {
         // ckSOL owns these prefixes; all pre-existing ckETH handles stay with EVM.
         if bridge_id.starts_with("cksol-") {
             self.solana.get_bridge_status(bridge_id).await
-        } else if bridge_id.starts_with(RETRIEVE_BRIDGE_ID_PREFIX) {
+        } else if bridge_id.starts_with(CKBTC_HANDLE_PREFIX) {
             self.btc.get_bridge_status(bridge_id).await
         } else {
             self.evm.get_bridge_status(bridge_id).await

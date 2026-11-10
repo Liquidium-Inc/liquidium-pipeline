@@ -730,7 +730,7 @@ where
             .await
         {
             Ok(DepositNotice::Accepted(submission)) => return Ok(submission),
-            Ok(DepositNotice::NotYet { reason }) => reason,
+            Ok(DepositNotice::NotYet { reason }) | Ok(DepositNotice::Held { reason }) => reason,
             Err(error) => error,
         };
         let account = *Self::expect_icp_destination(route, &request.destination)?;
@@ -1685,6 +1685,7 @@ mod tests {
                     assert_eq!((saved.deposit_id, saved.transfer_signature.as_str()), (Some(42), "sig-9"));
                 }
                 DepositNotice::NotYet { reason } => assert!(!accepted && reason.contains("42"), "{reason}"),
+                DepositNotice::Held { reason } => panic!("a ckSOL notice is never held: {reason}"),
             }
         }
     }

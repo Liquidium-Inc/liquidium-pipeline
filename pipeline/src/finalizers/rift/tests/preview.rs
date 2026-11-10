@@ -163,24 +163,99 @@ fn only_routes_whose_minter_deducts_its_fee_ask_for_headroom() {
     assert_eq!(order_headroom(ckusdc, &budget), 0.0);
 }
 
-/// The payout always comes back over the ckERC20 bridge, so ckBTC is a pay
-/// asset only until the BTC deposit route exists.
+/// A payout under the minter's deposit floor never mints, so the preview
+/// refuses it before Rift is paid.
 #[tokio::test]
-async fn ckbtc_is_not_a_receive_asset_yet() {
-    let finalizer = finalizer(
-        MockRiftBackend::new(),
-        MockBridgeBackend::new(),
-        MockOutboundSender::new(),
-    );
+async fn a_payout_under_the_deposit_minimum_is_refused_at_preview() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote()
+        .times(1)
+        .returning(|request| Ok(quote(&request.amount_in, "0.000002")));
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_get_fee_budget()
+        .returning(|_, _, _| Ok(BridgeFeeBudget::default()));
+    bridge
+        .expect_get_minimum_bridge_amount()
+        .returning(|asset, _, _| Ok(if asset == "BTC" { 0.000_003 } else { 0.0 }));
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
     let mut request = request(100_010_000);
+    request.pay_asset = ckusdt().asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(ckusdt(), Nat::from(100_010_000u64));
     request.receive_asset = ckbtc().asset_id();
 
-    let error = finalizer.check_amount(&request).await.unwrap_err();
+    let error = finalizer.preview(&context(), &request).await.unwrap_err();
 
-    assert!(
-        matches!(error, VenueAmountError::Unavailable(ref reason) if reason.contains("only to Ethereum")),
-        "{error}"
+    assert!(error.contains("deposit minimum"), "{error}");
+}
+
+/// A ckETH receive needs no minter call of its own: Rift pays ETH to the
+/// bridge EVM wallet and the shared Ethereum leg back makes the helper deposit.
+#[tokio::test]
+async fn a_ckusdt_to_cketh_leg_pays_out_to_the_bridge_wallet_and_comes_back_through_the_eth_route() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote().times(1).returning(|request| {
+        assert_eq!(request.from.as_str(), "ethereum.usdt");
+        assert_eq!(request.to.as_str(), "ethereum.eth");
+        Ok(quote(&request.amount_in, "0.03"))
+    });
+    let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
+    let mut request = request(100_010_000);
+    request.pay_asset = ckusdt().asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(ckusdt(), Nat::from(100_010_000u64));
+    request.receive_asset = cketh().asset_id();
+
+    let preview = finalizer.preview(&context(), &request).await.unwrap();
+
+    assert_eq!(preview.quote.legs[0].route_id, "ethereum.usdt>ethereum.eth");
+    assert_eq!(preview.quote.receive_amount, Nat::from(30_000_000_000_000_000u64));
+    let saved: RiftState = serde_json::from_value(preview.initial_execution_state.state["rift"].clone()).unwrap();
+    assert_eq!(saved.receive_chain, "ethereum");
+    assert_eq!(saved.receive_symbol, "ETH");
+    // The leg back is the native ETH route into the ckETH minter's helper.
+    let (_, back) = leg_routes(&ckusdt(), &cketh()).unwrap();
+    assert_eq!(
+        back.route_kind,
+        liquidium_pipeline_connectors::backend::bridge_backend::BridgeRouteKind::EthToCkEth
     );
+}
+
+/// A payout on Bitcoin mints straight into the final account, less the
+/// minter's check fee, which the preview takes off the receive.
+#[tokio::test]
+async fn a_ckusdt_to_ckbtc_leg_quotes_bitcoin_and_takes_the_minter_fee_off_the_receive() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote().times(1).returning(|request| {
+        assert_eq!(request.from.as_str(), "ethereum.usdt");
+        assert_eq!(request.to.as_str(), "bitcoin.btc");
+        Ok(quote(&request.amount_in, "0.0013"))
+    });
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_fee_budget().returning(|asset, _, _| {
+        Ok(if asset == "BTC" {
+            // The minter's check fee, 100 satoshi.
+            BridgeFeeBudget {
+                destination_fee_budget: 0.000_001,
+                ..BridgeFeeBudget::default()
+            }
+        } else {
+            BridgeFeeBudget::default()
+        })
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
+    let mut request = request(100_010_000);
+    request.pay_asset = ckusdt().asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(ckusdt(), Nat::from(100_010_000u64));
+    request.receive_asset = ckbtc().asset_id();
+
+    let preview = finalizer.preview(&context(), &request).await.unwrap();
+
+    assert_eq!(preview.quote.legs[0].route_id, "ethereum.usdt>bitcoin.btc");
+    assert_eq!(preview.quote.receive_amount, Nat::from(129_900u64));
+    let saved: RiftState = serde_json::from_value(preview.initial_execution_state.state["rift"].clone()).unwrap();
+    assert_eq!(saved.receive_chain, "bitcoin");
+    assert_eq!(saved.receive_symbol, "BTC");
 }
 
 /// A ckBTC leg pays Rift on Bitcoin. The minter takes its fee out of the

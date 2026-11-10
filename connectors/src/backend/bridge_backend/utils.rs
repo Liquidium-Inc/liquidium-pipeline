@@ -4,13 +4,69 @@ use icrc_ledger_types::{
     icrc1::account::Account,
     icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Transaction, TransactionRange},
 };
+use num_traits::ToPrimitive;
 use std::str::FromStr;
 
 use super::{
-    BridgeDestination, BridgeDestinationKind, BridgeRouteSpec, BridgeSweepRoute,
-    catalog::BRIDGE_ROUTE_CATALOG,
+    BridgeDestination, BridgeDestinationKind, BridgeRouteSpec, BridgeSweepRoute, catalog::BRIDGE_ROUTE_CATALOG,
 };
 use crate::pipeline_agent::PipelineAgent;
+
+/// The ledger's block count, so a search can start from the tip.
+pub(super) async fn ledger_length<A: PipelineAgent + ?Sized>(agent: &A, ledger: Principal) -> Result<u64, String> {
+    let request = GetTransactionsRequest {
+        start: Nat::from(0u8),
+        length: Nat::from(0u8),
+    };
+    let arg = Encode!(&request).map_err(|error| error.to_string())?;
+    let response: GetTransactionsResponse = agent.call_query(&ledger, "get_transactions", arg).await?;
+    nat_index(&response.log_length)
+}
+
+/// The blocks from `start`, `length` of them, with their indexes. Blocks the
+/// ledger moved to an archive are read from there.
+pub(super) async fn ledger_blocks<A: PipelineAgent + ?Sized>(
+    agent: &A,
+    ledger: Principal,
+    start: u64,
+    length: u64,
+) -> Result<Vec<(u64, Transaction)>, String> {
+    let request = GetTransactionsRequest {
+        start: Nat::from(start),
+        length: Nat::from(length),
+    };
+    let arg = Encode!(&request).map_err(|error| error.to_string())?;
+    let response: GetTransactionsResponse = agent.call_query(&ledger, "get_transactions", arg).await?;
+    let first = nat_index(&response.first_index)?;
+    let mut blocks: Vec<(u64, Transaction)> = indexed(first, response.transactions);
+    for archived in response.archived_transactions {
+        let request = GetTransactionsRequest {
+            start: archived.start.clone(),
+            length: archived.length.clone(),
+        };
+        let arg = Encode!(&request).map_err(|error| error.to_string())?;
+        let range: TransactionRange = agent
+            .call_query(&archived.callback.canister_id, &archived.callback.method, arg)
+            .await?;
+        blocks.extend(indexed(nat_index(&archived.start)?, range.transactions));
+    }
+    Ok(blocks)
+}
+
+fn indexed(first: u64, transactions: Vec<Transaction>) -> Vec<(u64, Transaction)> {
+    transactions
+        .into_iter()
+        .enumerate()
+        .map(|(offset, transaction)| (first + offset as u64, transaction))
+        .collect()
+}
+
+fn nat_index(value: &Nat) -> Result<u64, String> {
+    value
+        .0
+        .to_u64()
+        .ok_or_else(|| format!("ledger index {value} does not fit in u64"))
+}
 
 /// Parses a source ICP account from either textual `Account` form or principal text.
 /// If only principal text is provided, `subaccount` is set to `None`.
@@ -162,9 +218,9 @@ pub fn resolve_forward_route_by_target(target_asset: &str) -> Option<&'static Br
 }
 
 pub fn resolve_cketh_forward_route_by_target(target_asset: &str) -> Option<&'static BridgeRouteSpec> {
-    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        route.route_kind.is_cketh_forward() && target_asset.eq_ignore_ascii_case(route.target_asset)
-    })
+    BRIDGE_ROUTE_CATALOG
+        .iter()
+        .find(|route| route.route_kind.is_cketh_forward() && target_asset.eq_ignore_ascii_case(route.target_asset))
 }
 
 pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {

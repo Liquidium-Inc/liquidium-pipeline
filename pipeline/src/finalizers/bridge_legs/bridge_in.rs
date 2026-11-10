@@ -309,6 +309,10 @@ async fn advance_deposit_send(
             state.withdraw_bridge_submitted_at_ts = Some(now);
             Ok(BridgeLegOutcome::Submitted)
         }
+        // The provider holds the funds; no cycle of ours changes that.
+        DepositNotice::Held { reason } => Err(BridgeLegError::Ambiguous(format!(
+            "bridge deposit {receipt} is held by the provider: {reason}"
+        ))),
         DepositNotice::NotYet { reason } => {
             let waited = now.saturating_sub(state.withdraw_bridge_funded_at_ts.unwrap_or(now));
             if waited > DEPOSIT_NOTICE_WINDOW_SECS {

@@ -146,3 +146,37 @@ async fn a_bitcoin_order_refunds_to_the_bitcoin_wallet() {
 
     assert_eq!(state.step, RiftStep::BridgeOut);
 }
+
+/// A Bitcoin payout goes to the ckBTC minter's address for the final account,
+/// so the mint lands there with no leg of ours in between.
+#[tokio::test]
+async fn an_order_paying_out_on_bitcoin_names_the_minter_address_of_the_final_account() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_create_order()
+        .times(1)
+        .returning(|_, to_address, refund_address| {
+            assert_eq!(to_address, "bc1qminter");
+            assert_eq!(refund_address.as_deref(), Some(MAIN_WALLET));
+            Ok(order("100"))
+        });
+    let mut bridge = free_bridge();
+    bridge
+        .expect_deposit_address()
+        .times(1)
+        .returning(|asset, chain, destination| {
+            assert_eq!((asset, chain), ("BTC", "BTC"));
+            assert!(
+                matches!(destination, liquidium_pipeline_connectors::backend::bridge_backend::BridgeDestination::IcpAccount(account) if account.owner == Principal::anonymous())
+            );
+            Ok("bc1qminter".to_string())
+        });
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
+    let mut state = state_receiving_ckbtc(RiftStep::Order);
+    state.order = None;
+    state.quote_id = Some("quote-1".to_string());
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert_eq!(state.step, RiftStep::BridgeOut);
+    assert_eq!(state.order.unwrap().to_address.as_deref(), Some("bc1qminter"));
+}

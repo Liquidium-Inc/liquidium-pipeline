@@ -19,9 +19,6 @@ pub(super) enum RiftChain {
 }
 
 impl RiftChain {
-    /// The chain Rift delivers to: the ckERC20 bridge brings the payout back.
-    pub(super) const PAYOUT: RiftChain = RiftChain::Ethereum;
-
     /// The chain as Rift names it in `chain.symbol`.
     pub(super) fn name(self) -> &'static str {
         match self {
@@ -46,11 +43,29 @@ impl RiftChain {
         }
     }
 
+    /// The chain as the bridge route catalog names it.
+    pub(super) fn catalog_chain(self) -> &'static str {
+        match self {
+            Self::Ethereum => "ETH",
+            Self::Bitcoin => "BTC",
+        }
+    }
+
     /// How long Rift may take to see a deposit the bridge already paid. A
     /// Bitcoin deposit needs Rift's own confirmations after the minter's.
     pub(super) fn deposit_seen_timeout_secs(self) -> i64 {
         match self {
             Self::Ethereum => 2 * 60 * 60,
+            Self::Bitcoin => 4 * 60 * 60,
+        }
+    }
+
+    /// How long Rift's payout may take to come back as the ck asset. The
+    /// ckETH return waits for Ethereum finality; the ckBTC mint for the
+    /// minter's confirmations.
+    pub(super) fn return_timeout_secs(self) -> i64 {
+        match self {
+            Self::Ethereum => 60 * 60,
             Self::Bitcoin => 4 * 60 * 60,
         }
     }
@@ -66,5 +81,7 @@ mod tests {
             assert_eq!(RiftChain::parse(chain.name()).unwrap(), chain);
         }
         assert!(RiftChain::parse("solana").is_err());
+        assert_eq!(RiftChain::Bitcoin.catalog_chain(), "BTC");
+        assert!(RiftChain::Bitcoin.return_timeout_secs() > RiftChain::Ethereum.return_timeout_secs());
     }
 }

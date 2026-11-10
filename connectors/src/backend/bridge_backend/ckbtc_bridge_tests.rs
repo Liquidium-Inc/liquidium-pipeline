@@ -4,20 +4,23 @@ use std::sync::Arc;
 
 use candid::{Nat, Principal};
 use icrc_ledger_types::{
-    icrc1::account::Account,
+    icrc1::{account::Account, transfer::Memo},
     icrc3::{
         archive::{ArchivedRange, QueryTxArchiveFn},
-        transactions::{Burn, GetTransactionsRequest, GetTransactionsResponse, Transaction, TransactionRange},
+        transactions::{Burn, GetTransactionsRequest, GetTransactionsResponse, Mint, Transaction, TransactionRange},
     },
 };
 
-use super::{BridgeBackend, BridgeDestination, BridgeError, BridgeRequest, BridgeStatus, CkBtcBridgeBackend};
+use super::{
+    BridgeBackend, BridgeDestination, BridgeError, BridgeRequest, BridgeStatus, CkBtcBridgeBackend, DepositNotice,
+};
 use crate::{
     backend::{
         ckbtc_minter::{
-            CkBtcMinterInfo, ReimbursedDeposit, ReimbursementReason, ReimbursementRequest, RetrieveBtcOk,
-            RetrieveBtcStatusEntry, RetrieveBtcStatusV2, RetrieveBtcWithApprovalArgs, RetrieveBtcWithApprovalError,
-            RetrieveBtcWithApprovalRet, WithdrawalFee,
+            CkBtcMinterInfo, MinterAccountArgs, OutPoint, PendingUtxo, ReimbursedDeposit, ReimbursementReason,
+            ReimbursementRequest, RetrieveBtcOk, RetrieveBtcStatusEntry, RetrieveBtcStatusV2,
+            RetrieveBtcWithApprovalArgs, RetrieveBtcWithApprovalError, RetrieveBtcWithApprovalRet, SuspendedReason,
+            SuspendedUtxo, UpdateBalanceError, UpdateBalanceRet, Utxo, UtxoStatus, WithdrawalFee,
         },
         icp_backend::MockIcpBackend,
     },
@@ -70,6 +73,9 @@ fn minter_info(agent: &mut MockPipelineAgent, minimum: u64) {
             assert_eq!(method, "get_minter_info");
             Ok(CkBtcMinterInfo {
                 retrieve_btc_min_amount: minimum,
+                deposit_btc_min_amount: Some(300),
+                min_confirmations: 4,
+                kyt_fee: 100,
             })
         });
 }
@@ -549,7 +555,7 @@ async fn the_fee_budget_and_the_minimum_come_from_the_minter() {
     let none = backend.get_fee_budget("ckUSDC", "ICP", "USDC").await.unwrap();
     assert_eq!(none.destination_fee_budget, 0.0);
     assert_eq!(
-        backend.get_minimum_bridge_amount("BTC", "BTC", "ckBTC").await.unwrap(),
+        backend.get_minimum_bridge_amount("ckUSDC", "ICP", "USDC").await.unwrap(),
         0.0
     );
 }
@@ -568,4 +574,464 @@ async fn the_source_balance_is_the_ledger_balance() {
         0.002_5
     );
     assert!(backend.get_source_balance("ckUSDC", "ICP", OWNER).await.is_err());
+}
+
+// ---- the deposit side: Bitcoin paid to the minter's address for an account
+
+const PAYOUT_TX: &str = "53c022a60ed9cc64aa501ab3c0753dd90c39460b258df7b59b812e0d3294b6e7";
+
+fn deposit_to(account: Account) -> BridgeDestination {
+    BridgeDestination::IcpAccount(account)
+}
+
+/// The outpoint of `PAYOUT_TX`, in the minter's byte order.
+fn payout_outpoint() -> OutPoint {
+    let mut txid = hex::decode(PAYOUT_TX).unwrap();
+    txid.reverse();
+    OutPoint { txid, vout: 0 }
+}
+
+fn utxo(outpoint: OutPoint, value: u64) -> Utxo {
+    Utxo {
+        height: 975_293,
+        value,
+        outpoint,
+    }
+}
+
+#[tokio::test]
+async fn the_deposit_address_is_the_minters_address_for_the_final_account() {
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update::<String>()
+        .times(1)
+        .returning(|_, method, arg| {
+            assert_eq!(method, "get_btc_address");
+            let args: MinterAccountArgs = candid::decode_one(&arg).unwrap();
+            assert_eq!(args.owner, Some(Principal::management_canister()));
+            assert!(args.subaccount.is_none());
+            Ok("bc1qminter".to_string())
+        });
+    let account = Account {
+        owner: Principal::management_canister(),
+        subaccount: None,
+    };
+
+    let address = backend(agent, MockIcpBackend::new())
+        .deposit_address("BTC", "BTC", &deposit_to(account))
+        .await
+        .unwrap();
+
+    assert_eq!(address, "bc1qminter");
+    assert!(
+        backend(MockPipelineAgent::new(), MockIcpBackend::new())
+            .deposit_address("ckBTC", "ICP", &deposit_to(account))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn the_deposit_fee_budget_is_the_minters_check_fee() {
+    let mut agent = MockPipelineAgent::new();
+    minter_info(&mut agent, 50_000);
+
+    let budget = backend(agent, MockIcpBackend::new())
+        .get_fee_budget("BTC", "BTC", "ckBTC")
+        .await
+        .unwrap();
+
+    assert_eq!(budget.destination_fee_budget, 0.000_001);
+    assert_eq!(budget.source_fee_budget, 0.0);
+}
+
+#[tokio::test]
+async fn the_deposit_minimum_is_the_minters_deposit_floor() {
+    let mut agent = MockPipelineAgent::new();
+    minter_info(&mut agent, 50_000);
+
+    let minimum = backend(agent, MockIcpBackend::new())
+        .get_minimum_bridge_amount("BTC", "BTC", "ckBTC")
+        .await
+        .unwrap();
+
+    assert_eq!(minimum, 0.000_003);
+}
+
+/// A receipt that is no transaction id can never match, so it is refused
+/// instead of waited on.
+#[tokio::test]
+async fn a_receipt_that_is_not_a_transaction_id_is_refused() {
+    let error = backend(MockPipelineAgent::new(), MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", &format!("{PAYOUT_TX}:0"))
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("not a Bitcoin transaction id"), "{error}");
+}
+
+fn known_utxos(agent: &mut MockPipelineAgent, utxos: Vec<Utxo>) {
+    agent
+        .expect_call_query::<Vec<Utxo>>()
+        .times(1)
+        .returning(move |_, method, _| {
+            assert_eq!(method, "get_known_utxos");
+            Ok(utxos.clone())
+        });
+}
+
+/// The ckBTC ledger with `length` blocks, whose block 81 mints to the source
+/// account with the payout's transaction in its memo, as the minter writes it.
+fn ledger_with_the_mint(agent: &mut MockPipelineAgent, length: u64) {
+    agent
+        .expect_call_query::<GetTransactionsResponse>()
+        .returning(move |_, method, arg| {
+            assert_eq!(method, "get_transactions");
+            let request: GetTransactionsRequest = candid::decode_one(arg.as_slice()).unwrap();
+            let start: u64 = request.start.0.clone().try_into().unwrap();
+            let count: u64 = request.length.0.clone().try_into().unwrap();
+            let transactions = (start..(start + count).min(length))
+                .map(|index| {
+                    let mint = if index == 81 {
+                        let memo = [
+                            vec![0x82, 0x00, 0x83, 0x58, 0x20],
+                            payout_outpoint().txid,
+                            vec![0x00, 0x18, 0x64],
+                        ]
+                        .concat();
+                        Some(Mint {
+                            amount: Nat::from(129_900u64),
+                            to: source(),
+                            memo: Some(Memo::from(memo)),
+                            created_at_time: None,
+                        })
+                    } else {
+                        Some(Mint {
+                            amount: Nat::from(129_900u64),
+                            to: source(),
+                            memo: Some(Memo::from(vec![index as u8])),
+                            created_at_time: None,
+                        })
+                    };
+                    Transaction {
+                        kind: "mint".to_string(),
+                        mint,
+                        burn: None,
+                        transfer: None,
+                        approve: None,
+                        timestamp: 1,
+                    }
+                })
+                .collect();
+            Ok(GetTransactionsResponse {
+                first_index: Nat::from(start),
+                log_length: Nat::from(length),
+                transactions,
+                archived_transactions: Vec::new(),
+            })
+        });
+}
+
+/// Anyone may run `update_balance` for the account, so a repeat after the
+/// mint sees nothing new. The minter's known UTXOs and the mint memo recover it.
+#[tokio::test]
+async fn a_deposit_minted_by_another_call_is_recovered_from_the_known_utxos_and_the_ledger() {
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(
+        &mut agent,
+        UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
+            suspended_utxos: None,
+            required_confirmations: 4,
+            pending_utxos: None,
+            current_confirmations: None,
+        }),
+    );
+    known_utxos(&mut agent, vec![utxo(payout_outpoint(), 130_000)]);
+    ledger_with_the_mint(&mut agent, 2_500);
+
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+
+    match notice {
+        DepositNotice::Accepted(submission) => assert_eq!(submission.bridge_id, format!("ckbtc-mint:81:{PAYOUT_TX}")),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A call that minted other deposits says nothing about ours; the known
+/// UTXOs decide whether it is unseen or minted already.
+#[tokio::test]
+async fn a_call_that_minted_only_other_deposits_is_not_yet_when_ours_is_unknown() {
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(
+        &mut agent,
+        UpdateBalanceRet::Ok(vec![UtxoStatus::Minted {
+            minted_amount: 5_000,
+            block_index: 80,
+            utxo: utxo(
+                OutPoint {
+                    txid: vec![9; 32],
+                    vout: 1,
+                },
+                5_100,
+            ),
+        }]),
+    );
+    known_utxos(
+        &mut agent,
+        vec![utxo(
+            OutPoint {
+                txid: vec![9; 32],
+                vout: 1,
+            },
+            5_100,
+        )],
+    );
+
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("does not see")),
+        "{notice:?}"
+    );
+}
+
+/// After the first call, a refused deposit shows only in the suspended list.
+#[tokio::test]
+async fn a_suspended_deposit_is_held_on_a_repeat_call() {
+    for (reason, phrase) in [
+        (SuspendedReason::Quarantined, "quarantined"),
+        (SuspendedReason::ValueTooSmall, "deposit minimum"),
+    ] {
+        let mut agent = MockPipelineAgent::new();
+        update_balance_answer(
+            &mut agent,
+            UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
+                suspended_utxos: Some(vec![SuspendedUtxo {
+                    utxo: utxo(payout_outpoint(), 200),
+                    earliest_retry: 0,
+                    reason,
+                }]),
+                required_confirmations: 4,
+                pending_utxos: None,
+                current_confirmations: None,
+            }),
+        );
+        let notice = backend(agent, MockIcpBackend::new())
+            .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+            .await
+            .unwrap();
+        assert!(
+            matches!(notice, DepositNotice::Held { ref reason } if reason.contains(phrase)),
+            "{notice:?}"
+        );
+    }
+}
+
+/// A checked deposit passed the compliance check and the ledger refused the
+/// mint; the next call mints it, so it is not held.
+#[tokio::test]
+async fn a_checked_deposit_is_not_yet() {
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(
+        &mut agent,
+        UpdateBalanceRet::Ok(vec![UtxoStatus::Checked(utxo(payout_outpoint(), 130_000))]),
+    );
+
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("mints it next")),
+        "{notice:?}"
+    );
+}
+
+/// A handle that names a block with no mint is wrong for good, not unreadable.
+#[tokio::test]
+async fn a_mint_handle_on_a_block_that_is_no_mint_fails_instead_of_waiting() {
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<GetTransactionsResponse>()
+        .times(1)
+        .returning(|_, _, _| {
+            Ok(GetTransactionsResponse {
+                first_index: Nat::from(81u64),
+                log_length: Nat::from(100u64),
+                transactions: vec![Transaction {
+                    kind: "transfer".to_string(),
+                    mint: None,
+                    burn: None,
+                    transfer: None,
+                    approve: None,
+                    timestamp: 1,
+                }],
+                archived_transactions: Vec::new(),
+            })
+        });
+
+    let error = backend(agent, MockIcpBackend::new())
+        .get_bridge_status(&format!("ckbtc-mint:81:{PAYOUT_TX}"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, BridgeError::Other(ref m) if m.contains("not a mint")),
+        "{error}"
+    );
+}
+
+fn update_balance_answer(agent: &mut MockPipelineAgent, answer: UpdateBalanceRet) {
+    agent
+        .expect_call_update::<UpdateBalanceRet>()
+        .times(1)
+        .returning(move |_, method, _| {
+            assert_eq!(method, "update_balance");
+            Ok(answer.clone())
+        });
+}
+
+/// The minter names the deposit by its outpoint, so the Bitcoin transaction
+/// Rift reported is what ties a mint to this leg.
+#[tokio::test]
+async fn a_minted_deposit_paid_by_the_payout_is_accepted_under_its_mint_block() {
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(
+        &mut agent,
+        UpdateBalanceRet::Ok(vec![
+            UtxoStatus::Minted {
+                minted_amount: 5_000,
+                block_index: 80,
+                utxo: utxo(
+                    OutPoint {
+                        txid: vec![9; 32],
+                        vout: 1,
+                    },
+                    5_100,
+                ),
+            },
+            UtxoStatus::Minted {
+                minted_amount: 129_900,
+                block_index: 81,
+                utxo: utxo(payout_outpoint(), 130_000),
+            },
+        ]),
+    );
+
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", &format!("0x{PAYOUT_TX}"))
+        .await
+        .unwrap();
+
+    match notice {
+        DepositNotice::Accepted(submission) => assert_eq!(submission.bridge_id, format!("ckbtc-mint:81:{PAYOUT_TX}")),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_deposit_still_confirming_is_not_yet_with_its_count() {
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(
+        &mut agent,
+        UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
+            suspended_utxos: None,
+            required_confirmations: 4,
+            pending_utxos: Some(vec![PendingUtxo {
+                confirmations: 2,
+                value: 130_000,
+                outpoint: payout_outpoint(),
+            }]),
+            current_confirmations: Some(2),
+        }),
+    );
+
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("2 of 4 confirmations")),
+        "{notice:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_busy_minter_is_not_yet_and_a_quarantined_deposit_is_held() {
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(&mut agent, UpdateBalanceRet::Err(UpdateBalanceError::AlreadyProcessing));
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+    assert!(matches!(notice, DepositNotice::NotYet { .. }), "{notice:?}");
+
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(
+        &mut agent,
+        UpdateBalanceRet::Ok(vec![UtxoStatus::Tainted(utxo(payout_outpoint(), 130_000))]),
+    );
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+    assert!(
+        matches!(notice, DepositNotice::Held { ref reason } if reason.contains("quarantined")),
+        "{notice:?}"
+    );
+}
+
+/// The ledger is the proof of the mint: its block names the amount and the account.
+#[tokio::test]
+async fn a_mint_handle_reads_its_receipt_from_the_ledger() {
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<GetTransactionsResponse>()
+        .times(1)
+        .returning(|_, method, arg| {
+            assert_eq!(method, "get_transactions");
+            assert_eq!(block_start(&arg), 81);
+            Ok(GetTransactionsResponse {
+                first_index: Nat::from(81u64),
+                log_length: Nat::from(100u64),
+                transactions: vec![Transaction {
+                    kind: "mint".to_string(),
+                    mint: Some(icrc_ledger_types::icrc3::transactions::Mint {
+                        amount: Nat::from(129_900u64),
+                        to: source(),
+                        memo: None,
+                        created_at_time: None,
+                    }),
+                    burn: None,
+                    transfer: None,
+                    approve: None,
+                    timestamp: 1,
+                }],
+                archived_transactions: Vec::new(),
+            })
+        });
+
+    let status = backend(agent, MockIcpBackend::new())
+        .get_bridge_status(&format!("ckbtc-mint:81:{PAYOUT_TX}"))
+        .await
+        .unwrap();
+
+    match status {
+        BridgeStatus::Minted(receipt) => {
+            assert_eq!(receipt.amount, Nat::from(129_900u64));
+            assert_eq!(receipt.mint_block_index, Nat::from(81u64));
+            assert_eq!(receipt.recipient, source());
+            assert_eq!(receipt.transaction_hash, PAYOUT_TX);
+            assert_eq!(receipt.token_symbol, "ckBTC");
+        }
+        other => panic!("{other:?}"),
+    }
 }
