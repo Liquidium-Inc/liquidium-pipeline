@@ -5,7 +5,7 @@ use candid::Nat;
 use liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt;
 use serde::{Deserialize, Serialize};
 
-use crate::{bridge::legacy::LegacyBridgeSubmitPhase, outbound::driver::OutboundRecord};
+use crate::outbound::driver::OutboundRecord;
 
 /// The leg out: an ICP asset to the bridge wallet, then the provider call.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -13,14 +13,6 @@ pub struct BridgeOutState {
     /// The provider call that bridges the deposit, saved before it runs.
     #[serde(default)]
     pub deposit_bridge_call: Option<OutboundRecord>,
-    /// From rows saved before the outbound driver. It stays until the bridge
-    /// step upgrades it, so no save between can drop the call.
-    #[serde(
-        default,
-        rename = "deposit_bridge_submit_phase",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub legacy_bridge_submit_phase: Option<LegacyBridgeSubmitPhase>,
     /// True on rows saved before the outbound driver, whose build called the
     /// provider without a record. The bridge step clears it.
     #[serde(default = "crate::bridge::legacy::saved_before_driver")]

@@ -26,7 +26,6 @@ use super::{
 use crate::{
     bridge::{
         call_sender::{BridgeCall, prepare_bridge_call},
-        legacy::LegacyBridgeSubmitPhase,
         runtime::BridgeRuntime,
     },
     outbound::driver::{OutboundPhase, OutboundRecord, step_outbound},
@@ -253,7 +252,7 @@ async fn advance_submission(
         source_address: bridge.sources.for_chain(route.source_chain)?,
         provider_fee: state.deposit_bridge_provider_fee_budget_native_units.clone(),
     };
-    upgrade_legacy_bridge_call(state, inputs.size_in, &submission)?;
+    settle_unrecorded_bridge_call(state, inputs.size_in, &submission)?;
     let _submit_guard =
         acquire_bridge_submit_lock(route.source_asset, route.source_chain, &submission.source_address).await;
     if state.deposit_bridge_call.is_none() {
@@ -341,44 +340,17 @@ async fn save_call(
     Ok(BridgeLegOutcome::Saved { side_costs: Vec::new() })
 }
 
-/// Moves a journal attempt from a row saved before the outbound driver into a
-/// saved call. A recorded attempt may have run, so from now on it only settles
-/// from the provider history.
-fn upgrade_legacy_bridge_call(
+/// A row funded by a build before the outbound driver may hold a call
+/// without a record. It parks for an operator before any new call.
+fn settle_unrecorded_bridge_call(
     state: &mut BridgeOutState,
     size_in: &ChainTokenAmount,
     submission: &Submission<'_>,
 ) -> Result<(), String> {
     let unrecorded = std::mem::take(&mut state.deposit_bridge_call_unrecorded);
-    let attempt = match state.legacy_bridge_submit_phase.take() {
-        Some(LegacyBridgeSubmitPhase::Submitting(attempt)) => attempt,
-        Some(LegacyBridgeSubmitPhase::WaitingFunds) => return Ok(()),
-        None if unrecorded && state.deposit_bridge_call.is_none() => {
-            return park_unrecorded_bridge_call(state, size_in, submission);
-        }
-        None => return Ok(()),
-    };
-    let call = BridgeCall {
-        source_chain: submission.route.source_chain.to_string(),
-        source_address: submission.source_address.clone(),
-        target_asset: submission.route.target_asset.to_string(),
-        provider_fee_budget_native_units: submission.provider_fee.clone(),
-        ..attempt.bridge_call()
-    };
-    let mut record = OutboundRecord::prepared(prepare_bridge_call(attempt.id.clone(), &call)?);
-    record.phase = if attempt.parked_for_operator {
-        OutboundPhase::Parked {
-            reason: format!(
-                "bridge call {} {} to {} was parked by the bridge journal; answer it with reconcile",
-                call.amount, call.asset, call.destination
-            ),
-        }
-    } else {
-        OutboundPhase::Submitted {
-            at: attempt.called_at_ts.unwrap_or(attempt.started_at_ts),
-        }
-    };
-    state.deposit_bridge_call = Some(record);
+    if unrecorded && state.deposit_bridge_call.is_none() {
+        return park_unrecorded_bridge_call(state, size_in, submission);
+    }
     Ok(())
 }
 
