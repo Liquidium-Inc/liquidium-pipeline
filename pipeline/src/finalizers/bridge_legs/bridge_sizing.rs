@@ -18,10 +18,11 @@ const BRIDGED_DEPOSIT_FEE_COUNT: u8 = 1;
 /// The symbol a return route's gas cost carries in its fee budget.
 const GAS_SYMBOL: &str = "ETH";
 const GAS_DECIMALS: u8 = 18;
+/// The gas price moves between the preview and the send.
+const GAS_MARGIN: f64 = 1.25;
 
-/// Checks that the bridge wallet holds the gas the return route pays before
-/// any funds commit to it. The balance read keeps a reserve back, so this
-/// asks a little more than the send needs.
+/// Checks that the bridge wallet holds the gas the return route pays, with a
+/// margin, before any funds commit to it. The send checks again at its price.
 pub async fn ensure_return_gas(
     bridge: &BridgeRuntime,
     route: &BridgeRouteSpec,
@@ -38,12 +39,9 @@ pub async fn ensure_return_gas(
     if needed == 0u8 {
         return Ok(());
     }
-    let needed = nat_units_to_amount_via_core(&needed, GAS_DECIMALS)?;
+    let needed = nat_units_to_amount_via_core(&needed, GAS_DECIMALS)? * GAS_MARGIN;
     let wallet = bridge.sources.for_chain(route.source_chain)?;
-    let held = bridge
-        .backend
-        .get_source_balance(GAS_SYMBOL, route.source_chain, &wallet)
-        .await?;
+    let held = bridge.backend.get_gas_balance(route.source_chain, &wallet).await?;
     if held < needed {
         return Err(format!(
             "bridge wallet {wallet} holds {held} ETH, below the {needed} ETH of gas the {} return needs",

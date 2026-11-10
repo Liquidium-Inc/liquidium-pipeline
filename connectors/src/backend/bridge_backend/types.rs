@@ -210,6 +210,13 @@ pub trait BridgeBackend: Send + Sync {
     /// Returns a human-readable source balance for a route input asset/account.
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String>;
 
+    /// The raw native balance of a wallet on `chain`, for a gas check. Unlike
+    /// the ETH source balance, nothing is kept back from it.
+    async fn get_gas_balance(&self, chain: &str, address: &str) -> Result<f64, String> {
+        let _ = (chain, address);
+        Err("gas balances are not supported by this bridge backend".to_string())
+    }
+
     /// Returns the source-asset amount that must remain on the source account
     /// in addition to the submitted bridge amount.
     async fn get_source_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
