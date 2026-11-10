@@ -21,6 +21,11 @@ pub enum FinalizerError {
     /// the runnable queue and nothing would ever return that custody.
     #[error("{0}")]
     VenueCustody(String),
+    /// No venue offers an acceptable swap right now, and the collateral is
+    /// still ours (audit L17). The row never fails for this: once the normal
+    /// budget is spent, it retries at a slow pace until a route returns.
+    #[error("{0}")]
+    NoRoute(String),
     /// This liquidation can never be finalized. Fail it and stop.
     #[error("{0}")]
     Permanent(String),
@@ -53,13 +58,15 @@ pub struct FinalizerResult {
 }
 
 impl FinalizerResult {
-    pub fn noop() -> Self {
+    /// A finished liquidation with no swap result: no swap was needed, or the
+    /// stage accepted a failure as final.
+    pub fn finished_without_swap(swapper: Option<String>, reason: Option<String>) -> Self {
         Self {
             swap_result: None,
-            finalized: false,
+            finalized: true,
             operator_required: false,
-            swapper: None,
-            reason: None,
+            swapper,
+            reason,
         }
     }
 }
@@ -79,6 +86,7 @@ impl FinalizerError {
         match self {
             FinalizerError::Retryable(_) => "Retryable",
             FinalizerError::VenueCustody(_) => "VenueCustody",
+            FinalizerError::NoRoute(_) => "NoRoute",
             FinalizerError::Permanent(_) => "Permanent",
             FinalizerError::BadDebtAmountFloor(_) => "BadDebtAmountFloor",
             FinalizerError::Unresumable(_) => "Unresumable",
@@ -89,6 +97,7 @@ impl FinalizerError {
         match self {
             FinalizerError::Retryable(message)
             | FinalizerError::VenueCustody(message)
+            | FinalizerError::NoRoute(message)
             | FinalizerError::Permanent(message)
             | FinalizerError::BadDebtAmountFloor(message)
             | FinalizerError::Unresumable(message) => message,

@@ -63,11 +63,14 @@ where
                 .await
                 .map_err(|e| format!("Agent query error: {e}"))?;
 
-            for mut user in page_users {
-                user.positions
-                    .retain(|item| Self::is_supported_position(item, supported_assets));
-
-                if user.positions.is_empty() {
+            for user in page_users {
+                // Keep every position: the strategy needs the whole portfolio to
+                // tell bad debt from debt that other collateral still backs.
+                let repayable = user
+                    .positions
+                    .iter()
+                    .any(|item| item.debt_amount > 0u8 && Self::is_supported_position(item, supported_assets));
+                if !repayable {
                     continue;
                 }
 
@@ -447,5 +450,58 @@ mod tests {
             AssetType::CkAsset(supported_principal)
         );
         assert!(pages.lock().unwrap().is_empty());
+    }
+
+    /// Audit S4: the debt list decides which borrowers are worth scanning, but
+    /// it must not delete the collateral that backs their debt.
+    #[tokio::test]
+    async fn opportunity_finder_keeps_collateral_outside_the_debt_list() {
+        let ckusdc = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap();
+        let cksol = Principal::from_text("la34w-haaaa-aaaar-qb5na-cai").unwrap();
+        let usdc_debt = LiquidateblePosition {
+            pool_id: ckusdc,
+            debt_amount: Nat::from(1_000u64),
+            collateral_amount: Nat::from(0u64),
+            asset: Assets::USDC,
+            asset_type: AssetType::CkAsset(ckusdc),
+            account: Principal::anonymous(),
+            liquidation_bonus: 60,
+            liquidation_threshold: 8500,
+            protocol_fee: 200,
+        };
+        let sol_collateral = LiquidateblePosition {
+            pool_id: cksol,
+            debt_amount: Nat::from(0u64),
+            collateral_amount: Nat::from(5_000u64),
+            asset: Assets::SOL,
+            asset_type: AssetType::CkAsset(cksol),
+            ..usdc_debt.clone()
+        };
+        let user = |positions| LiquidatebleUser {
+            account: Principal::anonymous(),
+            health_factor: Nat::from(1u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
+            total_debt: Nat::from(1_000u64),
+            positions,
+        };
+        // Only collateral in the debt list's assets: nothing the bot can repay.
+        let users = vec![
+            user(vec![usdc_debt.clone(), sol_collateral.clone()]),
+            user(vec![sol_collateral.clone()]),
+        ];
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
+            Ok(ScanResult {
+                users: users.clone(),
+                next_cursor: None,
+                scanned: 2,
+            })
+        });
+        let finder = OpportunityFinder::new(Arc::new(agent), Principal::anonymous(), vec![]);
+
+        let result = finder.process(&vec![ckusdc.to_text()]).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].positions, vec![usdc_debt, sol_collateral]);
     }
 }

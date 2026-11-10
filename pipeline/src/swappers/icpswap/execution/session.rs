@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use candid::Principal;
-use ic_agent::{Agent, Identity};
+use ic_agent::Identity;
 use liquidium_pipeline_connectors::backend::icp_backend::{IcpBackend, IcpBackendImpl};
 
 use super::{
@@ -61,11 +61,7 @@ impl IcpswapExecutionSessionFactory for IcpswapAgentSessionFactory {
     fn open(&self, descriptor: &IcpswapExecutionIdentity) -> Result<IcpswapExecutionSession, String> {
         let identity = self.derive_identity(descriptor)?;
         let agent = Arc::new(
-            Agent::builder()
-                .with_url(self.ic_url.clone())
-                .with_identity(identity)
-                .with_max_tcp_error_retries(3)
-                .build()
+            crate::context::build_ic_agent(&self.ic_url, identity)
                 .map_err(|error| format!("failed to build ICPSwap execution agent: {error}"))?,
         );
         let backend = Arc::new(IcpBackendImpl::new(agent.clone()));

@@ -20,11 +20,13 @@ use super::{
         parse_evm_token_address, parse_source_icp_account, recovered_bridge_id, resolve_cketh_route_for_request,
     },
     types::{
-        CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
-        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalDetail,
-        WithdrawalRet, WithdrawalSearchParameter,
+        BridgeError, CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus,
+        HelperContract, LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg,
+        WithdrawalDetail, WithdrawalError, WithdrawalRet, WithdrawalSearchParameter,
     },
 };
+use liquidium_pipeline_core::outbound::SendOutcome;
+use liquidium_pipeline_core::types::side_cost::SideCost;
 use crate::{
     backend::{
         amount_utils::{
@@ -32,17 +34,18 @@ use crate::{
             nat_units_to_amount_via_core,
         },
         bridge_backend::{
-            BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-            BridgeSubmission, BridgeSubmissionCandidate, resolve_cketh_forward_route_by_source,
-            resolve_cketh_reverse_route_by_source,
+            BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+            BridgeSend, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice,
+            resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
         },
-        evm_backend::EvmBackendImpl,
+        evm_backend::{Broadcast, ERC20_APPROVE_GAS_LIMIT, EvmBackendImpl, SignedEvmTx},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
             icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
             icrc2_allowance_with_context, icrc2_approve_with_context,
         },
     },
+    outbound::evm_prepared_send,
     pipeline_agent::PipelineAgent,
 };
 
@@ -73,17 +76,50 @@ const MIN_ETH_FORWARD_GAS_RESERVE_WEI: u128 = 5_000_000_000_000_000;
 const ETH_FORWARD_HELPER_GAS_LIMIT: u128 = 150_000;
 const ETH_FORWARD_GAS_RESERVE_MULTIPLIER: u128 = 2;
 const DEFAULT_CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
-pub const FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX: &str = "finalizer_permanent_amount_floor";
-pub const BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX: &str = FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
-/// Marks a submission the bridge refused only because the wallet is busy. The
-/// finalizer keeps the step pending and retries without spending its budget.
-pub const BRIDGE_SUBMISSION_DEFERRED_PREFIX: &str = "bridge_submission_deferred";
 
 fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U256 {
     let dynamic_reserve = U256::from(gas_price_wei)
         .saturating_mul(U256::from(gas_limit))
         .saturating_mul(U256::from(ETH_FORWARD_GAS_RESERVE_MULTIPLIER));
     dynamic_reserve.max(U256::from(MIN_ETH_FORWARD_GAS_RESERVE_WEI))
+}
+
+/// The minter's certified answer to `withdraw_erc20`: no ckERC20 left the
+/// account. A ckETH fee it burned is reimbursed, so a new call is safe.
+impl From<WithdrawErc20Error> for BridgeError {
+    fn from(error: WithdrawErc20Error) -> Self {
+        let message = format!("withdraw_erc20 error: {error:?}");
+        match error {
+            WithdrawErc20Error::TemporarilyUnavailable(_)
+            | WithdrawErc20Error::CkErc20LedgerError {
+                error: LedgerError::TemporarilyUnavailable(_),
+                ..
+            }
+            | WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::TemporarilyUnavailable(_),
+            } => BridgeError::Deferred(message),
+            WithdrawErc20Error::CkErc20LedgerError {
+                error: LedgerError::AmountTooLow { .. },
+                ..
+            }
+            | WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::AmountTooLow { .. },
+            } => BridgeError::BelowMinimum(message),
+            _ => BridgeError::Refused(message),
+        }
+    }
+}
+
+/// The minter's certified answer to `withdraw_eth`: no ckETH left the account.
+impl From<WithdrawalError> for BridgeError {
+    fn from(error: WithdrawalError) -> Self {
+        let message = format!("withdraw_eth error: {error:?}");
+        match error {
+            WithdrawalError::TemporarilyUnavailable(_) => BridgeError::Deferred(message),
+            WithdrawalError::AmountTooLow { .. } => BridgeError::BelowMinimum(message),
+            _ => BridgeError::Refused(message),
+        }
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -95,42 +131,51 @@ pub trait BridgeEvmBackend: Send + Sync {
 
     async fn native_balance_of(&self, owner: Address) -> Result<U256, String>;
     async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String>;
+    /// The current gas price, for cost estimates.
+    async fn gas_price_wei(&self) -> Result<u128, String>;
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String>;
     async fn erc20_allowance_of(&self, token: Address, owner: Address, spender: Address) -> Result<U256, String>;
     async fn erc20_decimals_of(&self, token: Address) -> Result<u8, String>;
     async fn erc20_approve_and_wait(&self, token: Address, spender: Address, amount: U256) -> Result<TxHash, String>;
 
-    async fn helper_deposit_native(
+    // The helper calls are signed for the wallet's next nonce and not sent,
+    // so the caller can save each one before it reaches the network.
+    async fn sign_helper_deposit_native(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
 
-    async fn helper_deposit_with_subaccount(
+    async fn sign_helper_deposit_with_subaccount(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
 
-    async fn helper_deposit_eth_native(
+    async fn sign_helper_deposit_eth_native(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
 
-    async fn helper_deposit_eth_with_subaccount(
+    async fn sign_helper_deposit_eth_with_subaccount(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
+
+    async fn broadcast(&self, tx: &SignedEvmTx) -> Broadcast;
+
+    /// Decides a saved transaction from the chain.
+    async fn signed_outcome(&self, tx: &SignedEvmTx) -> SendOutcome;
 
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String>;
 }
@@ -152,12 +197,17 @@ where
     }
 
     async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String> {
-        let gas_price_wei = self
-            .provider
+        Ok(eth_forward_gas_reserve_from_price(
+            self.gas_price_wei().await?,
+            gas_limit,
+        ))
+    }
+
+    async fn gas_price_wei(&self) -> Result<u128, String> {
+        self.provider
             .get_gas_price()
             .await
-            .map_err(|e| format!("native gas price fetch failed: {e}"))?;
-        Ok(eth_forward_gas_reserve_from_price(gas_price_wei, gas_limit))
+            .map_err(|e| format!("native gas price fetch failed: {e}"))
     }
 
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String> {
@@ -180,70 +230,78 @@ where
         self.has_pending_nonce_gap(self.signer_address()).await
     }
 
-    async fn helper_deposit_native(
+    async fn sign_helper_deposit_native(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkErc20HelperNative::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .deposit_1(token, amount, recipient_principal)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("native helper deposit failed (helper={helper}, token={token}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("native helper deposit signing failed (helper={helper}, token={token}): {e}"))
     }
 
-    async fn helper_deposit_with_subaccount(
+    async fn sign_helper_deposit_with_subaccount(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkErc20HelperWithSubaccount::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .depositErc20(token, amount, recipient_principal, recipient_subaccount)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("helper depositErc20 failed (helper={helper}, token={token}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("helper depositErc20 signing failed (helper={helper}, token={token}): {e}"))
     }
 
-    async fn helper_deposit_eth_native(
+    async fn sign_helper_deposit_eth_native(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkErc20HelperNative::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .deposit_0(recipient_principal)
             .value(amount)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("native ETH helper deposit failed (helper={helper}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("native ETH helper deposit signing failed (helper={helper}): {e}"))
     }
 
-    async fn helper_deposit_eth_with_subaccount(
+    async fn sign_helper_deposit_eth_with_subaccount(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkEthHelperWithSubaccount::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .depositEth(recipient_principal, recipient_subaccount)
             .value(amount)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("ETH helper depositEth failed (helper={helper}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("ETH helper depositEth signing failed (helper={helper}): {e}"))
+    }
+
+    async fn broadcast(&self, tx: &SignedEvmTx) -> Broadcast {
+        self.broadcast_signed(tx).await
+    }
+
+    async fn signed_outcome(&self, tx: &SignedEvmTx) -> SendOutcome {
+        EvmBackendImpl::signed_outcome(self, tx).await
     }
 
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String> {
@@ -275,6 +333,9 @@ where
     pub cketh_minter_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
     forward_submission: tokio::sync::Mutex<()>,
+    /// One reverse submission at a time: the minter's ICRC-2 allowances are
+    /// account-wide, and one withdraw spends both the ckERC20 and the ckETH one.
+    reverse_submission: tokio::sync::Mutex<()>,
 }
 
 impl<A, B, E> CkErc20BridgeBackend<A, B, E>
@@ -297,6 +358,7 @@ where
             cketh_minter_canister,
             bridge_ic_owner_principal,
             forward_submission: tokio::sync::Mutex::new(()),
+            reverse_submission: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -399,7 +461,9 @@ where
         self.evm_backend.erc20_decimals_of(token).await
     }
 
-    async fn approve_minter_spend(&self, ledger: Principal, amount: Nat) -> Result<(), String> {
+    /// Sets the minter's allowance. `expected` makes the ledger refuse the approve
+    /// when the allowance changed since it was read, instead of overwriting it.
+    async fn approve_minter_spend(&self, ledger: Principal, amount: Nat, expected: Nat) -> Result<(), String> {
         let approve_args = ApproveArgs {
             from_subaccount: None,
             spender: Account {
@@ -407,7 +471,7 @@ where
                 subaccount: None,
             },
             amount,
-            expected_allowance: None,
+            expected_allowance: Some(expected),
             expires_at: None,
             fee: None,
             memo: None,
@@ -441,12 +505,42 @@ where
             return Ok(());
         }
 
-        self.approve_minter_spend(ledger, required_allowance).await
+        self.approve_minter_spend(ledger, required_allowance, current_allowance)
+            .await
     }
 
     fn with_fee_headroom(amount: &Nat) -> Nat {
         // Keep a modest buffer for quote drift between preflight and withdraw burn.
         amount.clone() + (amount.clone() / Nat::from(5u8))
+    }
+
+    /// A return to ICP pays gas from the bridge wallet: one helper call, plus
+    /// an approve when the token is an ERC-20. The limits are the ones execution budgets.
+    async fn forward_fee_budget(&self, route: &BridgeRouteSpec) -> Result<BridgeFeeBudget, String> {
+        let gas_limit = match route.route_kind {
+            BridgeRouteKind::EthToCkEth => ETH_FORWARD_HELPER_GAS_LIMIT,
+            _ => ETH_FORWARD_HELPER_GAS_LIMIT + u128::from(ERC20_APPROVE_GAS_LIMIT),
+        };
+        let gas_cost = self.evm_backend.gas_price_wei().await?.saturating_mul(gas_limit);
+        Ok(BridgeFeeBudget {
+            side_costs: vec![SideCost::new(
+                format!("ETH gas for the {} helper deposit", route.source_asset),
+                "ETH",
+                ETH_DECIMALS,
+                Nat::from(gas_cost),
+            )],
+            ..BridgeFeeBudget::default()
+        })
+    }
+
+    /// The ckETH a ckERC20 withdrawal needs in the bridge account: the burn
+    /// that pays gas, plus the fee of the approve that allows that burn.
+    async fn cketh_side_budget(&self, ckerc20_ledger: Principal, cketh_ledger_id: Principal) -> Result<Nat, String> {
+        let (burn_budget, approve_fee) = tokio::try_join!(
+            self.quoted_cketh_fee_budget(Some(ckerc20_ledger)),
+            icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "ckerc20 bridge")
+        )?;
+        Ok(burn_budget + approve_fee)
     }
 
     async fn quoted_cketh_fee_budget(&self, quote_for_ledger: Option<Principal>) -> Result<Nat, String> {
@@ -458,29 +552,18 @@ where
         Nat::from(DEFAULT_CKETH_MIN_WITHDRAWAL_WEI)
     }
 
-    fn below_minimum_bridge_error(asset: &str, chain: &str, target_asset: &str, amount: f64, minimum: f64) -> String {
-        format!(
-            "{FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
-            asset, chain, target_asset, amount, minimum
-        )
-    }
-
-    async fn ensure_native_cketh_withdrawal_minimum(
-        &self,
+    fn ensure_native_cketh_withdrawal_minimum(
         route: &BridgeRouteSpec,
         amount_native: &Nat,
         amount: f64,
-    ) -> Result<(), String> {
+    ) -> Result<(), BridgeError> {
         let minimum_native = Self::native_cketh_minimum_withdrawal_amount();
         if amount_native < &minimum_native {
             let minimum = nat_units_to_amount_via_core(&minimum_native, ETH_DECIMALS)?;
-            return Err(Self::below_minimum_bridge_error(
-                route.source_asset,
-                route.source_chain,
-                route.target_asset,
-                amount,
-                minimum,
-            ));
+            return Err(BridgeError::BelowMinimum(format!(
+                "{}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
+                route.source_asset, route.source_chain, route.target_asset, amount, minimum
+            )));
         }
         Ok(())
     }
@@ -511,18 +594,19 @@ where
             })
     }
 
-    async fn submit_forward_bridge(
+    /// Checks a forward ERC20 request, sets the helper allowance and signs the
+    /// helper call. The caller holds `forward_submission` until it sends.
+    async fn sign_forward_bridge(
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
-        // Exact approvals replace the wallet's allowance. Serialise preflight
-        // and submission, then defer while a helper may still consume it in the
-        // mempool. The RPC nonce check also applies after backend reconstruction.
-        let _submission = self.forward_submission.lock().await;
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), BridgeError> {
+        // Exact approvals replace the wallet's allowance. Defer while a helper
+        // may still consume one in the mempool. The RPC nonce check also
+        // applies after backend reconstruction.
         if self.evm_backend.has_pending_transactions().await? {
-            return Err(format!(
-                "{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions; retry after inclusion"
+            return Err(BridgeError::Deferred(
+                "bridge wallet has pending transactions; retry after inclusion".to_string(),
             ));
         }
         let token_address = parse_evm_token_address(route)?;
@@ -541,7 +625,7 @@ where
             return Err(format!(
                 "destination {:?} includes an ICP subaccount, but native helper contract does not support subaccount destinations",
                 request.destination
-            ));
+            ).into());
         }
         let helper_address = match helper {
             HelperContract::WithSubaccount(address) | HelperContract::Native(address) => address,
@@ -558,16 +642,38 @@ where
             return Err(format!(
                 "bridge amount preflight failed: ERC20 balance is below requested deposit amount (available={} required={} signer={} token={})",
                 signer_balance, amount_base_units, signer, token_address
-            ));
+            ).into());
         }
-
         // Helper must be approved before deposit call can transfer ERC20 from signer.
         let helper_allowance = self
             .evm_backend
             .erc20_allowance_of(token_address, signer, helper_address)
             .await
             .map_err(|e| format!("ERC20 allowance(helper={helper_address}) failed: {e}"))?;
+        // USDT refuses to change one non-zero allowance to another, so a leftover
+        // allowance goes to zero first. That costs one more approve.
+        let clears_allowance = !helper_allowance.is_zero() && helper_allowance < amount_base_units;
+        let approves: u128 = if clears_allowance { 2 } else { 1 };
+
+        // The approve and the helper call pay gas from the wallet's own ETH. A
+        // short wallet waits for funding instead of failing at broadcast.
+        let gas_limit = ETH_FORWARD_HELPER_GAS_LIMIT + approves * u128::from(ERC20_APPROVE_GAS_LIMIT);
+        let gas_needed = U256::from(self.evm_backend.gas_price_wei().await?).saturating_mul(U256::from(gas_limit));
+        let eth_balance = self.evm_backend.native_balance_of(signer).await?;
+        if eth_balance < gas_needed {
+            return Err(BridgeError::Deferred(format!(
+                "bridge wallet holds {eth_balance} wei ETH, below the {gas_needed} wei of gas the {} return needs",
+                route.source_asset
+            )));
+        }
+
         if helper_allowance < amount_base_units {
+            if clears_allowance {
+                self.evm_backend
+                    .erc20_approve_and_wait(token_address, helper_address, U256::ZERO)
+                    .await
+                    .map_err(|e| format!("ERC20 approve(helper={helper_address}, 0) failed: {e}"))?;
+            }
             self.evm_backend
                 .erc20_approve_and_wait(token_address, helper_address, amount_base_units)
                 .await
@@ -582,29 +688,25 @@ where
             route.target_asset,
         )
         .await?;
-        let tx_hash = match helper {
-            HelperContract::WithSubaccount(address) => self
-                .evm_backend
-                .helper_deposit_with_subaccount(
-                    address,
-                    token_address,
-                    amount_base_units,
-                    recipient_principal_bytes32,
-                    recipient_subaccount_bytes32,
-                )
-                .await
-                .map_err(|e| format!("helper depositErc20 failed: {e}"))?,
-            HelperContract::Native(address) => self
-                .evm_backend
-                .helper_deposit_native(address, token_address, amount_base_units, recipient_principal_bytes32)
-                .await
-                .map_err(|e| format!("native helper deposit failed: {e}"))?,
+        let tx = match helper {
+            HelperContract::WithSubaccount(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_with_subaccount(
+                        address,
+                        token_address,
+                        amount_base_units,
+                        recipient_principal_bytes32,
+                        recipient_subaccount_bytes32,
+                    )
+                    .await?
+            }
+            HelperContract::Native(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_native(address, token_address, amount_base_units, recipient_principal_bytes32)
+                    .await?
+            }
         };
-
-        // Return the submitted tx hash; completion is tracked asynchronously via get_bridge_status.
-        Ok(BridgeSubmission {
-            bridge_id: handle.bridge_id(tx_hash)?,
-        })
+        Ok((tx, handle))
     }
 
     /// Submits native ETH forward bridge flow (`ETH@ETH -> ckETH@ICP`).
@@ -620,11 +722,11 @@ where
     /// Safety invariant:
     /// - Preflight requires `signer_balance >= amount + dynamic gas reserve`
     ///   so we never attempt to bridge the entire ETH balance and strand gas.
-    async fn submit_native_forward_bridge(
+    async fn sign_native_forward_bridge(
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), BridgeError> {
         let signer = self.evm_backend.signer_address();
         ensure_source_matches_signer(&request.source_address, signer)?;
 
@@ -636,7 +738,7 @@ where
             return Err(format!(
                 "destination {:?} includes an ICP subaccount, but native ETH helper contract does not support subaccount destinations",
                 request.destination
-            ));
+            ).into());
         }
 
         let amount_wei = amount_to_base_units_strict(request.amount, ETH_DECIMALS)?;
@@ -656,7 +758,7 @@ where
             return Err(format!(
                 "bridge amount preflight failed: ETH balance is below requested deposit amount plus gas reserve (available={} required={} amount={} gas_reserve={} signer={})",
                 signer_balance, required_balance, amount_wei, gas_reserve, signer
-            ));
+            ).into());
         }
 
         let handle = super::mint_events::PendingMintHandle::prepare(
@@ -667,34 +769,113 @@ where
             route.target_asset,
         )
         .await?;
-        let tx_hash = match helper {
-            HelperContract::WithSubaccount(address) => self
-                .evm_backend
-                .helper_deposit_eth_with_subaccount(
-                    address,
-                    amount_wei,
-                    recipient_principal_bytes32,
-                    recipient_subaccount_bytes32,
-                )
-                .await
-                .map_err(|e| format!("ETH helper depositEth failed: {e}"))?,
-            HelperContract::Native(address) => self
-                .evm_backend
-                .helper_deposit_eth_native(address, amount_wei, recipient_principal_bytes32)
-                .await
-                .map_err(|e| format!("native ETH helper deposit failed: {e}"))?,
+        let tx = match helper {
+            HelperContract::WithSubaccount(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_eth_with_subaccount(
+                        address,
+                        amount_wei,
+                        recipient_principal_bytes32,
+                        recipient_subaccount_bytes32,
+                    )
+                    .await?
+            }
+            HelperContract::Native(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_eth_native(address, amount_wei, recipient_principal_bytes32)
+                    .await?
+            }
         };
+        Ok((tx, handle))
+    }
 
-        Ok(BridgeSubmission {
-            bridge_id: handle.bridge_id(tx_hash)?,
-        })
+    /// Signs the helper call of a forward route. It sends nothing.
+    async fn sign_forward(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), BridgeError> {
+        match route.route_kind {
+            BridgeRouteKind::CkEthErc20Forward => self.sign_forward_bridge(route, request).await,
+            BridgeRouteKind::EthToCkEth => self.sign_native_forward_bridge(route, request).await,
+            _ => Err(format!(
+                "route {}@{} -> {} has no signed helper call",
+                route.source_asset, route.source_chain, route.target_asset
+            )
+            .into()),
+        }
+    }
+
+    /// The one-shot forward flow: sign, then broadcast at once.
+    async fn submit_signed_forward(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<BridgeSubmission, BridgeError> {
+        let _submission = self.forward_submission.lock().await;
+        let (tx, handle) = self.sign_forward(route, request).await?;
+        match self.evm_backend.broadcast(&tx).await {
+            // Completion is tracked through get_bridge_status.
+            Broadcast::Sent => Ok(BridgeSubmission {
+                bridge_id: handle.bridge_id(tx.hash)?,
+            }),
+            Broadcast::Rejected(error) => Err(format!("helper deposit {:#x} refused: {error}", tx.hash).into()),
+            // A send error does not prove the transaction stayed local. A
+            // repeat after it lands would deposit the same funds twice.
+            Broadcast::Unknown(error) => Err(BridgeError::Ambiguous(format!(
+                "helper deposit has no decided answer: {error}"
+            ))),
+        }
     }
 
     async fn submit_reverse_bridge(
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
+        // Held until the withdraw spends the allowances it reads and sets.
+        let _submission = self.reverse_submission.lock().await;
+        let (source_account, cketh_ledger_id, withdraw_args) = self
+            .prepare_reverse_bridge(route, request)
+            .await
+            .map_err(BridgeError::before_call)?;
+
+        let first_try = self.withdraw_erc20_call(&withdraw_args).await?;
+        let result = match first_try {
+            ok @ WithdrawErc20Ret::Ok(_) => ok,
+            WithdrawErc20Ret::Err(WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::InsufficientAllowance { failed_burn_amount, .. },
+            }) => {
+                // If fee drift exceeded pre-approved allowance, re-approve based on the
+                // failed burn amount and retry once.
+                let retry_fee_budget = Self::with_fee_headroom(&failed_burn_amount);
+                self.ensure_minter_allowance(&source_account, cketh_ledger_id, retry_fee_budget)
+                    .await
+                    .map_err(BridgeError::Refused)?;
+                self.withdraw_erc20_call(&withdraw_args).await?
+            }
+            err @ WithdrawErc20Ret::Err(_) => err,
+        };
+
+        match result {
+            // Both block indexes identify the ICP-side withdrawal request.
+            WithdrawErc20Ret::Ok(request_id) => Ok(BridgeSubmission {
+                bridge_id: format!(
+                    "ic-withdraw:{}:{}",
+                    request_id.ckerc20_block_index, request_id.cketh_block_index
+                ),
+            }),
+            WithdrawErc20Ret::Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Checks the reverse ERC20 request and sets both minter allowances. It
+    /// does not call the minter's withdraw.
+    async fn prepare_reverse_bridge(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<(Account, Principal, WithdrawErc20Arg), String> {
         let source_account = parse_source_icp_account(&request.source_address)?;
         // Reverse flow is restricted to the configured bridge owner principal.
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
@@ -729,7 +910,7 @@ where
         let cketh_ledger_id = self.cketh_ledger_id().await?;
         let required_fee_budget = match &request.provider_fee_budget_native_units {
             Some(quoted) => quoted.clone(),
-            None => self.quoted_cketh_fee_budget(Some(ckerc20_ledger_id)).await?,
+            None => self.cketh_side_budget(ckerc20_ledger_id, cketh_ledger_id).await?,
         };
 
         // Minter withdraw burns ckERC20 and consumes ckETH for the EVM execution fee.
@@ -767,33 +948,7 @@ where
             from_ckerc20_subaccount: None,
             amount: amount_native,
         };
-
-        let first_try = self.withdraw_erc20_call(&withdraw_args).await?;
-        let result = match first_try {
-            ok @ WithdrawErc20Ret::Ok(_) => ok,
-            WithdrawErc20Ret::Err(WithdrawErc20Error::CkEthLedgerError {
-                error: LedgerError::InsufficientAllowance { failed_burn_amount, .. },
-            }) => {
-                // If fee drift exceeded pre-approved allowance, re-approve based on the
-                // failed burn amount and retry once.
-                let retry_fee_budget = Self::with_fee_headroom(&failed_burn_amount);
-                self.ensure_minter_allowance(&source_account, cketh_ledger_id, retry_fee_budget)
-                    .await?;
-                self.withdraw_erc20_call(&withdraw_args).await?
-            }
-            err @ WithdrawErc20Ret::Err(_) => err,
-        };
-
-        match result {
-            // Both block indexes identify the ICP-side withdrawal request.
-            WithdrawErc20Ret::Ok(request_id) => Ok(BridgeSubmission {
-                bridge_id: format!(
-                    "ic-withdraw:{}:{}",
-                    request_id.ckerc20_block_index, request_id.cketh_block_index
-                ),
-            }),
-            WithdrawErc20Ret::Err(err) => Err(format!("withdraw_erc20 error: {:?}", err)),
-        }
+        Ok((source_account, cketh_ledger_id, withdraw_args))
     }
 
     /// Submits native reverse bridge flow (`ckETH@ICP -> ETH@ETH`).
@@ -814,21 +969,39 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
+        // Held until the withdraw spends the allowances it reads and sets.
+        let _submission = self.reverse_submission.lock().await;
+        let withdraw_args = self
+            .prepare_native_reverse_bridge(route, request)
+            .await
+            .map_err(BridgeError::before_call)?;
+
+        match self.withdraw_eth_call(&withdraw_args).await? {
+            WithdrawalRet::Ok(request_id) => Ok(BridgeSubmission {
+                bridge_id: format!("ic-withdraw-eth:{}", request_id.block_index),
+            }),
+            WithdrawalRet::Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Checks the native reverse request and sets the minter allowance. It
+    /// does not call the minter's withdraw.
+    async fn prepare_native_reverse_bridge(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<WithdrawalArg, BridgeError> {
         let source_account = parse_source_icp_account(&request.source_address)?;
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
 
         let destination = expect_evm_destination(route, &request.destination)?;
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
         let amount_native = amount_to_nat_units_strict(request.amount, ETH_DECIMALS)?;
-        self.ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)
-            .await?;
+        Self::ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)?;
         let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
-        let required_fee_budget = match &request.provider_fee_budget_native_units {
-            Some(quoted) => quoted.clone(),
-            None => self.quoted_cketh_fee_budget(None).await?,
-        };
-        let required_budget = amount_native.clone() + approve_fee.clone() + required_fee_budget.clone();
+        // The minter burns exactly `amount` and sends `amount - gas`.
+        let required_budget = amount_native.clone() + approve_fee.clone();
 
         let available_cketh = icrc1_balance_with_context(
             self.icp_backend.as_ref(),
@@ -841,27 +1014,19 @@ where
             let available_formatted = nat_units_to_amount_via_core(&available_cketh, ETH_DECIMALS)?;
             let required_formatted = nat_units_to_amount_via_core(&required_budget, ETH_DECIMALS)?;
             return Err(format!(
-                "bridge amount preflight failed: ckETH balance is below required withdraw+approve+fee budget (available={} required={} source={})",
+                "bridge amount preflight failed: ckETH balance is below required withdraw+approve budget (available={} required={} source={})",
                 available_formatted, required_formatted, request.source_address
-            ));
+            ).into());
         }
 
-        let required_allowance = amount_native.clone() + required_fee_budget.clone();
-        self.ensure_minter_allowance(&source_account, cketh_ledger_id, required_allowance)
+        self.ensure_minter_allowance(&source_account, cketh_ledger_id, amount_native.clone())
             .await?;
 
-        let withdraw_args = WithdrawalArg {
+        Ok(WithdrawalArg {
             amount: amount_native,
             recipient: destination.to_string(),
             from_subaccount: None,
-        };
-
-        match self.withdraw_eth_call(&withdraw_args).await? {
-            WithdrawalRet::Ok(request_id) => Ok(BridgeSubmission {
-                bridge_id: format!("ic-withdraw-eth:{}", request_id.block_index),
-            }),
-            WithdrawalRet::Err(err) => Err(format!("withdraw_eth error: {:?}", err)),
-        }
+        })
     }
 }
 
@@ -1008,6 +1173,11 @@ where
     }
 
     async fn get_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<BridgeFeeBudget, String> {
+        if let Some(route) = resolve_cketh_forward_route_by_source(asset, chain)
+            && route.target_asset.eq_ignore_ascii_case(target_asset)
+        {
+            return self.forward_fee_budget(route).await;
+        }
         let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) else {
             return Ok(BridgeFeeBudget::default());
         };
@@ -1019,14 +1189,21 @@ where
         match route.route_kind {
             BridgeRouteKind::CkEthErc20Reverse => {
                 let ledger_id = parse_ckerc20_ledger_id(route)?;
+                let cketh_ledger_id = self.cketh_ledger_id().await?;
                 let (decimals, approve_fee, withdrawal_fee_budget) = tokio::try_join!(
                     icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
                     icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
-                    self.quoted_cketh_fee_budget(Some(ledger_id))
+                    self.cketh_side_budget(ledger_id, cketh_ledger_id)
                 )?;
                 Ok(BridgeFeeBudget {
                     source_fee_budget: nat_units_to_amount_via_core(&approve_fee, decimals)?,
                     destination_fee_budget: 0.0,
+                    side_costs: vec![SideCost::new(
+                        "ckETH for the ERC-20 withdrawal gas",
+                        "ETH",
+                        ETH_DECIMALS,
+                        withdrawal_fee_budget.clone(),
+                    )],
                     provider_fee_budget_native_units: Some(withdrawal_fee_budget),
                 })
             }
@@ -1036,11 +1213,13 @@ where
                     icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "cketh bridge"),
                     self.quoted_cketh_fee_budget(None)
                 )?;
-                let total_budget = approve_fee + withdrawal_fee_budget.clone();
+                // The minter burns exactly `amount` and takes the gas out of it,
+                // so the bridge account keeps only the approve fee back.
                 Ok(BridgeFeeBudget {
-                    source_fee_budget: nat_units_to_amount_via_core(&total_budget, ETH_DECIMALS)?,
+                    source_fee_budget: nat_units_to_amount_via_core(&approve_fee, ETH_DECIMALS)?,
                     destination_fee_budget: nat_units_to_amount_via_core(&withdrawal_fee_budget, ETH_DECIMALS)?,
                     provider_fee_budget_native_units: Some(withdrawal_fee_budget),
+                    side_costs: Vec::new(),
                 })
             }
             _ => Ok(BridgeFeeBudget::default()),
@@ -1072,19 +1251,49 @@ where
     ///
     /// The method performs route validation and preflight checks before sending any
     /// on-chain/canister state-changing calls.
-    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
+    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, BridgeError> {
         // Resolve route metadata once; it validates asset/chain pair and destination kind.
         let route = resolve_cketh_route_for_request(&request)?;
         match route.route_kind {
-            BridgeRouteKind::CkEthErc20Forward => self.submit_forward_bridge(route, &request).await,
+            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth => {
+                self.submit_signed_forward(route, &request).await
+            }
             BridgeRouteKind::CkEthErc20Reverse => self.submit_reverse_bridge(route, &request).await,
-            BridgeRouteKind::EthToCkEth => self.submit_native_forward_bridge(route, &request).await,
             BridgeRouteKind::CkEthToEth => self.submit_native_reverse_bridge(route, &request).await,
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by CkErc20BridgeBackend",
                 route.source_asset, route.source_chain, route.target_asset
-            )),
+            )
+            .into()),
         }
+    }
+
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, BridgeError> {
+        let route = resolve_cketh_route_for_request(request)?;
+        // Held until the send is signed, so two rows cannot sign one nonce.
+        let _submission = self.forward_submission.lock().await;
+        let (tx, handle) = self.sign_forward(route, request).await?;
+        Ok(BridgeSend {
+            send: evm_prepared_send(&tx)?,
+            handle: handle.encode()?,
+        })
+    }
+
+    async fn track_deposit(
+        &self,
+        _asset: &str,
+        _chain: &str,
+        _destination: &BridgeDestination,
+        handle: &str,
+        receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        // The minter finds a helper deposit in its own logs; the saved
+        // handle and the hash name it.
+        let hash = receipt
+            .parse::<TxHash>()
+            .map_err(|e| format!("invalid helper deposit hash `{receipt}`: {e}"))?;
+        let bridge_id = super::mint_events::PendingMintHandle::decode(handle)?.bridge_id(hash)?;
+        Ok(DepositNotice::Accepted(BridgeSubmission { bridge_id }))
     }
 
     async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
@@ -1145,7 +1354,7 @@ where
         Ok(candidates)
     }
 
-    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
         if bridge_id.starts_with("ic-withdraw:") || bridge_id.starts_with("ic-withdraw-eth:") {
             // The reverse-route caller separately requires the exchange deposit
             // credit before trading. This legacy status releases that polling
@@ -1161,11 +1370,11 @@ where
             .parse::<TxHash>()
             .map_err(|e| format!("invalid bridge id '{}': expected EVM tx hash: {e}", bridge_id))?;
 
-        let receipt = self
-            .evm_backend
-            .receipt_status(tx_hash)
-            .await
-            .map_err(|e| format!("failed to fetch transaction receipt for bridge id '{}': {e}", bridge_id))?;
+        let receipt = self.evm_backend.receipt_status(tx_hash).await.map_err(|e| {
+            BridgeError::Unreadable(format!(
+                "failed to fetch transaction receipt for bridge id '{bridge_id}': {e}"
+            ))
+        })?;
 
         let Some(receipt) = receipt else {
             return Ok(BridgeStatus::Pending);
@@ -1177,7 +1386,8 @@ where
                 &self.cketh_minter_canister,
                 event_start,
                 transaction_hash,
-            ).await?;
+            )
+            .await?;
             if let BridgeStatus::Minted(receipt) = &status {
                 if expectation.as_ref().is_some_and(|expected| !expected.matches(receipt)) {
                     return Err("mint evidence does not match the submitted amount, token and destination".into());

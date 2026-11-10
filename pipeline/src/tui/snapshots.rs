@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Local;
-use futures::future::join_all;
 
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
@@ -22,19 +21,12 @@ pub(super) async fn fetch_balances_snapshot(
             .then(a.address.cmp(&b.address))
     });
 
-    let (main_results, trader_results, recovery_results) = tokio::join!(
+    let (main_results, trader_results, recovery_results, bridge_results) = tokio::join!(
         ctx.main_service.sync_assets(&asset_ids),
         ctx.trader_service.sync_assets(&asset_ids),
         ctx.recovery_service.sync_assets(&asset_ids),
+        ctx.bridge_service.sync_assets(&asset_ids),
     );
-    let bridge_results = join_all(asset_ids.iter().cloned().map(|asset_id| {
-        let ctx = ctx.clone();
-        async move {
-            let service = ctx.bridge_balance_service_for_symbol(&asset_id.symbol);
-            service.get_balance(&asset_id).await.map(|balance| (asset_id, balance))
-        }
-    }))
-    .await;
 
     let mut rows = Vec::with_capacity(asset_ids.len());
     for (idx, asset_id) in asset_ids.iter().enumerate() {

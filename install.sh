@@ -11,9 +11,7 @@ INSTALL_DIR="${INSTALL_DIR:-$HOME/.liquidium-pipeline}"
 REPO="https://github.com/${GH_USER}/${GH_REPO}.git"
 SKIP_RUST="${SKIP_RUST:-false}"
 
-RELEASES_DIR="${INSTALL_DIR%/}/releases"
 USER_BIN="$HOME/.local/bin"
-REPO_DIR="${INSTALL_DIR%/}/repo"
 
 usage() {
   cat <<EOF
@@ -74,6 +72,10 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown arg: $1"; usage;;
   esac
 done
+
+# Derived after the arguments, so --install-dir moves the clone and the releases too.
+RELEASES_DIR="${INSTALL_DIR%/}/releases"
+REPO_DIR="${INSTALL_DIR%/}/repo"
 
 if [[ -n "$TAG" && -n "$BRANCH" ]]; then
   echo "Error: --tag and --branch are mutually exclusive. Choose one."

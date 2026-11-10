@@ -9,6 +9,7 @@ use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
+use crate::liquidation::settlement_speed::{SettlementSpeed, debt_return_speed, pair_speeds};
 use crate::stage::PipelineStage;
 
 use candid::{Int, Nat};
@@ -25,9 +26,9 @@ use log::{debug, info, warn};
 
 use num_traits::ToPrimitive;
 
-use crate::liquidation::liquidation_math::oracle_implied_output;
+use crate::liquidation::liquidation_math::{BPS_ONE, close_cap, oracle_implied_output, seize_denominator_bps};
 use crate::swappers::model::{BASIS_POINTS_DENOMINATOR, SwapRequest, amount_after_bps_haircut};
-use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger, now_ts};
+use crate::utils::{ICP_LEDGER_PRINCIPAL, approval_threshold, now_ts};
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
 
@@ -36,31 +37,68 @@ use itertools::Itertools;
 #[cfg(test)]
 const WIPEOUT_THRESHOLD: u32 = 975;
 
-fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
+fn position_asset_id(pos: &LiquidateblePosition) -> Option<AssetId> {
     if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
-        let id = AssetId {
+        return Some(AssetId {
             chain: "icp".to_string(),
             address: ICP_LEDGER_PRINCIPAL.to_string(),
             symbol: "ICP".to_string(),
-        };
-        return registry.get(&id);
+        });
     }
 
     match pos.asset_type {
-        AssetType::CkAsset(principal) => {
-            let id = AssetId {
-                chain: "icp".to_string(),
-                address: principal.to_text(),
-                symbol: pos.asset.symbol(),
-            };
-            registry.get(&id)
-        }
+        AssetType::CkAsset(principal) => Some(AssetId {
+            chain: "icp".to_string(),
+            address: principal.to_text(),
+            symbol: pos.asset.symbol(),
+        }),
         _ => None,
     }
 }
 
-fn is_supported_position_asset_type(pos: &LiquidateblePosition) -> bool {
-    pos.asset.symbol().eq_ignore_ascii_case("ICP") || matches!(pos.asset_type, AssetType::CkAsset(_))
+fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
+    registry.get(&position_asset_id(pos)?)
+}
+
+/// The same position in the borrower's working state, with the amounts left
+/// after the requests accepted earlier in this cycle.
+fn current_position(user: &LiquidatebleUser, pos: &LiquidateblePosition) -> Option<LiquidateblePosition> {
+    user.positions
+        .iter()
+        .find(|p| p.pool_id == pos.pool_id && p.asset == pos.asset && p.account == pos.account)
+        .cloned()
+}
+
+/// One (debt, collateral) pair and the values that rank it.
+struct RankedCombo {
+    user_idx: usize,
+    debt_position: LiquidateblePosition,
+    collateral_position: LiquidateblePosition,
+    debt_value: Nat,
+    collateral_value: Nat,
+    /// How the seized collateral reaches a venue.
+    settlement: SettlementSpeed,
+    /// How the proceeds come back as the debt asset.
+    repayment_settlement: SettlementSpeed,
+    /// `debt_value` after the haircut for a debt whose proceeds bridge home.
+    ranked_debt_value: Nat,
+    /// Whether this collateral can back the largest repay that one call allows.
+    covers_debt: bool,
+}
+
+/// The ranking weight that a debt loses when its proceeds bridge home.
+/// At 25%, a bridged debt must be a third larger to win, so speed never costs a much bigger liquidation.
+const RETURN_LEG_HAIRCUT_BPS: u32 = 2_500;
+
+/// Whether collateral worth `collateral_value` can back a repay worth `repay_value`, both in RAY.
+/// Out-of-range bps count as not covering, because the estimator refuses that pair too.
+fn collateral_covers_repay(
+    repay_value: &Nat,
+    collateral_value: &Nat,
+    collateral_position: &LiquidateblePosition,
+) -> bool {
+    seize_denominator_bps(collateral_position.liquidation_bonus, collateral_position.protocol_fee)
+        .is_ok_and(|denom_bps| collateral_value.clone() * Nat::from(BPS_ONE) >= repay_value.clone() * denom_bps)
 }
 
 pub struct SimpleLiquidationStrategy<C, R, U>
@@ -75,6 +113,9 @@ where
     pub account_service: Arc<BalanceService>,
     pub approval_state: Arc<ApprovalState>,
     pub watchdog: Arc<dyn Watchdog>,
+    /// ICP assets that an enabled exchange lists itself. Empty makes every venue leg slow, but
+    /// coverage and same-asset pairs still shape the ranking.
+    venue_native_symbols: Vec<String>,
 }
 
 impl<C, R, U> SimpleLiquidationStrategy<C, R, U>
@@ -97,6 +138,7 @@ where
             account_service: balance_service,
             approval_state,
             watchdog: noop_watchdog(),
+            venue_native_symbols: Vec::new(),
         }
     }
 
@@ -105,14 +147,61 @@ where
         self
     }
 
+    /// Sets the assets that reach an exchange without a bridge.
+    pub fn with_venue_native_symbols(mut self, symbols: Vec<String>) -> Self {
+        self.venue_native_symbols = symbols;
+        self
+    }
+
     fn debt_approval_needed(&self, token: &ChainToken) -> bool {
         let ChainToken::Icp { ledger, .. } = token else {
             return false;
         };
 
-        let threshold = max_for_ledger(ledger) / Nat::from(2u8);
+        let threshold = approval_threshold(ledger);
         self.approval_state
             .needs_approval(*ledger, self.config.get_lending_canister(), &threshold)
+    }
+
+    fn log_funding_shortfall(
+        token: &ChainToken,
+        position: &LiquidateblePosition,
+        available: &Nat,
+        required: &Nat,
+        reason: &str,
+    ) {
+        let missing = required.clone() - available.clone();
+        info!(
+            "Skip liquidation: insufficient wallet funds; borrower={} debt_pool={} reason={} available={} required={} missing={}",
+            position.account,
+            position.pool_id,
+            reason,
+            ChainTokenAmount::from_raw(token.clone(), available.clone()).formatted(),
+            ChainTokenAmount::from_raw(token.clone(), required.clone()).formatted(),
+            ChainTokenAmount::from_raw(token.clone(), missing).formatted(),
+        );
+    }
+
+    /// Both legs of this pair, and the return speed of its debt alone.
+    /// A token the registry cannot name counts as slow, because the loop skips that pair anyway.
+    fn combo_speeds(
+        &self,
+        debt_position: &LiquidateblePosition,
+        collateral_position: &LiquidateblePosition,
+    ) -> (SettlementSpeed, SettlementSpeed, SettlementSpeed) {
+        let (Some(collateral), Some(repayment)) = (
+            resolve_token_for_position(self.registry.as_ref(), collateral_position),
+            resolve_token_for_position(self.registry.as_ref(), debt_position),
+        ) else {
+            return (
+                SettlementSpeed::Delayed,
+                SettlementSpeed::Delayed,
+                SettlementSpeed::Delayed,
+            );
+        };
+
+        let (out, back) = pair_speeds(&collateral, &repayment, &self.venue_native_symbols);
+        (out, back, debt_return_speed(&repayment, &self.venue_native_symbols))
     }
 
     /// Ranking weight for one leg of a combo.
@@ -192,6 +281,7 @@ where
         for user in users.iter() {
             for pos in user.positions.iter() {
                 if pos.debt_amount > 0u8
+                    && self.has_debt_role(pos)
                     && let Some(token) = resolve_token_for_position(self.registry.as_ref(), pos)
                 {
                     debt_assets.insert(token);
@@ -222,6 +312,14 @@ where
             .collect()
     }
 
+    fn has_debt_role(&self, pos: &LiquidateblePosition) -> bool {
+        position_asset_id(pos).is_some_and(|id| self.registry.is_debt_asset(&id))
+    }
+
+    fn has_collateral_role(&self, pos: &LiquidateblePosition) -> bool {
+        position_asset_id(pos).is_some_and(|id| self.registry.is_collateral_asset(&id))
+    }
+
     #[allow(clippy::type_complexity)]
     fn build_combos(
         &self,
@@ -234,26 +332,32 @@ where
         let mut bad_debts: Vec<(usize, LiquidateblePosition)> = Vec::new();
 
         for (idx, user) in work_users.iter().enumerate() {
-            let debts: Vec<_> = user.positions.iter().filter(|p| p.debt_amount > 0u8).cloned().collect();
-
-            let colls: Vec<_> = user
+            let debts: Vec<_> = user
                 .positions
                 .iter()
-                .filter(|p| p.collateral_amount > 0u8)
+                .filter(|p| p.debt_amount > 0u8 && self.has_debt_role(p))
                 .cloned()
                 .collect();
-
             if debts.is_empty() {
                 continue;
             }
 
-            if colls.is_empty() {
+            // Bad debt is judged on the whole portfolio. Collateral that the bot
+            // may not seize still backs the debt, so repaying it would donate.
+            if user.positions.iter().all(|p| p.collateral_amount == 0u8) {
                 debug!("Bad debt detected: user has no collateral; queueing debt positions.");
                 for d in debts {
                     bad_debts.push((idx, d));
                 }
                 continue;
             }
+
+            let colls: Vec<_> = user
+                .positions
+                .iter()
+                .filter(|p| p.collateral_amount > 0u8 && self.has_collateral_role(p))
+                .cloned()
+                .collect();
 
             for d in &debts {
                 for c in &colls {
@@ -298,10 +402,6 @@ where
                 continue;
             }
 
-            if !is_supported_position_asset_type(&debt_position) {
-                return Err("invalid asset type".to_string());
-            }
-
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
             {
                 tok
@@ -337,9 +437,12 @@ where
                         available: available_balance.to_string(),
                     })
                     .await;
-                debug!(
-                    "Skipping bad-debt position due to insufficient funds: asset={}, available={} < min_required={}",
-                    debt_position.asset, available_balance, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &debt_fee_total,
+                    "ledger fees for bad-debt repayment",
                 );
                 continue;
             }
@@ -378,9 +481,12 @@ where
             if available_balance.clone() >= repay_amount.clone() + debt_fee_total.clone() {
                 *available_balance = available_balance.clone() - repay_amount.clone() - debt_fee_total.clone();
             } else {
-                debug!(
-                    "Available balance would underflow when updating bad-debt balance. available={}, repay={}, fees={}",
-                    available_balance, repay_amount, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &(repay_amount.clone() + debt_fee_total.clone()),
+                    "bad-debt repayment plus ledger fees",
                 );
                 continue;
             }
@@ -393,7 +499,8 @@ where
                     debt_pool_id: debt_position.pool_id,
                     collateral_pool_id: debt_position.pool_id,
                     debt_amount: repay_amount.clone(),
-                    receiver_address: self.config.get_trader_principal(),
+                    // No swap follows, so the main account that paid gets it back directly (audit L03).
+                    receiver_address: self.config.get_liquidator_principal(),
                     buy_bad_debt: true,
                 },
                 ref_price: 0u32.into(),
@@ -452,27 +559,73 @@ where
                     &mut prices,
                 )
                 .await;
-            priced.push((
+            let (settlement, repayment_settlement, debt_return) =
+                self.combo_speeds(&debt_position, &collateral_position);
+            // Coverage is against what one call may repay, so the close factor counts.
+            let allowed_repay_value = close_cap(&debt_value, &work_users[user_idx].health_factor);
+            let covers_debt = collateral_covers_repay(&allowed_repay_value, &collateral_value, &collateral_position);
+            // The weight comes from the debt alone, so every pair on one debt ranks with the same weight.
+            let ranked_debt_value = match debt_return {
+                SettlementSpeed::Direct => debt_value.clone(),
+                SettlementSpeed::Delayed => {
+                    amount_after_bps_haircut(&debt_value, RETURN_LEG_HAIRCUT_BPS).unwrap_or_else(|_| Nat::from(0u8))
+                }
+            };
+            priced.push(RankedCombo {
                 user_idx,
                 debt_position,
                 collateral_position,
                 debt_value,
                 collateral_value,
-            ));
+                settlement,
+                repayment_settlement,
+                ranked_debt_value,
+                covers_debt,
+            });
         }
 
-        // Most urgent first: lowest health factor, then largest debt by value,
-        // then largest collateral by value.
-        priced.sort_by(|(i1, _, _, d1, c1), (i2, _, _, d2, c2)| {
-            work_users[*i1]
+        // Order: lowest health factor, largest weighted debt, collateral that covers the repay,
+        // fastest legs, largest collateral. Coverage comes before speed, so fast dust cannot spend the budget of a liquidation it cannot back.
+        priced.sort_by(|a, b| {
+            work_users[a.user_idx]
                 .health_factor
-                .cmp(&work_users[*i2].health_factor)
-                .then(d2.cmp(d1))
-                .then(c2.cmp(c1))
+                .cmp(&work_users[b.user_idx].health_factor)
+                .then(b.ranked_debt_value.cmp(&a.ranked_debt_value))
+                .then(b.covers_debt.cmp(&a.covers_debt))
+                .then((a.settlement, a.repayment_settlement).cmp(&(b.settlement, b.repayment_settlement)))
+                .then(b.collateral_value.cmp(&a.collateral_value))
         });
 
-        for (user_idx, debt_position, collateral_position, _, _) in priced {
-            let debt_key = format!("{}:{}", debt_position.account, debt_position.pool_id);
+        // Logs the order the loop walks, so a live run shows why a pair came first.
+        // Enable it with `RUST_LOG=liquidator::stages::simple_strategy=debug`.
+        for (rank, combo) in priced.iter().enumerate() {
+            debug!(
+                "Ranked #{}: borrower={} hf={} | debt={} (${:.2} -> ranked ${:.2}) | collateral={} (${:.2}) | covers={} out={:?} back={:?}",
+                rank,
+                combo.debt_position.account,
+                work_users[combo.user_idx].health_factor,
+                combo.debt_position.asset.symbol(),
+                Self::native_to_units(&combo.debt_value, 27),
+                Self::native_to_units(&combo.ranked_debt_value, 27),
+                combo.collateral_position.asset.symbol(),
+                Self::native_to_units(&combo.collateral_value, 27),
+                combo.covers_debt,
+                combo.settlement,
+                combo.repayment_settlement,
+            );
+        }
+
+        for RankedCombo {
+            user_idx,
+            debt_position: debt_ref,
+            collateral_position: collateral_ref,
+            settlement,
+            repayment_settlement,
+            covers_debt,
+            ..
+        } in priced
+        {
+            let debt_key = format!("{}:{}", debt_ref.account, debt_ref.pool_id);
             if cleared_debts.contains(&debt_key) {
                 continue;
             }
@@ -481,10 +634,16 @@ where
                 continue;
             }
 
-            if !is_supported_position_asset_type(&debt_position)
-                || !is_supported_position_asset_type(&collateral_position)
-            {
-                return Err("invalid asset type".to_string());
+            // Amounts come from the working state, so collateral that an earlier
+            // request in this cycle already takes is not planned twice.
+            let (Some(debt_position), Some(collateral_position)) = (
+                current_position(&work_users[user_idx], &debt_ref),
+                current_position(&work_users[user_idx], &collateral_ref),
+            ) else {
+                continue;
+            };
+            if debt_position.debt_amount == 0u8 || collateral_position.collateral_amount == 0u8 {
+                continue;
             }
 
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
@@ -530,9 +689,12 @@ where
                         available: available_balance.to_string(),
                     })
                     .await;
-                debug!(
-                    "Skipping combo due to insufficient funds: asset={}, available={} < min_required={}",
-                    debt_position.asset, available_balance, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &debt_fee_total,
+                    "repayment ledger fees",
                 );
                 continue;
             }
@@ -546,15 +708,31 @@ where
                 max_balance
             );
 
-            let mut estimation = self
+            // The estimator caps one call with the health factor before this request.
+            let repay_cap = close_cap(&debt_position.debt_amount, &work_users[user_idx].health_factor);
+
+            // Estimate on a copy: only an accepted request may change the
+            // borrower that later candidates are planned against.
+            let mut candidate_user = work_users[user_idx].clone();
+            let mut estimation = match self
                 .collateral_service
                 .calculate_liquidation_amounts(
                     max_balance.clone(),
                     &debt_position,
                     &collateral_position,
-                    &mut work_users[user_idx],
+                    &mut candidate_user,
                 )
-                .await?;
+                .await
+            {
+                Ok(estimation) => estimation,
+                Err(error) => {
+                    warn!(
+                        "Skipping combo {} debt / {} collateral: estimation failed: {}",
+                        debt_position.asset, collateral_position.asset, error
+                    );
+                    continue;
+                }
+            };
 
             let gross_estimated_collateral = estimation.received_collateral.clone();
             estimation.received_collateral = if estimation.received_collateral < collateral_token.fee() {
@@ -640,7 +818,7 @@ where
 
             let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
-                "💱 Quote: repay_debt={} {} | seized_collateral={} {} | estimated_swap_out={} {} | price={} inverse_price={} | swap={} -> {}",
+                "💱 Quote: repay_debt={} {} | seized_collateral={} {} | estimated_swap_out={} {} | price={} inverse_price={} | swap={} -> {} | ranked: covers={} out={:?} back={:?}",
                 Self::native_to_units(&expected_repaid_debt, repayment_token.decimals()),
                 repayment_token.symbol(),
                 Self::native_to_units(&estimation.received_collateral, collateral_token.decimals()),
@@ -650,7 +828,10 @@ where
                 price,
                 inverse_price,
                 collateral_token.symbol(),
-                repayment_token.symbol()
+                repayment_token.symbol(),
+                covers_debt,
+                settlement,
+                repayment_settlement,
             );
 
             let profit = Int::from(amount_received)
@@ -689,13 +870,23 @@ where
                 *available_balance =
                     available_balance.clone() - estimation.repaid_debt.clone() - debt_fee_total.clone();
             } else {
-                debug!(
-                    "Available balance would underflow when updating. available={}, repay={}, fees={}",
-                    available_balance, estimation.repaid_debt, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &(estimation.repaid_debt.clone() + debt_fee_total.clone()),
+                    "repayment plus ledger fees",
                 );
                 continue;
             }
 
+            // Swaps run from the trader account. Without a swap the collateral goes
+            // straight back to the main account that paid the debt (audit L03).
+            let collateral_receiver = if swap_args.is_some() {
+                self.config.get_trader_principal()
+            } else {
+                self.config.get_liquidator_principal()
+            };
             result.push(ExecutorRequest {
                 debt_asset: repayment_token.clone(),
                 collateral_asset: collateral_token.clone(),
@@ -704,7 +895,7 @@ where
                     debt_pool_id: debt_position.pool_id,
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
-                    receiver_address: self.config.get_trader_principal(),
+                    receiver_address: collateral_receiver,
                     buy_bad_debt,
                 },
                 ref_price: estimation.ref_price,
@@ -717,8 +908,11 @@ where
                 debt_approval_needed,
                 min_collateral_amount,
             });
+            work_users[user_idx] = candidate_user;
 
-            if estimation.repaid_debt >= debt_position.debt_amount {
+            // The padded request is no proof that the debt closed, so the expected repay decides.
+            // A repay that the collateral capped keeps the debt open for other collateral; one at the close cap does not.
+            if expected_repaid_debt >= repay_cap {
                 cleared_debts.insert(debt_key);
             }
 
@@ -762,8 +956,13 @@ mod tests {
 
     fn mk_icp_token(symbol: &str, decimals: u8) -> ChainToken {
         // Fee comes from ChainToken impl, not from tests.
+        //
+        // The ledger is derived from the symbol because real ck-assets each
+        // have their own. A shared principal made every token compare equal by
+        // `asset_id`, which silently reads as "collateral is already the
+        // repayment asset" and collapses settlement ranking to one class.
         ChainToken::Icp {
-            ledger: p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            ledger: Principal::from_slice(symbol.as_bytes()),
             symbol: symbol.to_string(),
             decimals,
             fee: 100u8.into(),
@@ -810,6 +1009,12 @@ mod tests {
         }
     }
 
+    /// Every asset is both a debt and a collateral asset, as in the sample config.
+    fn all_roles(registry: &mut MockTokenRegistryTrait) {
+        registry.expect_is_debt_asset().return_const(true);
+        registry.expect_is_collateral_asset().return_const(true);
+    }
+
     fn mk_user(positions: Vec<LiquidateblePosition>, total_debt: u64, hf: u64) -> LiquidatebleUser {
         LiquidatebleUser {
             account: Principal::anonymous(),
@@ -828,6 +1033,7 @@ mod tests {
 
         // Registry always resolves to the same token for this test.
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -836,7 +1042,7 @@ mod tests {
         let mut cfg = MockConfigTrait::new();
         let trader = p("aaaaa-aa");
         cfg.expect_get_trader_principal().return_const(trader);
-        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(p("2vxsx-fae"));
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
         cfg.expect_get_lending_canister()
@@ -899,6 +1105,11 @@ mod tests {
         assert_eq!(req.liquidation.borrower, pos.account);
         assert_eq!(req.liquidation.debt_amount, Nat::from(2_000u64));
         assert!(req.swap_args.is_none(), "no swap expected when assets match");
+        assert_eq!(
+            req.liquidation.receiver_address,
+            p("2vxsx-fae"),
+            "no swap, so the main account receives"
+        );
         assert_eq!(req.min_collateral_amount, Nat::from(0u8));
     }
 
@@ -909,6 +1120,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -962,12 +1174,12 @@ mod tests {
         assert_eq!(res.unwrap_err(), "Could not get balance");
     }
 
-    // Errors on unsupported asset type.
     #[tokio::test]
-    async fn simple_strategy_fails_on_unsupported_asset_type() {
+    async fn simple_strategy_skips_an_unsupported_asset_type() {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1026,9 +1238,10 @@ mod tests {
         };
 
         let user = mk_user(vec![pos], 1_000, 900);
-        let res = strategy.process(&vec![user]).await;
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), "invalid asset type");
+        // A position the bot cannot represent is skipped; it must not fail
+        // the cycle for every other borrower.
+        let res = strategy.process(&vec![user]).await.unwrap();
+        assert!(res.is_empty());
     }
 
     #[tokio::test]
@@ -1050,6 +1263,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning({
             let ckusdc_token = ckusdc_token.clone();
             let icp_token = icp_token.clone();
@@ -1067,7 +1281,7 @@ mod tests {
         let mut cfg = MockConfigTrait::new();
         let trader = p("aaaaa-aa");
         cfg.expect_get_trader_principal().return_const(trader);
-        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(p("2vxsx-fae"));
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
         cfg.expect_get_lending_canister()
@@ -1132,6 +1346,11 @@ mod tests {
         assert_eq!(req.liquidation.collateral_pool_id, icp_pool);
         assert!(!req.liquidation.buy_bad_debt);
         assert!(req.swap_args.is_some());
+        assert_eq!(
+            req.liquidation.receiver_address,
+            p("aaaaa-aa"),
+            "a swap runs from the trader account"
+        );
     }
 
     // HF at or above 1000: no liquidation attempts.
@@ -1141,6 +1360,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1211,6 +1431,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1303,6 +1524,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1385,6 +1607,7 @@ mod tests {
         let token = mk_icp_token("ckBTC", 8);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1497,6 +1720,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning({
             let ckusdc_token = ckusdc_token.clone();
             let cketh_token = cketh_token.clone();
@@ -1595,6 +1819,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning({
             let ckusdc_token = ckusdc_token.clone();
             let cketh_token = cketh_token.clone();
@@ -1683,6 +1908,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1749,6 +1975,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6); // fee = 100
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1812,8 +2039,22 @@ mod tests {
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let borrower = p("user-budget");
         let debt_pos = mk_position(pool, borrower, ledger, 1_000, 0, Assets::USDC);
-        let coll_pos1 = mk_position(pool, borrower, ledger, 0, 3_000, Assets::USDC);
-        let coll_pos2 = mk_position(pool, borrower, ledger, 0, 2_500, Assets::USDC);
+        let coll_pos1 = mk_position(
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            borrower,
+            ledger,
+            0,
+            3_000,
+            Assets::USDC,
+        );
+        let coll_pos2 = mk_position(
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            borrower,
+            ledger,
+            0,
+            2_500,
+            Assets::USDC,
+        );
         let user = mk_user(vec![debt_pos, coll_pos1, coll_pos2], 1_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
@@ -1827,6 +2068,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1893,8 +2135,15 @@ mod tests {
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let borrower = p("user-hf-bump");
         let coll_pos = mk_position(pool, borrower, ledger, 0, 3_000, Assets::USDC);
-        let debt_pos1 = mk_position(pool, borrower, ledger, 1_000, 0, Assets::USDC);
-        let debt_pos2 = mk_position(pool, borrower, ledger, 500, 0, Assets::USDC);
+        let debt_pos1 = mk_position(
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            borrower,
+            ledger,
+            1_000,
+            0,
+            Assets::USDC,
+        );
+        let debt_pos2 = mk_position(p("cngnf-vqaaa-aaaar-qag4q-cai"), borrower, ledger, 500, 0, Assets::USDC);
         let user = mk_user(vec![coll_pos, debt_pos1, debt_pos2], 1_500, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
@@ -1912,6 +2161,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -2004,6 +2254,7 @@ mod tests {
         let ckbtc_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning(move |id: &AssetId| {
             Some(match id.symbol.as_str() {
                 "ETH" | "ckETH" => mk_icp_token("ckETH", 18),
@@ -2111,6 +2362,609 @@ mod tests {
         );
     }
 
+    /// Ranking by value alone gave the larger USDT debt the ckETH, which waits 15-20 minutes on the minter.
+    /// The ckBTC reaches MEXC in one transfer, so it must back the first debt.
+    #[tokio::test]
+    async fn pairs_the_largest_debt_with_the_collateral_that_recycles_fastest() {
+        let ckusdt_ledger = p("cngnf-vqaaa-aaaar-qag4q-cai");
+        let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
+        let ckbtc_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
+
+        let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
+        registry.expect_get().returning(move |id: &AssetId| {
+            Some(match id.symbol.as_str() {
+                "USDT" => mk_icp_token("ckUSDT", 6),
+                "USDC" => mk_icp_token("ckUSDC", 6),
+                "ETH" => mk_icp_token("ckETH", 18),
+                _ => mk_icp_token("ckBTC", 8),
+            })
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(100u32);
+
+        // The (debt, collateral) pair the loop evaluates first.
+        let first_pair = Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let sink = first_pair.clone();
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        // BTC ~$100k, ETH ~$3k, both stables $1, all in RAY.
+        collateral.expect_price_ray().returning(|asset| {
+            Ok(match asset {
+                Assets::BTC => Nat::from(100_000_000_000_000_000_000_000_000_000_000u128),
+                Assets::ETH => Nat::from(3_000_000_000_000_000_000_000_000_000_000u128),
+                _ => Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+            })
+        });
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(move |_max_balance, debt_pos, coll_pos, _user| {
+                sink.lock()
+                    .unwrap()
+                    .get_or_insert_with(|| (debt_pos.asset.symbol(), coll_pos.asset.symbol()));
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(1_000u64),
+                    repaid_debt: debt_pos.debt_amount.clone(),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(100_000_000_000u128),
+            })
+        });
+        account.expect_get_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(100_000_000_000u128),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        )
+        // What MEXC lists on the ICP network. ckETH is absent on purpose.
+        .with_venue_native_symbols(vec!["ckUSDT".to_string(), "ckBTC".to_string(), "ICP".to_string()]);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 600 USDT, the larger debt, so it is paired first either way.
+        let usdt_debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            ckusdt_ledger,
+            600_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 500 USDC.
+        let usdc_debt = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            ckusdc_ledger,
+            500_000_000,
+            0,
+            Assets::USDC,
+        );
+        // 1 ckETH -- $3000, the more valuable collateral, but it has to bridge.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            cketh_ledger,
+            0,
+            1_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+        // 0.02 ckBTC -- $2000, worth less, but tradeable seconds after the seize.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            ckbtc_ledger,
+            0,
+            2_000_000,
+            Assets::BTC,
+        );
+
+        let user = mk_user(
+            vec![usdt_debt, usdc_debt, cketh_collateral, ckbtc_collateral],
+            1_100_000_000,
+            900,
+        );
+
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            first_pair.lock().unwrap().clone(),
+            Some(("USDT".to_string(), "BTC".to_string())),
+            "the most urgent debt must take the collateral that recycles in seconds, not the largest one"
+        );
+    }
+
+    /// A strategy whose estimator records each pair it is asked about and repays `repaid_fraction_bps` of the debt.
+    fn ranking_probe(
+        repaid_fraction_bps: u64,
+        received_collateral: u64,
+    ) -> (
+        SimpleLiquidationStrategy<MockConfigTrait, MockTokenRegistryTrait, MockCollateralServiceTrait>,
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
+        registry.expect_get().returning(move |id: &AssetId| {
+            Some(match id.symbol.as_str() {
+                "USDT" => mk_icp_token("ckUSDT", 6),
+                "USDC" => mk_icp_token("ckUSDC", 6),
+                "ETH" => mk_icp_token("ckETH", 18),
+                "ICP" => mk_icp_token("ICP", 8),
+                _ => mk_icp_token("ckBTC", 8),
+            })
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(100u32);
+
+        let pairs = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let sink = pairs.clone();
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        // BTC ~$100k, ETH ~$3k, both stables $1, all in RAY.
+        collateral.expect_price_ray().returning(|asset| {
+            Ok(match asset {
+                Assets::BTC => Nat::from(100_000_000_000_000_000_000_000_000_000_000u128),
+                Assets::ETH => Nat::from(3_000_000_000_000_000_000_000_000_000_000u128),
+                Assets::ICP => Nat::from(5_000_000_000_000_000_000_000_000_000u128),
+                _ => Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+            })
+        });
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(move |_max_balance, debt_pos, coll_pos, _user| {
+                sink.lock()
+                    .unwrap()
+                    .push((debt_pos.asset.symbol(), coll_pos.asset.symbol()));
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(received_collateral),
+                    repaid_debt: (debt_pos.debt_amount.clone() * Nat::from(repaid_fraction_bps))
+                        / Nat::from(BASIS_POINTS_DENOMINATOR),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(1_000_000_000_000u128),
+            })
+        });
+        account.expect_get_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(1_000_000_000_000u128),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry,
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        )
+        // What MEXC lists on the ICP network. ckETH is absent on purpose.
+        .with_venue_native_symbols(vec!["ckUSDT".to_string(), "ckBTC".to_string(), "ICP".to_string()]);
+
+        (strategy, pairs)
+    }
+
+    /// Fast dust must not outrank collateral that can close the debt.
+    /// The buffer override pads the dust request to the full debt, which spends the budget of a liquidation it cannot back.
+    #[tokio::test]
+    async fn a_dust_position_that_settles_fast_does_not_outrank_collateral_that_covers_the_debt() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 5,000 ckUSDT.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            5_000_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 3 ckETH -- $9,000, slow, and the only position that can close the debt.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            3_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+        // 0.0002 ckBTC -- $20, fast, and nowhere near enough.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            20_000,
+            Assets::BTC,
+        );
+
+        let user = mk_user(vec![debt, cketh_collateral, ckbtc_collateral], 5_000_000_000, 900);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDT".to_string(), "ETH".to_string())),
+            "the collateral that can close the debt must be paired first, however slowly it settles"
+        );
+    }
+
+    /// Same-asset collateral needs no venue, so it beats collateral whose proceeds bridge home.
+    /// The ckBTC is worth more here, so only the return leg can decide.
+    #[tokio::test]
+    async fn collateral_that_is_already_the_repayment_asset_wins_the_pairing() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 1,000 ckUSDC.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            1_000_000_000,
+            0,
+            Assets::USDC,
+        );
+        // 5,000 ckUSDC -- needs no swap whatsoever.
+        let ckusdc_collateral = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            0,
+            5_000_000_000,
+            Assets::USDC,
+        );
+        // 0.06 ckBTC -- $6,000: reaches MEXC fast, but MEXC returns ckUSDC through the bridge.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            6_000_000,
+            Assets::BTC,
+        );
+
+        let user = mk_user(vec![debt, ckusdc_collateral, ckbtc_collateral], 1_000_000_000, 900);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDC".to_string(), "USDC".to_string())),
+            "same-asset collateral skips the swap entirely and must rank ahead of a venue round trip"
+        );
+    }
+
+    /// A repay that the collateral capped leaves the debt open for the borrower's other collateral.
+    /// At HF 900 one call may repay the whole debt, so the half repay is the collateral's limit.
+    #[tokio::test]
+    async fn a_partially_repaid_debt_stays_open_for_the_next_collateral() {
+        // The estimator settles half of whatever it is asked to repay, and
+        // seizes enough for the combo to be profitable.
+        let (strategy, pairs) = ranking_probe(5_000, 2_000_000_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 1,000 ckUSDT.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            1_000_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 5,000 ckUSDT -- same asset, so no swap and a clean profit.
+        let ckusdt_collateral = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            0,
+            5_000_000_000,
+            Assets::USDT,
+        );
+        // 3 ckETH -- $9,000, the collateral that should still get its turn.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            3_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+
+        let user = mk_user(vec![debt, ckusdt_collateral, cketh_collateral], 1_000_000_000, 900);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().clone(),
+            vec![
+                ("USDT".to_string(), "USDT".to_string()),
+                ("USDT".to_string(), "ETH".to_string()),
+            ],
+            "a half-settled debt must still be offered the borrower's other collateral"
+        );
+    }
+
+    /// Above HF 975 one call repays at most half the debt, so a half repay reaches the close cap.
+    /// The debt then gets one request in this cycle, not a second padded one.
+    #[tokio::test]
+    async fn a_repay_at_the_close_cap_clears_the_debt_for_the_cycle() {
+        let (strategy, pairs) = ranking_probe(5_000, 2_000_000_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 1,000 ckUSDT.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            1_000_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 5,000 ckUSDT -- same asset, so no swap and a clean profit.
+        let ckusdt_collateral = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            0,
+            5_000_000_000,
+            Assets::USDT,
+        );
+        // 3 ckETH -- $9,000.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            3_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+
+        let user = mk_user(vec![debt, ckusdt_collateral, cketh_collateral], 1_000_000_000, 990);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().clone(),
+            vec![("USDT".to_string(), "USDT".to_string())],
+            "a repay at the close cap must not be followed by a second request on the same debt"
+        );
+    }
+
+    /// Above HF 975 coverage is against the half that one call may repay, not the full debt.
+    /// $600 of fast ckBTC backs that $500, so it wins over $3,000 of slow ckETH.
+    #[tokio::test]
+    async fn fast_collateral_that_backs_the_close_capped_repay_wins_over_slow_collateral() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 1,000 ckUSDT.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            1_000_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 0.006 ckBTC -- $600, fast.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            600_000,
+            Assets::BTC,
+        );
+        // 1 ckETH -- $3,000, slow.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            1_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+
+        let user = mk_user(vec![debt, ckbtc_collateral, cketh_collateral], 1_000_000_000, 990);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDT".to_string(), "BTC".to_string())),
+            "collateral that backs the close-capped repay must win on speed"
+        );
+    }
+
+    /// Same-asset dust must not outrank collateral that covers the debt.
+    /// The haircut comes from the debt alone, so both pairs carry the same weight and coverage decides.
+    #[tokio::test]
+    async fn same_asset_dust_does_not_outrank_collateral_that_covers_the_debt() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 1,000 ckUSDC.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            1_000_000_000,
+            0,
+            Assets::USDC,
+        );
+        // 1 ckUSDC -- same asset, but dust.
+        let ckusdc_dust = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            0,
+            1_000_000,
+            Assets::USDC,
+        );
+        // 0.05 ckBTC -- $5,000, covers the debt.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            5_000_000,
+            Assets::BTC,
+        );
+
+        let user = mk_user(vec![debt, ckusdc_dust, ckbtc_collateral], 1_000_000_000, 900);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDC".to_string(), "BTC".to_string())),
+            "the collateral that covers the debt must be paired first"
+        );
+    }
+
+    /// The borrower from the first live run: ckUSDC debt of `ckusdc_debt` and $40 of ckUSDT debt,
+    /// against ckBTC and ckETH collateral.
+    fn mixed_debt_borrower(ckusdc_debt: u64) -> LiquidatebleUser {
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        let usdc_debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            ckusdc_debt,
+            0,
+            Assets::USDC,
+        );
+        // 40 ckUSDT.
+        let usdt_debt = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            40_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 0.02 ckBTC -- $2,000, covers either debt.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            2_000_000,
+            Assets::BTC,
+        );
+        // 1 ckETH -- $3,000, also covers either debt.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            1_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+
+        mk_user(
+            vec![usdc_debt, usdt_debt, ckbtc_collateral, cketh_collateral],
+            ckusdc_debt + 40_000_000,
+            900,
+        )
+    }
+
+    /// MEXC returns ckUSDT on ICP but ckUSDC through the bridge, which costs 15-20 minutes.
+    /// Raw size sent a $51 ckUSDC debt ahead of a $40 ckUSDT one.
+    #[tokio::test]
+    async fn a_debt_whose_proceeds_come_straight_home_beats_a_slightly_larger_bridged_one() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        // $51.35 ckUSDC against $40 ckUSDT: bigger, but its proceeds bridge.
+        let _ = strategy.process(&vec![mixed_debt_borrower(51_350_000)]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDT".to_string(), "BTC".to_string())),
+            "the debt that comes home in seconds must be repaid first when the two are comparable"
+        );
+    }
+
+    /// Speed must not cost a much bigger liquidation, because liquidations are contested.
+    /// Taking the small one first can lift the borrower's health factor out of range.
+    #[tokio::test]
+    async fn a_materially_larger_bridged_debt_still_outranks_a_fast_small_one() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        // $500 ckUSDC against $40 ckUSDT: far past the 25% haircut.
+        let _ = strategy.process(&vec![mixed_debt_borrower(500_000_000)]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDC".to_string(), "BTC".to_string())),
+            "a debt worth an order more must win despite its slower return leg"
+        );
+    }
+
+    /// The haircut is 25%, so a bridged debt wins once it is a third larger than a fast one.
+    #[tokio::test]
+    async fn the_return_leg_haircut_turns_over_at_a_third_larger() {
+        // $53 ckUSDC vs $40 ckUSDT: 53 * 0.75 = 39.75, still short of 40.
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+        let _ = strategy.process(&vec![mixed_debt_borrower(53_000_000)]).await.unwrap();
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned().map(|pair| pair.0),
+            Some("USDT".to_string()),
+            "just under a third larger, the fast debt still wins"
+        );
+
+        // $54 ckUSDC vs $40 ckUSDT: 54 * 0.75 = 40.5, now ahead.
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+        let _ = strategy.process(&vec![mixed_debt_borrower(54_000_000)]).await.unwrap();
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned().map(|pair| pair.0),
+            Some("USDC".to_string()),
+            "just over a third larger, the bigger debt wins despite bridging"
+        );
+    }
+
     /// Ranking asks the oracle about combos the main loop may never reach, so a
     /// single unpriceable asset must not cost us every other liquidation in the
     /// cycle.
@@ -2120,6 +2974,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -2180,10 +3035,11 @@ mod tests {
         let unpriceable_borrower = p("user-with-sol");
         let healthy_borrower = p("user-with-usdc");
 
+        let collateral_pool = p("ss2fx-dyaaa-aaaar-qacoq-cai");
         let sol_debt = mk_position(pool, unpriceable_borrower, ledger, 1_000, 0, Assets::SOL);
-        let sol_collateral = mk_position(pool, unpriceable_borrower, ledger, 0, 4_000, Assets::SOL);
+        let sol_collateral = mk_position(collateral_pool, unpriceable_borrower, ledger, 0, 4_000, Assets::SOL);
         let usdc_debt = mk_position(pool, healthy_borrower, ledger, 1_000, 0, Assets::USDC);
-        let usdc_collateral = mk_position(pool, healthy_borrower, ledger, 0, 4_000, Assets::USDC);
+        let usdc_collateral = mk_position(collateral_pool, healthy_borrower, ledger, 0, 4_000, Assets::USDC);
 
         let sol_user = mk_user(vec![sol_debt, sol_collateral], 1_000, 900);
         let usdc_user = mk_user(vec![usdc_debt, usdc_collateral], 1_000, 900);
@@ -2203,6 +3059,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -2281,5 +3138,278 @@ mod tests {
         let user_large = mk_user(vec![coll_pos, debt_large], 2_000, 900);
 
         let _ = strategy.process(&vec![user_small, user_large]).await.unwrap();
+    }
+
+    mod candidate_selection {
+        //! Audit S4, L05, L07 and L08: discovery and candidate selection.
+        use super::*;
+        use crate::liquidation::collateral_service::CollateralService;
+        use crate::price_oracle::price_oracle::MockPriceOracle;
+
+        const RAY: u128 = 1_000_000_000_000_000_000_000_000_000;
+
+        fn token(ledger: &str, symbol: &str, decimals: u8) -> ChainToken {
+            ChainToken::Icp {
+                ledger: p(ledger),
+                symbol: symbol.to_string(),
+                decimals,
+                fee: 100u8.into(),
+            }
+        }
+
+        fn tokens() -> Vec<ChainToken> {
+            vec![
+                token("xevnm-gaaaa-aaaar-qafnq-cai", "USDC", 6),
+                token("cngnf-vqaaa-aaaar-qag4q-cai", "USDT", 6),
+                token("mxzaz-hqaaa-aaaar-qaada-cai", "BTC", 8),
+                token("la34w-haaaa-aaaar-qb5na-cai", "SOL", 9),
+                token("ss2fx-dyaaa-aaaar-qacoq-cai", "ETH", 18),
+            ]
+        }
+
+        /// A registry with each token on its own ledger and the given roles.
+        fn registry(debt: &'static [&'static str], collateral: &'static [&'static str]) -> MockTokenRegistryTrait {
+            let tokens = tokens();
+            let mut registry = MockTokenRegistryTrait::new();
+            registry
+                .expect_get()
+                .returning(move |id: &AssetId| tokens.iter().find(|t| t.symbol() == id.symbol).cloned());
+            registry
+                .expect_is_debt_asset()
+                .returning(move |id: &AssetId| debt.contains(&id.symbol.as_str()));
+            registry
+                .expect_is_collateral_asset()
+                .returning(move |id: &AssetId| collateral.contains(&id.symbol.as_str()));
+            registry
+        }
+
+        fn strategy<U: CollateralServiceTrait>(
+            registry: MockTokenRegistryTrait,
+            collateral: U,
+            buy_bad_debt: bool,
+        ) -> SimpleLiquidationStrategy<MockConfigTrait, MockTokenRegistryTrait, U> {
+            let mut cfg = MockConfigTrait::new();
+            let trader = p("aaaaa-aa");
+            cfg.expect_get_trader_principal().return_const(trader);
+            cfg.expect_get_liquidator_principal().return_const(trader);
+            cfg.expect_should_buy_bad_debt().return_const(buy_bad_debt);
+            cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+            cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(500u32);
+            cfg.expect_get_lending_canister()
+                .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+            let mut account = MockAccountInfo::new();
+            let funded = |t: &ChainToken| {
+                Ok(ChainTokenAmount {
+                    token: t.clone(),
+                    value: Nat::from(1_000_000_000_000u64),
+                })
+            };
+            account.expect_get_balance().returning(funded);
+            account.expect_sync_balance().returning(funded);
+            let registry = Arc::new(registry);
+            let balance_service = Arc::new(BalanceService::new(registry.clone(), Arc::new(account)));
+            SimpleLiquidationStrategy::new(
+                Arc::new(cfg),
+                registry,
+                Arc::new(collateral),
+                balance_service,
+                Arc::new(ApprovalState::new()),
+            )
+        }
+
+        fn position(
+            pool: &str,
+            borrower: Principal,
+            debt: u128,
+            collateral: u128,
+            asset: Assets,
+        ) -> LiquidateblePosition {
+            LiquidateblePosition {
+                pool_id: p(pool),
+                debt_amount: Nat::from(debt),
+                collateral_amount: Nat::from(collateral),
+                asset,
+                asset_type: AssetType::CkAsset(p(pool)),
+                account: borrower,
+                liquidation_bonus: 1000,
+                liquidation_threshold: 8500,
+                protocol_fee: 0,
+            }
+        }
+
+        fn borrower(positions: Vec<LiquidateblePosition>, hf: u64) -> LiquidatebleUser {
+            LiquidatebleUser {
+                account: positions[0].account,
+                positions,
+                total_debt: Nat::from(0u8),
+                health_factor: Nat::from(hf),
+                weighted_liquidation_threshold: Nat::from(8500u64),
+            }
+        }
+
+        /// Real estimator over fixed USD prices; SOL has no feed.
+        fn estimator() -> CollateralService<MockPriceOracle> {
+            let mut oracle = MockPriceOracle::new();
+            oracle.expect_get_price().returning(|asset, _| match asset {
+                "USDT" | "USDC" => Ok((Nat::from(RAY), 27)),
+                "BTC" => Ok((Nat::from(100_000 * RAY), 27)),
+                _ => Err(format!("no price feed for {asset}")),
+            });
+            CollateralService::new(Arc::new(oracle))
+        }
+
+        const USDC_POOL: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
+        const USDT_POOL: &str = "cngnf-vqaaa-aaaar-qag4q-cai";
+        const BTC_POOL: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
+        const SOL_POOL: &str = "la34w-haaaa-aaaar-qb5na-cai";
+        const ETH_POOL: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
+
+        /// S4: ckUSDC is debt only and ckSOL collateral only. The borrower's
+        /// ckSOL backs the debt, so it is liquidated, never bought as bad debt.
+        #[tokio::test]
+        async fn collateral_outside_the_debt_list_is_seized_not_donated() {
+            let user = Principal::from_slice(&[1]);
+            let unseizable = Principal::from_slice(&[2]);
+            for buy_bad_debt in [true, false] {
+                let mut collateral = MockCollateralServiceTrait::new();
+                collateral.expect_price_ray().returning(|_| Ok(Nat::from(RAY)));
+                collateral
+                    .expect_calculate_liquidation_amounts()
+                    .returning(|_, _, _, _| {
+                        Ok(LiquidationEstimation {
+                            received_collateral: Nat::from(4_000_000_000u64),
+                            repaid_debt: Nat::from(1_000_000u64),
+                            ref_price: Nat::from(RAY),
+                            debt_price: Nat::from(RAY),
+                        })
+                    });
+                let strategy = strategy(registry(&["USDC"], &["SOL"]), collateral, buy_bad_debt);
+                let backed = borrower(
+                    vec![
+                        position(USDC_POOL, user, 1_000_000, 0, Assets::USDC),
+                        position(SOL_POOL, user, 0, 4_000_000_000, Assets::SOL),
+                    ],
+                    900,
+                );
+                // ETH has no role: the bot may not seize it, and it still backs the debt.
+                let backed_by_unseizable = borrower(
+                    vec![
+                        position(USDC_POOL, unseizable, 1_000_000, 0, Assets::USDC),
+                        position(ETH_POOL, unseizable, 0, 4_000_000_000_000_000_000, Assets::ETH),
+                    ],
+                    900,
+                );
+
+                let requests = strategy.process(&vec![backed, backed_by_unseizable]).await.unwrap();
+
+                assert_eq!(requests.len(), 1, "buy_bad_debt={buy_bad_debt}");
+                let liquidation = &requests[0].liquidation;
+                assert_eq!(liquidation.borrower, user);
+                assert_eq!(
+                    (liquidation.debt_pool_id, liquidation.collateral_pool_id),
+                    (p(USDC_POOL), p(SOL_POOL))
+                );
+                assert!(!liquidation.buy_bad_debt);
+            }
+        }
+
+        /// L05: two debts share one collateral that the first request takes
+        /// whole. The second must not be planned from the old amount.
+        #[tokio::test]
+        async fn collateral_taken_by_an_accepted_request_is_not_planned_again() {
+            let user = Principal::from_slice(&[3]);
+            let strategy = strategy(registry(&["USDT", "USDC"], &["BTC"]), estimator(), false);
+            let shared = borrower(
+                vec![
+                    position(USDT_POOL, user, 110_000_000, 0, Assets::USDT),
+                    position(USDC_POOL, user, 100_000_000, 0, Assets::USDC),
+                    position(BTC_POOL, user, 0, 110_000, Assets::BTC),
+                ],
+                900,
+            );
+
+            let requests = strategy.process(&vec![shared]).await.unwrap();
+
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].liquidation.debt_pool_id, p(USDT_POOL));
+        }
+
+        /// L07: an estimate that is then rejected must leave the borrower as it
+        /// was, so the next collateral is planned from the real health factor.
+        #[tokio::test]
+        async fn a_rejected_estimate_leaves_the_borrower_unchanged() {
+            let user = Principal::from_slice(&[4]);
+            let mut collateral = MockCollateralServiceTrait::new();
+            collateral.expect_price_ray().returning(|_| Ok(Nat::from(RAY)));
+            collateral.expect_calculate_liquidation_amounts().returning(
+                |_, _, coll: &LiquidateblePosition, borrower: &mut LiquidatebleUser| {
+                    if coll.pool_id == p(BTC_POOL) {
+                        // The estimate projects a healthy borrower, then fails the fee gate.
+                        borrower.health_factor = Nat::from(1_000u64);
+                        return Ok(LiquidationEstimation {
+                            received_collateral: Nat::from(50u64),
+                            repaid_debt: Nat::from(1_000u64),
+                            ref_price: Nat::from(RAY),
+                            debt_price: Nat::from(RAY),
+                        });
+                    }
+                    assert_eq!(
+                        borrower.health_factor,
+                        Nat::from(900u64),
+                        "the rejected estimate leaked"
+                    );
+                    Ok(LiquidationEstimation {
+                        received_collateral: Nat::from(4_000_000_000_000_000_000u128),
+                        repaid_debt: Nat::from(1_000u64),
+                        ref_price: Nat::from(RAY),
+                        debt_price: Nat::from(RAY),
+                    })
+                },
+            );
+            let strategy = strategy(registry(&["USDC"], &["BTC", "ETH"]), collateral, false);
+            let user = borrower(
+                vec![
+                    position(USDC_POOL, user, 1_000, 0, Assets::USDC),
+                    // Worth more than the ETH, so the ranking estimates it first.
+                    position(BTC_POOL, user, 0, 5_000_000_000, Assets::BTC),
+                    position(ETH_POOL, user, 0, 4_000_000_000_000_000_000, Assets::ETH),
+                ],
+                900,
+            );
+
+            let requests = strategy.process(&vec![user]).await.unwrap();
+
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].liquidation.collateral_pool_id, p(ETH_POOL));
+        }
+
+        /// L08: an estimate that fails on a missing price drops only its own
+        /// candidate; the rest of the cycle still produces its requests.
+        #[tokio::test]
+        async fn a_failed_estimate_drops_only_its_own_candidate() {
+            let unpriceable = Principal::from_slice(&[5]);
+            let valid = Principal::from_slice(&[6]);
+            let strategy = strategy(registry(&["USDT", "SOL"], &["BTC"]), estimator(), false);
+            // The lower health factor puts the unpriceable borrower first.
+            let sol_debt = borrower(
+                vec![
+                    position(SOL_POOL, unpriceable, 1_000_000_000, 0, Assets::SOL),
+                    position(BTC_POOL, unpriceable, 0, 110_000, Assets::BTC),
+                ],
+                800,
+            );
+            let usdt_debt = borrower(
+                vec![
+                    position(USDT_POOL, valid, 50_000_000, 0, Assets::USDT),
+                    position(BTC_POOL, valid, 0, 110_000, Assets::BTC),
+                ],
+                900,
+            );
+
+            let requests = strategy.process(&vec![sol_debt, usdt_debt]).await.unwrap();
+
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].liquidation.borrower, valid);
+        }
     }
 }

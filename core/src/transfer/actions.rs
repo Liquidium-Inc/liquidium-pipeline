@@ -39,10 +39,7 @@ impl TransferFailure {
 
 impl std::fmt::Display for TransferFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransferFailure::Rejected(message) => write!(f, "{message}"),
-            TransferFailure::Ambiguous(message) => write!(f, "{message}"),
-        }
+        f.write_str(self.message())
     }
 }
 

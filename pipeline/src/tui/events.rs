@@ -16,5 +16,9 @@ pub(super) enum UiEvent {
     Profits(Result<ProfitsSnapshot, String>),
     Executions(Result<ExecutionsSnapshot, String>),
     Withdraw(Result<String, String>),
-    Deposit(Result<DepositAddress, String>),
+    /// A deposit-address reply for the lookup with this id.
+    Deposit {
+        request: u64,
+        result: Result<DepositAddress, String>,
+    },
 }

@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use super::super::app::{App, BalancesPanel, WithdrawAccountKind, WithdrawDestinationKind, WithdrawField};
+use super::super::app::{App, BalancesPanel, WithdrawDestination, WithdrawField, WithdrawSource};
 use super::super::withdraw::mexc_deposit_lookup_for_asset;
 
 pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -232,36 +232,36 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(true);
 
     let source = match app.withdraw.source {
-        WithdrawAccountKind::Main => "main",
-        WithdrawAccountKind::Trader => "trader",
-        WithdrawAccountKind::Recovery => "recovery",
-        WithdrawAccountKind::Bridge => "bridge",
+        WithdrawSource::Main => "main",
+        WithdrawSource::Trader => "trader",
+        WithdrawSource::Recovery => "recovery",
+        WithdrawSource::Bridge => "bridge",
     };
     let destination = match app.withdraw.destination {
-        WithdrawDestinationKind::Main => "main",
-        WithdrawDestinationKind::Trader => {
+        WithdrawDestination::Main => "main",
+        WithdrawDestination::Trader => {
             if is_icp_asset {
                 "trader"
             } else {
                 "trader (ICP-only)"
             }
         }
-        WithdrawDestinationKind::Recovery => {
+        WithdrawDestination::Recovery => {
             if is_icp_asset {
                 "recovery"
             } else {
                 "recovery (ICP-only)"
             }
         }
-        WithdrawDestinationKind::Bridge => "bridge",
-        WithdrawDestinationKind::Manual => "manual",
+        WithdrawDestination::Bridge => "bridge",
+        WithdrawDestination::Manual => "manual",
     };
 
     let asset_label = selected_asset
         .map(|a| format!("{}:{}", a.chain, a.symbol))
         .unwrap_or_else(|| "-".to_string());
 
-    let manual_value = if matches!(app.withdraw.destination, WithdrawDestinationKind::Manual) {
+    let manual_value = if matches!(app.withdraw.destination, WithdrawDestination::Manual) {
         if app.withdraw.manual_destination.is_empty() {
             "press Enter".to_string()
         } else {

@@ -171,6 +171,7 @@ pub(crate) fn bootstrap_control_plane(
     db_path: &str,
     paused: Arc<AtomicBool>,
     lifecycle_watchdog: Option<Arc<dyn Watchdog>>,
+    operator: Arc<dyn crate::operator::OperatorConsole>,
 ) -> anyhow::Result<()> {
     let control_state_store = Arc::new(
         SqliteWalStore::new_with_busy_timeout(db_path, 30_000)
@@ -208,7 +209,13 @@ pub(crate) fn bootstrap_control_plane(
         });
 
         if let Err(err) =
-            crate::control_plane::serve_bound_listener_with_hook(control_listener, paused, Some(on_transition)).await
+            crate::control_plane::serve_bound_listener_with_hook(
+                control_listener,
+                paused,
+                Some(on_transition),
+                Some(operator),
+            )
+            .await
         {
             // The accept loop already retries transient failures, so reaching
             // here means the socket is unusable and pause/resume is gone for
@@ -378,20 +385,14 @@ async fn run_single_daemon_cycle(
 
                 if executions.is_empty() {
                     info!(
-                        "Found {} opportunities but none executable yet; likely waiting for funds or liquidity",
+                        "Found {} opportunities but none executable yet; see strategy logs for skip reasons",
                         opportunities.len()
                     );
                 }
 
+                // The executor alerts each liquidation that may have run without a WAL row.
                 if let Err(error) = executor.process(&executions).await {
                     tracing::error!("Executor failed: {error}");
-                    liq_dog.notify(WatchdogEvent::OperatorRequired {
-                        execution_id: "liquidation-intake".to_string(),
-                        venue: "protocol".to_string(),
-                        pending_step: "persist-liquidation-result".to_string(),
-                        owner: executor.account_id.owner.to_text(),
-                        details: error,
-                    }).await;
                 }
             }
             .instrument(info_span!("liquidation.cycle", opportunities = opp_count));

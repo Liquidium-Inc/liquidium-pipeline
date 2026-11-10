@@ -3,7 +3,6 @@ use std::sync::Arc;
 use prettytable::{Cell, Row, Table, format};
 use tracing::info;
 
-use futures::future::join_all;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use solana_sdk::{signature::Keypair, signer::Signer};
@@ -70,19 +69,12 @@ pub async fn funds() -> Result<(), String> {
 
     let asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();
 
-    let (main_results, trader_results, recovery_results) = tokio::join!(
+    let (main_results, trader_results, recovery_results, bridge_results) = tokio::join!(
         ctx.main_service.sync_assets(&asset_ids),
         ctx.trader_service.sync_assets(&asset_ids),
         ctx.recovery_service.sync_assets(&asset_ids),
+        ctx.bridge_service.sync_assets(&asset_ids),
     );
-    let bridge_results = join_all(asset_ids.iter().cloned().map(|asset_id| {
-        let ctx = ctx.clone();
-        async move {
-            let service = ctx.bridge_balance_service_for_symbol(&asset_id.symbol);
-            service.get_balance(&asset_id).await.map(|balance| (asset_id, balance))
-        }
-    }))
-    .await;
 
     if plain_logs {
         for (idx, asset_id) in asset_ids.iter().enumerate() {

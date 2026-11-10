@@ -211,6 +211,18 @@ pub struct IcpswapRecoveryState {
     pub wallet_credited_amount: Option<Nat>,
 }
 
+/// An operator's answer for a parked leg. The leg uses it on its next check,
+/// and only if the balances agree with it.
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapOperatorAnswer {
+    /// The input transfer to the pool deposit account landed in this block.
+    TransferLanded { block_index: Nat },
+    /// The swap ran and produced this gross output.
+    SwapLanded { output: Nat },
+    /// The parked call did not take effect, or its balance is written off.
+    Absent,
+}
+
 /// CEX-style durable state for the official manual ICPSwap workflow.
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IcpswapState {
@@ -220,6 +232,8 @@ pub struct IcpswapState {
     pub step: IcpswapStep,
     #[serde(default)]
     pub operator_pending_step: Option<IcpswapStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_answer: Option<IcpswapOperatorAnswer>,
     #[serde(default)]
     pub last_error: Option<String>,
     /// Earliest time the finalizer may advance this execution again.

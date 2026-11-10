@@ -22,7 +22,7 @@ use super::{
     transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
     types::{
         ICPSWAP_STATE_VERSION, IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState,
-        IcpswapStep, IcpswapUnusedBalance,
+        IcpswapOperatorAnswer, IcpswapStep, IcpswapUnusedBalance, IcpswapWithdrawArgs,
     },
 };
 
@@ -1321,4 +1321,243 @@ fn persisted_gross_output_accepts_the_previous_wire_field_name() {
 
     let decoded: IcpswapExecutionState = serde_json::from_value(json).unwrap();
     assert_eq!(decoded.trade.gross_output_amount, Some(Nat::from(119_000u64)));
+}
+
+fn deposit_account() -> Account {
+    Account {
+        owner: p(9),
+        subaccount: Some(principal_to_subaccount(owner().owner)),
+    }
+}
+
+fn parked(store: &Store, pending: IcpswapStep, answer: Option<IcpswapOperatorAnswer>) {
+    let mut state = store.0.lock().unwrap();
+    state.step = IcpswapStep::OperatorRequired;
+    state.operator_pending_step = Some(pending);
+    state.operator_answer = answer;
+    state.last_error = Some("parked".to_string());
+    state.transfer.args = Some(TransferArg {
+        from_subaccount: None,
+        to: deposit_account(),
+        fee: Some(Nat::from(10u64)),
+        created_at_time: Some(1_000),
+        memo: None,
+        amount: Nat::from(100_010u64),
+    });
+}
+
+fn ledger_balances(client: &mut MockIcpswapManualClient, deposited: u64, wallet: u64) {
+    let deposit = deposit_account();
+    let leg = owner();
+    client
+        .expect_ledger_balance()
+        .withf(move |_, account| *account == deposit)
+        .returning(move |_, _| Ok(Nat::from(deposited)));
+    client
+        .expect_ledger_balance()
+        .withf(move |_, account| *account == leg)
+        .returning(move |_, _| Ok(Nat::from(wallet)));
+}
+
+fn assert_refused(result: &IcpswapExecutionState) {
+    assert_eq!(result.step, IcpswapStep::OperatorRequired);
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("operator answer refused")),
+        "{:?}",
+        result.last_error
+    );
+}
+
+#[tokio::test]
+async fn parked_transfer_answers_need_matching_ledger_balances() {
+    let landed = Some(IcpswapOperatorAnswer::TransferLanded {
+        block_index: Nat::from(77u64),
+    });
+    let absent = Some(IcpswapOperatorAnswer::Absent);
+    let cases = [
+        (landed.clone(), 100_010, 0, IcpswapStep::Deposit),
+        (landed, 100_009, 0, IcpswapStep::OperatorRequired),
+        (absent.clone(), 0, 100_020, IcpswapStep::Transfer),
+        (absent.clone(), 100_010, 100_020, IcpswapStep::OperatorRequired),
+        (absent, 0, 100_019, IcpswapStep::OperatorRequired),
+    ];
+    for (answer, deposited, wallet, expected) in cases {
+        let store = Store::new();
+        parked(&store, IcpswapStep::TransferPending, answer);
+        let mut client = MockIcpswapManualClient::new();
+        ledger_balances(&mut client, deposited, wallet);
+
+        let result = advance_manual(&client, &store, "run-1", owner(), 1_000)
+            .await
+            .expect("answer");
+
+        assert_eq!(result.step, expected, "deposited {deposited}, wallet {wallet}");
+        assert_eq!(result.operator_answer, None);
+        match expected {
+            IcpswapStep::Deposit => assert_eq!(result.transfer.block_index, Some(Nat::from(77u64))),
+            IcpswapStep::Transfer => assert_eq!(result.transfer.args, None),
+            _ => assert_refused(&result),
+        }
+    }
+}
+
+#[tokio::test]
+async fn parked_deposit_runs_again_only_while_the_deposit_account_holds_the_input() {
+    for (deposited, expected) in [
+        (100_010, IcpswapStep::Deposit),
+        (100_009, IcpswapStep::OperatorRequired),
+    ] {
+        let store = Store::new();
+        parked(&store, IcpswapStep::DepositPending, Some(IcpswapOperatorAnswer::Absent));
+        store.0.lock().unwrap().deposit.input_pool_balance_before = Some(Nat::from(0u8));
+        let mut client = MockIcpswapManualClient::new();
+        client.expect_unused_balance().returning(|_, _| Ok(unused(0, 0)));
+        ledger_balances(&mut client, deposited, 0);
+
+        let result = advance_manual(&client, &store, "run-1", owner(), 1_000)
+            .await
+            .expect("answer");
+
+        assert_eq!(result.step, expected, "deposited {deposited}");
+        if expected == IcpswapStep::OperatorRequired {
+            assert_refused(&result);
+        }
+    }
+}
+
+#[tokio::test]
+async fn parked_swap_answers_need_matching_pool_balances() {
+    let absent = Some(IcpswapOperatorAnswer::Absent);
+    let landed = Some(IcpswapOperatorAnswer::SwapLanded {
+        output: Nat::from(60_000u64),
+    });
+    let cases = [
+        (absent.clone(), unused(100_000, 0), IcpswapStep::Recover),
+        (absent, unused(50_000, 50_000), IcpswapStep::OperatorRequired),
+        (landed.clone(), unused(50_000, 60_000), IcpswapStep::Withdraw),
+        (landed, unused(50_000, 59_999), IcpswapStep::OperatorRequired),
+    ];
+    for (answer, pool, expected) in cases {
+        let store = Store::new();
+        parked(&store, IcpswapStep::TradePending, answer);
+        {
+            let mut state = store.0.lock().unwrap();
+            state.trade.input_pool_balance_before = Some(Nat::from(100_000u64));
+            state.trade.output_pool_balance_before = Some(Nat::from(0u8));
+        }
+        let mut client = MockIcpswapManualClient::new();
+        let balances = pool.clone();
+        client
+            .expect_unused_balance()
+            .returning(move |_, _| Ok(balances.clone()));
+
+        let result = advance_manual(&client, &store, "run-1", owner(), 1_000)
+            .await
+            .expect("answer");
+
+        assert_eq!(result.step, expected, "pool {pool:?}");
+        match expected {
+            IcpswapStep::Withdraw => assert_eq!(result.trade.gross_output_amount, Some(Nat::from(60_000u64))),
+            IcpswapStep::Recover => assert_eq!(result.operator_pending_step, None),
+            _ => assert_refused(&result),
+        }
+    }
+}
+
+#[tokio::test]
+async fn parked_withdrawals_run_again_only_while_the_pool_holds_the_amount() {
+    let absent = Some(IcpswapOperatorAnswer::Absent);
+    let cases = [
+        (
+            IcpswapStep::WithdrawPending,
+            absent.clone(),
+            unused(0, 119_000),
+            IcpswapStep::Withdraw,
+        ),
+        (
+            IcpswapStep::WithdrawPending,
+            absent.clone(),
+            unused(0, 0),
+            IcpswapStep::OperatorRequired,
+        ),
+        (
+            IcpswapStep::RecoverPending,
+            absent.clone(),
+            unused(100_000, 0),
+            IcpswapStep::Recover,
+        ),
+        (
+            IcpswapStep::RecoverPending,
+            absent,
+            unused(0, 0),
+            IcpswapStep::OperatorRequired,
+        ),
+        (
+            IcpswapStep::WithdrawPending,
+            None,
+            unused(0, 119_000),
+            IcpswapStep::OperatorRequired,
+        ),
+    ];
+    for (pending, answer, pool, expected) in cases {
+        let store = Store::new();
+        let release_only = answer.is_none();
+        parked(&store, pending, answer);
+        {
+            let mut state = store.0.lock().unwrap();
+            state.withdraw.withdraw_args = Some(IcpswapWithdrawArgs {
+                token: p(2).to_text(),
+                fee: Nat::from(5u64),
+                amount: Nat::from(119_000u64),
+            });
+            state.withdraw.pool_balance_before = Some(Nat::from(119_000u64));
+            state.withdraw.wallet_balance_before = Some(Nat::from(0u8));
+            state.recovery.withdraw_args = Some(IcpswapWithdrawArgs {
+                token: p(1).to_text(),
+                fee: Nat::from(10u64),
+                amount: Nat::from(100_000u64),
+            });
+            state.recovery.pool_balance_before = Some(Nat::from(100_000u64));
+            state.recovery.wallet_balance_before = Some(Nat::from(0u8));
+        }
+        let mut client = MockIcpswapManualClient::new();
+        let balances = pool.clone();
+        client
+            .expect_unused_balance()
+            .returning(move |_, _| Ok(balances.clone()));
+        client.expect_ledger_balance().returning(|_, _| Ok(Nat::from(0u8)));
+
+        let result = advance_manual(&client, &store, "run-1", owner(), 1_000)
+            .await
+            .expect("answer");
+
+        assert_eq!(result.step, expected, "{pending:?} with pool {pool:?}");
+        if release_only {
+            // A release alone checks again and never clears the doubt.
+            assert_eq!(result.last_error.as_deref(), Some("parked"));
+        } else if expected == IcpswapStep::OperatorRequired {
+            assert_refused(&result);
+        }
+    }
+}
+
+#[tokio::test]
+async fn parked_forward_answered_absent_writes_the_balance_off() {
+    let store = Store::new();
+    parked(&store, IcpswapStep::Forward, Some(IcpswapOperatorAnswer::Absent));
+    store.0.lock().unwrap().last_error = Some("credit cannot cover its forwarding fee".to_string());
+
+    let result = advance_manual(&MockIcpswapManualClient::new(), &store, "run-1", owner(), 1_000)
+        .await
+        .expect("write off");
+
+    assert_eq!(result.step, IcpswapStep::Failed);
+    assert_eq!(result.operator_pending_step, None);
+    assert_eq!(
+        result.last_error.as_deref(),
+        Some("written off by an operator: credit cannot cover its forwarding fee")
+    );
 }
