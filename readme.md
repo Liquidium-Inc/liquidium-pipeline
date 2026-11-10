@@ -327,7 +327,7 @@ Quick reference:
 | `RIFT_API_KEY` | Optional. Names the integrator to Rift; without it Rift serves one request per second. |
 | `BRIDGE_CKBTC_MINTER_CANISTER` | The ckBTC minter; defaults to `mqygn-kiaaa-aaaar-qaadq-cai`. |
 | `BRIDGE_CKBTC_LEDGER_CANISTER` | The ckBTC ledger the minter burns from; defaults to `mxzaz-hqaaa-aaaar-qaada-cai`. |
-| `RIFT_VENUE_ALLOWLIST`, `RIFT_VENUE_BLOCKLIST` | Comma-separated Rift venue names that may, or never may, route an order (for example `rift_otc`). A venue's own confirmation count sets a leg's duration, and Rift does not report it, so pin or block venues from measured runs. |
+| `RIFT_VENUE_ALLOWLIST`, `RIFT_VENUE_BLOCKLIST` | Comma-separated Rift venue names that may, or never may, route an order. A venue's own confirmation count sets a leg's duration, and Rift does not report it. Measured on 2026-11-10 for ckBTC: the OTC route took 120 minutes to deliver, `near_intents` 16, so `RIFT_VENUE_BLOCKLIST=rift_otc` is the shipped default. |
 | `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
