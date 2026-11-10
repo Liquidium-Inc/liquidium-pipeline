@@ -53,7 +53,11 @@ async fn a_sized_amount_that_drifts_from_the_order_takes_a_new_order_instead_of_
 
     assert!(state.funding.is_none(), "the unsent transfer is dropped");
     assert!(state.order.is_none());
-    assert_eq!(state.amount_in.to_f64(), 100.0, "the next order is for what the bridge delivers");
+    assert_eq!(
+        state.amount_in.to_f64(),
+        100.0,
+        "the next order is for what the bridge delivers"
+    );
     assert_eq!(state.step, RiftStep::Order);
     assert!(!state.send_saved);
 }

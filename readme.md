@@ -81,7 +81,7 @@ the requested subaccount is preserved.
 
 ## At a Glance
 
-- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. Add `rift` for a bridge-and-swap fallback on ckUSDC, ckUSDT and ckBTC (see [Rift Venue](#rift-venue)). This release disables Kraken: `kraken` in the list stops startup.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. Add `rift` for a bridge-and-swap fallback on ckUSDC, ckUSDT, ckETH and ckBTC (see [Rift Venue](#rift-venue)). This release disables Kraken: `kraken` in the list stops startup.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
@@ -912,13 +912,13 @@ Every Kraken order is IOC at its price limit. Kraken keeps no caller id for a wi
 
 ## Rift Venue
 
-[Rift](https://www.rift.trade) swaps one asset for another across chains and pays an address. It has no account and no order book, so it is a fallback for ckUSDC, ckUSDT and ckBTC when MEXC's book is thin; it carries no ICP. The payout is always on Ethereum, so ckBTC is a pay asset only. Add `rift` to `ENABLED_SWAP_VENUES`; the planner asks MEXC first, Rift next, then Kraken.
+[Rift](https://www.rift.trade) swaps one asset for another across chains and pays an address. It has no account and no order book, so it is a fallback for ckUSDC, ckUSDT, ckETH and ckBTC when MEXC's book is thin; it carries no ICP. The payout is always on Ethereum, so ckBTC is a pay asset only. Add `rift` to `ENABLED_SWAP_VENUES`; the planner asks MEXC first, Rift next, then Kraken.
 
 A Rift leg takes these steps, each saved before it acts:
 
 1. A fresh quote. A quote under the plan's conservative output is refused.
 2. The order. Rift delivers to the bridge EVM wallet and refunds to the main EVM wallet.
-3. The ckERC20 bridge, or the ckBTC minter for ckBTC, pays the order's deposit address straight from the minter. Nothing passes through our wallets on the way in. The ckBTC minter takes the Bitcoin fee out of the amount at burn time, so a ckBTC order asks for one fee estimate less than the expected arrival; a fee rise cannot underfund it. Rift swaps a deposit above the order amount whole, so the headroom is not lost.
+3. The ckERC20 bridge, or the ckBTC minter for ckBTC, pays the order's deposit address straight from the minter. Nothing passes through our wallets on the way in. The ckBTC and ckETH minters take their fee out of the amount at execution time, so those orders ask for one fee estimate less than the expected arrival; a fee rise cannot underfund them. Rift swaps a deposit above the order amount whole, so the headroom is not lost.
 4. The order status until Rift delivers. An underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide. A refunded order parks too; the operator finds the refund on Ethereum and answers `landed <tx>`, which ends the leg as refunded and reports the row failed. The funds sit at the main EVM wallet, outside the pipeline.
 5. The ckERC20 bridge brings the delivered asset back to ICP as its ck form.
 

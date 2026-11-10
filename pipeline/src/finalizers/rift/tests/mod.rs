@@ -52,6 +52,15 @@ pub(super) fn ckusdt() -> ChainToken {
     }
 }
 
+pub(super) fn cketh() -> ChainToken {
+    ChainToken::Icp {
+        ledger: Principal::from_slice(&[9]),
+        symbol: "ckETH".to_string(),
+        decimals: 18,
+        fee: Nat::from(2_000_000_000_000u64),
+    }
+}
+
 pub(super) fn ckbtc() -> ChainToken {
     ChainToken::Icp {
         ledger: Principal::from_slice(&[7]),
@@ -77,7 +86,35 @@ pub(super) fn registry() -> Arc<TokenRegistry> {
         (ckusdc().asset_id(), ckusdc()),
         (ckusdt().asset_id(), ckusdt()),
         (ckbtc().asset_id(), ckbtc()),
+        (cketh().asset_id(), cketh()),
     ])))
+}
+
+/// A bridge whose withdrawal of `asset` keeps `source_fee` back, takes
+/// `destination_fee` out of the amount, and refuses less than `minimum`.
+/// Every other route is free of charge.
+pub(super) fn minter_bridge(
+    asset: &'static str,
+    source_fee: f64,
+    destination_fee: f64,
+    minimum: f64,
+) -> MockBridgeBackend {
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_fee_budget().returning(move |pay, _, _| {
+        Ok(if pay == asset {
+            BridgeFeeBudget {
+                source_fee_budget: source_fee,
+                destination_fee_budget: destination_fee,
+                ..BridgeFeeBudget::default()
+            }
+        } else {
+            BridgeFeeBudget::default()
+        })
+    });
+    bridge
+        .expect_get_minimum_bridge_amount()
+        .returning(move |pay, _, _| Ok(if pay == asset { minimum } else { 0.0 }));
+    bridge
 }
 
 /// A bridge whose fee budgets are free of charge and carry no side costs.

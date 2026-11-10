@@ -1,6 +1,7 @@
 //! The amount-scoped preview: the bridge out sized as execution sizes it, a
 //! Rift quote for what arrives, and the bridge back's costs. Nothing moves.
 use candid::Nat;
+use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, BridgeRouteSpec};
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBackend, RiftQuoteRequest};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
@@ -20,6 +21,17 @@ use crate::{
     swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, amount_after_bps_haircut},
     utils::now_ts,
 };
+
+/// What the order asks below the expected arrival. A minter that takes its
+/// fee out of the amount at execution time can deliver less than the
+/// estimate; one more fee estimate covers a rise, and Rift swaps the overfund whole.
+pub(super) fn order_headroom(out: &BridgeRouteSpec, budget: &BridgeFeeBudget) -> f64 {
+    if out.route_kind.fee_comes_out_of_amount() {
+        budget.destination_fee_budget.max(0.0)
+    } else {
+        0.0
+    }
+}
 
 /// What the order asks for: the expected arrival less the headroom, or
 /// nothing when the fees eat the arrival.
@@ -101,8 +113,9 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let pay_token = &pay_amount.token;
         let expected = ChainTokenAmount::from_formatted(pay_token.clone(), arrival.expected_amount);
         let arrival_headroom =
-            ChainTokenAmount::from_formatted(pay_token.clone(), pay_chain.order_headroom(&arrival.sizing.fee_budget));
-        let amount_in = order_amount(&expected, &arrival_headroom).ok_or("the bridge fees leave nothing for Rift to swap")?;
+            ChainTokenAmount::from_formatted(pay_token.clone(), order_headroom(out, &arrival.sizing.fee_budget));
+        let amount_in =
+            order_amount(&expected, &arrival_headroom).ok_or("the bridge fees leave nothing for Rift to swap")?;
         let pair = format!("{}.{}->{}", pay_chain.name(), out.target_asset, back.source_asset);
         let quote = self
             .backend
@@ -114,7 +127,8 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             })
             .await
             .map_err(|error| format!("Rift cannot quote {pair}: {error}"))?;
-        let receive_amount = rift_amount(&final_asset, &quote.estimated_amount_out).map_err(|error| error.to_string())?;
+        let receive_amount =
+            rift_amount(&final_asset, &quote.estimated_amount_out).map_err(|error| error.to_string())?;
         if receive_amount.value == 0u8 {
             return Err(format!("Rift quotes nothing for {} {pair}", decimal_text(&amount_in)));
         }
