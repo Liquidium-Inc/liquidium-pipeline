@@ -32,11 +32,18 @@ mod order;
 mod wait;
 
 /// The chain Rift swaps on for every asset this venue carries.
+/// The chain Rift delivers to: the ckERC20 bridge brings the payout back.
 pub(super) const RIFT_CHAIN: &str = "ethereum";
+pub(super) const BITCOIN: &str = "bitcoin";
 
-/// The ck assets this venue carries, with their Ethereum symbol. ckETH waits
-/// for a fix to the fee drift between the order and the native bridge.
-const RIFT_ASSETS: [(&str, &str); 2] = [("ckUSDC", "USDC"), ("ckUSDT", "USDT")];
+/// The ck assets this venue carries, with the chain and symbol Rift knows
+/// them by. ckETH waits for a fix to the fee drift between the order and the
+/// native bridge.
+const RIFT_ASSETS: [(&str, &str, &str); 3] = [
+    ("ckUSDC", RIFT_CHAIN, "USDC"),
+    ("ckUSDT", RIFT_CHAIN, "USDT"),
+    ("ckBTC", BITCOIN, "BTC"),
+];
 
 /// A throttled or unreachable Rift is a wait; every other refusal is a retry.
 impl From<RiftError> for VenueStepError {
@@ -124,24 +131,30 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         &self.bridge.sources.evm
     }
 
-    /// The Ethereum symbol of a ck asset this venue carries.
-    pub(super) fn rift_symbol(asset: &ChainToken) -> Option<&'static str> {
+    /// The chain and symbol Rift knows a ck asset by.
+    pub(super) fn rift_asset(asset: &ChainToken) -> Option<(&'static str, &'static str)> {
         let symbol = asset.symbol();
         RIFT_ASSETS
             .iter()
-            .find(|(ck, _)| ck.eq_ignore_ascii_case(&symbol))
-            .map(|(_, evm)| *evm)
+            .find(|(ck, _, _)| ck.eq_ignore_ascii_case(&symbol))
+            .map(|(_, chain, symbol)| (*chain, *symbol))
     }
 
-    /// The two bridge routes of a leg: the pay asset out to Ethereum, and the
-    /// delivered asset back to its ck form.
+    /// The two bridge routes of a leg: the pay asset out to its chain, and
+    /// the delivered asset back from Ethereum to its ck form.
     pub(super) fn leg_routes(
         pay: &ChainToken,
         receive: &ChainToken,
     ) -> Result<(&'static BridgeRouteSpec, &'static BridgeRouteSpec), String> {
-        let pay_symbol = Self::rift_symbol(pay).ok_or_else(|| format!("Rift does not carry {}", pay.symbol()))?;
-        let receive_symbol =
-            Self::rift_symbol(receive).ok_or_else(|| format!("Rift does not deliver {}", receive.symbol()))?;
+        let (_, pay_symbol) = Self::rift_asset(pay).ok_or_else(|| format!("Rift does not carry {}", pay.symbol()))?;
+        let (receive_chain, receive_symbol) =
+            Self::rift_asset(receive).ok_or_else(|| format!("Rift does not deliver {}", receive.symbol()))?;
+        if receive_chain != RIFT_CHAIN {
+            return Err(format!(
+                "Rift delivers only to Ethereum in this build, not {} on {receive_chain}",
+                receive.symbol()
+            ));
+        }
         if pay_symbol == receive_symbol {
             return Err(format!("Rift cannot swap {} for itself", pay.symbol()));
         }

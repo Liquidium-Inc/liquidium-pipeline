@@ -1,6 +1,7 @@
 //! The amount-scoped preview: the bridge out sized as execution sizes it, a
 //! Rift quote for what arrives, and the bridge back's costs. Nothing moves.
 use candid::Nat;
+use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeDestinationKind, BridgeFeeBudget, BridgeRouteSpec};
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBackend, RiftQuoteRequest};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
@@ -20,13 +21,22 @@ use crate::{
     utils::now_ts,
 };
 
+/// What the order asks below the expected arrival. The minter deducts the
+/// Bitcoin fee at burn time, so one more fee estimate covers a rise in it.
+fn order_headroom(out: &BridgeRouteSpec, budget: &BridgeFeeBudget) -> f64 {
+    match out.destination_kind {
+        BridgeDestinationKind::BtcAddress => budget.destination_fee_budget.max(0.0),
+        _ => 0.0,
+    }
+}
+
 /// The one leg of a Rift route: the whole allocation for what Rift pays out.
 fn swap_leg(state: &RiftState, receive_amount: &ChainTokenAmount, price: f64) -> SwapQuoteLeg {
     SwapQuoteLeg {
         venue: RIFT_VENUE_ID.to_string(),
         route_id: format!(
             "{}>{}",
-            RiftAsset::new(RIFT_CHAIN, &state.pay_symbol).as_str(),
+            RiftAsset::new(&state.pay_chain, &state.pay_symbol).as_str(),
             RiftAsset::new(RIFT_CHAIN, &state.receive_symbol).as_str()
         ),
         pay_chain: state.size_in.token.chain(),
@@ -78,20 +88,23 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         request: &SwapRequest,
     ) -> Result<RiftPreview, String> {
         let (pay_amount, final_asset, final_destination) = self.swap_request_parts(request)?;
+        let (pay_chain, _) = Self::rift_asset(&pay_amount.token)
+            .ok_or_else(|| format!("Rift does not carry {}", pay_amount.token.symbol()))?;
         let (out, back) = Self::leg_routes(&pay_amount.token, &final_asset)?;
         let arrival = bridged_deposit_arrival(&self.bridge, out, &pay_amount.token, &pay_amount)
             .await
             .map_err(|error| error.to_string())?;
         let mut side_costs = arrival.sizing.fee_budget.side_costs.clone();
-        let amount_in = arrival.expected_amount;
+        let arrival_headroom = order_headroom(out, &arrival.sizing.fee_budget);
+        let amount_in = arrival.expected_amount - arrival_headroom;
         if amount_in <= LIQUIDITY_EPS {
             return Err("the bridge fees leave nothing for Rift to swap".to_string());
         }
-        let pair = format!("{}->{}", out.target_asset, back.source_asset);
+        let pair = format!("{pay_chain}.{}->{}", out.target_asset, back.source_asset);
         let quote = self
             .backend
             .quote(&RiftQuoteRequest {
-                from: RiftAsset::new(RIFT_CHAIN, out.target_asset),
+                from: RiftAsset::new(pay_chain, out.target_asset),
                 to: RiftAsset::new(RIFT_CHAIN, back.source_asset),
                 amount_in: decimal_text(amount_in, pay_amount.token.decimals()),
             })
@@ -131,9 +144,11 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             size_in: pay_amount.clone(),
             final_asset: final_asset.clone(),
             final_destination,
+            pay_chain: pay_chain.to_string(),
             pay_symbol: out.target_asset.to_string(),
             receive_symbol: back.source_asset.to_string(),
             amount_in,
+            arrival_headroom,
             min_amount_out: conservative_receive.to_f64(),
             quote_id: None,
             order: None,

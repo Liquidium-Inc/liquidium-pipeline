@@ -173,9 +173,11 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
         size_in: ChainTokenAmount::from_raw(ckusdc(), Nat::from(100_010_000u64)),
         final_asset: ckusdt(),
         final_destination: Principal::anonymous().to_text(),
+        pay_chain: "ethereum".to_string(),
         pay_symbol: "USDC".to_string(),
         receive_symbol: "USDT".to_string(),
         amount_in: 100.0,
+        arrival_headroom: 0.0,
         min_amount_out: 99.0,
         quote_id: None,
         order: Some(RiftOrderRecord {

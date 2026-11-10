@@ -14,7 +14,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
     /// What to quote: the amount the bridge delivers, in Rift's names.
     pub(super) fn quote_request(&self, state: &RiftState) -> RiftQuoteRequest {
         RiftQuoteRequest {
-            from: RiftAsset::new(RIFT_CHAIN, &state.pay_symbol),
+            from: RiftAsset::new(&state.pay_chain, &state.pay_symbol),
             to: RiftAsset::new(RIFT_CHAIN, &state.receive_symbol),
             amount_in: decimal_text(state.amount_in, state.size_in.token.decimals()),
         }

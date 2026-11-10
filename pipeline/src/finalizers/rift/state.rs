@@ -55,6 +55,10 @@ pub struct RiftOrderRecord {
     pub refund_tx: Option<String>,
 }
 
+fn ethereum() -> String {
+    "ethereum".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiftState {
     pub liq_id: String,
@@ -64,11 +68,19 @@ pub struct RiftState {
     pub final_asset: ChainToken,
     /// The ICP account the final asset goes to.
     pub final_destination: String,
-    /// The Ethereum symbols on each side of Rift, `USDC` -> `USDT`.
+    /// The chain Rift takes the pay asset on: `ethereum` or `bitcoin`.
+    #[serde(default = "ethereum")]
+    pub pay_chain: String,
+    /// The symbols on each side of Rift, `USDC` -> `USDT`. The payout is
+    /// always on Ethereum.
     pub pay_symbol: String,
     pub receive_symbol: String,
-    /// What the bridge delivers to Rift, as the preview sized it.
+    /// What the order asks for: the expected bridge arrival less the headroom.
     pub amount_in: f64,
+    /// What the order asks below the expected arrival. A Bitcoin fee can rise
+    /// between the estimate and the burn, and an underfunded order is refunded.
+    #[serde(default)]
+    pub arrival_headroom: f64,
     /// The planned floor for a fresh quote. A quote under it is refused.
     pub min_amount_out: f64,
     /// The fresh quote, saved before the order is created from it. Rift

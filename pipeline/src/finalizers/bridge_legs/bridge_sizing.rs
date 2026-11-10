@@ -111,7 +111,10 @@ pub fn reverse_bridge_source_fee_reserve(
 ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, BridgeLegError> {
     if !matches!(
         route.route_kind,
-        BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth | BridgeRouteKind::IcpToSolana
+        BridgeRouteKind::CkEthErc20Reverse
+            | BridgeRouteKind::CkEthToEth
+            | BridgeRouteKind::IcpToSolana
+            | BridgeRouteKind::CkBtcToBtc
     ) || !route.source_chain.eq_ignore_ascii_case("ICP")
         || !asset.symbol().eq_ignore_ascii_case(route.source_asset)
         || !asset.chain().eq_ignore_ascii_case(route.source_chain)

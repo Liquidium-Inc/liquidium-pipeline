@@ -80,18 +80,18 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 }
             }
             BridgeLegOutcome::Saved { side_costs } => {
-                // The funding was just sized. Rift refunds a deposit that is
-                // not the order amount, so the unsent transfer is dropped and
-                // a new order is taken for what the bridge delivers now.
+                // The funding was just sized. Rift refunds a deposit under the
+                // order amount, so the unsent transfer is dropped and a new
+                // order is taken for what the bridge delivers now.
                 if funding_phase
                     && let Some(expected) = state.bridge_out.deposit_bridge_expected_amount
-                    && (expected - order_amount).abs() > AMOUNT_TOLERANCE
+                    && (expected - state.arrival_headroom - order_amount).abs() > AMOUNT_TOLERANCE
                 {
                     warn!(
-                        "[rift] liq_id={} the bridge would deliver {expected} {}, but order {} expects {order_amount}; a new order follows",
-                        state.liq_id, state.pay_symbol, order_id
+                        "[rift] liq_id={} the bridge would deliver {expected} {} with {} headroom, but order {} expects {order_amount}; a new order follows",
+                        state.liq_id, state.pay_symbol, state.arrival_headroom, order_id
                     );
-                    state.amount_in = expected;
+                    state.amount_in = expected - state.arrival_headroom;
                     state.reorder();
                     return Ok(());
                 }
