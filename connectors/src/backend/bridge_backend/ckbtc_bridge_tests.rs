@@ -445,8 +445,8 @@ async fn the_lookup_refuses_another_source_account() {
     assert!(error.contains("does not match configured bridge owner"), "{error}");
 }
 
-/// Only a confirmed Bitcoin transaction completes. A reimbursement that is
-/// still under way holds the funds, so it waits like any other state.
+/// A broadcast Bitcoin transaction completes. A reimbursement that is still
+/// under way holds the funds, so it waits like any other state.
 #[tokio::test]
 async fn the_status_maps_every_minter_state() {
     let reimbursement = ReimbursementRequest {
@@ -458,7 +458,11 @@ async fn the_status_maps_every_minter_state() {
         (RetrieveBtcStatusV2::Pending, BridgeStatus::Pending),
         (RetrieveBtcStatusV2::Signing, BridgeStatus::Pending),
         (RetrieveBtcStatusV2::Sending { txid: vec![1] }, BridgeStatus::Pending),
-        (RetrieveBtcStatusV2::Submitted { txid: vec![1] }, BridgeStatus::Pending),
+        // Broadcast is enough: the receiver watches the chain itself.
+        (
+            RetrieveBtcStatusV2::Submitted { txid: vec![1] },
+            BridgeStatus::Completed,
+        ),
         (RetrieveBtcStatusV2::AmountTooLow, BridgeStatus::Pending),
         (RetrieveBtcStatusV2::WillReimburse(reimbursement), BridgeStatus::Pending),
         (

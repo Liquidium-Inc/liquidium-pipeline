@@ -291,8 +291,9 @@ where
         Ok(candidates)
     }
 
-    /// Only a confirmed Bitcoin transaction completes, and only a done
-    /// reimbursement cancels: until then the minter still holds the funds.
+    /// A broadcast Bitcoin transaction completes the leg: the receiver
+    /// watches the chain itself, and the minter's six confirmations are only
+    /// its own bookkeeping. Only a done reimbursement cancels.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
         let block_index = Self::retrieval_index(bridge_id)?;
         let status = self
@@ -302,16 +303,16 @@ where
             .map_err(BridgeError::Unreadable)?;
         Ok(match status {
             RetrieveBtcStatusV2::Pending | RetrieveBtcStatusV2::Signing => BridgeStatus::Pending,
-            RetrieveBtcStatusV2::Sending { txid } | RetrieveBtcStatusV2::Submitted { txid } => {
+            RetrieveBtcStatusV2::Sending { txid } => {
                 log::debug!(
-                    "[ckbtc bridge] retrieval {block_index} is in Bitcoin transaction {}",
+                    "[ckbtc bridge] retrieval {block_index} is being sent as Bitcoin transaction {}",
                     display_txid(&txid)
                 );
                 BridgeStatus::Pending
             }
-            RetrieveBtcStatusV2::Confirmed { txid } => {
+            RetrieveBtcStatusV2::Submitted { txid } | RetrieveBtcStatusV2::Confirmed { txid } => {
                 log::info!(
-                    "[ckbtc bridge] retrieval {block_index} confirmed in Bitcoin transaction {}",
+                    "[ckbtc bridge] retrieval {block_index} is on Bitcoin in transaction {}",
                     display_txid(&txid)
                 );
                 BridgeStatus::Completed

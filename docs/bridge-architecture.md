@@ -90,8 +90,10 @@ Defined in `connectors/src/backend/bridge_backend/mod.rs`:
 - Refusals: `AlreadyProcessing` defers, `AmountTooLow` is below minimum, a bad
   address or short funds is refused. `TemporarilyUnavailable` and `GenericError`
   are ambiguous, because the minter's ledger call may have burned.
-- Status: `Confirmed` completes. A reimbursement cancels only once `Reimbursed`,
-  when the ckBTC is back on the account; `WillReimburse` and `AmountTooLow` wait.
+- Status: `Submitted` and `Confirmed` complete, because the receiver watches the
+  chain itself and the minter's six confirmations are only its bookkeeping. A
+  reimbursement cancels only once `Reimbursed`, when the ckBTC is back on the
+  account; `WillReimburse` and `AmountTooLow` wait.
 
 `RoutedBridgeBackend` sends `ckBTC@ICP` and `BTC@BTC` requests, and `ckbtc-`
 handles, to this backend. `BTC@BTC -> ckBTC` is not served yet.
