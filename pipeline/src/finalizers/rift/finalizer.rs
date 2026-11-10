@@ -5,15 +5,15 @@ use std::sync::{Arc, Mutex};
 
 use candid::{Nat, Principal};
 
-pub use super::chain::RiftRefundAddresses;
 use super::chain::RiftChain;
+pub use super::chain::RiftRefundAddresses;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::BridgeRouteSpec,
     rift_backend::{RiftBackend, RiftError, RiftVenueLists},
 };
 use liquidium_pipeline_core::{
-    tokens::chain_token_amount::ChainTokenAmount,
     outbound::OutboundSender,
+    tokens::chain_token_amount::ChainTokenAmount,
     tokens::{chain_token::ChainToken, token_registry::TokenRegistryTrait},
 };
 
@@ -36,11 +36,11 @@ mod order;
 mod wait;
 
 /// The ck assets this venue carries, with the chain and symbol Rift knows
-/// them by. ckETH waits for a fix to the fee drift between the order and the
-/// native bridge.
-const RIFT_ASSETS: [(&str, RiftChain, &str); 3] = [
+/// them by.
+const RIFT_ASSETS: [(&str, RiftChain, &str); 4] = [
     ("ckUSDC", RiftChain::Ethereum, "USDC"),
     ("ckUSDT", RiftChain::Ethereum, "USDT"),
+    ("ckETH", RiftChain::Ethereum, "ETH"),
     ("ckBTC", RiftChain::Bitcoin, "BTC"),
 ];
 
@@ -64,7 +64,9 @@ pub(super) fn rift_amount(token: &ChainToken, text: &str) -> Result<ChainTokenAm
     let fraction = &fraction[..fraction.len().min(decimals)];
     let digits = format!("{whole}{fraction:0<decimals$}");
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(VenueStepError::Other(format!("Rift amount `{text}` is not a plain decimal")));
+        return Err(VenueStepError::Other(format!(
+            "Rift amount `{text}` is not a plain decimal"
+        )));
     }
     let units = digits
         .parse::<u128>()

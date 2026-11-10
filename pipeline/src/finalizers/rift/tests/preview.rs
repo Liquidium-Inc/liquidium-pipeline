@@ -101,22 +101,66 @@ async fn an_asset_rift_does_not_carry_is_unavailable_before_any_call() {
         MockBridgeBackend::new(),
         MockOutboundSender::new(),
     );
-    let cketh = ChainToken::Icp {
-        ledger: Principal::from_slice(&[9]),
-        symbol: "ckETH".to_string(),
-        decimals: 18,
-        fee: Nat::from(2_000_000_000_000u64),
+    let icp = ChainToken::Icp {
+        ledger: Principal::from_slice(&[11]),
+        symbol: "ICP".to_string(),
+        decimals: 8,
+        fee: Nat::from(10_000u64),
     };
     let mut request = request(100_010_000);
-    request.pay_asset = cketh.asset_id();
-    request.pay_amount = ChainTokenAmount::from_raw(cketh, Nat::from(1_000_000_000_000_000u64));
+    request.pay_asset = icp.asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(icp, Nat::from(100_000_000u64));
 
     let error = finalizer.check_amount(&request).await.unwrap_err();
 
     assert!(
-        matches!(error, VenueAmountError::Unavailable(ref reason) if reason.contains("ckETH")),
+        matches!(error, VenueAmountError::Unavailable(ref reason) if reason.contains("ICP")),
         "{error}"
     );
+}
+
+/// The ckETH minter takes the Ethereum gas out of the withdrawn amount at
+/// execution time, so a ckETH order gets the same headroom as a ckBTC one.
+#[tokio::test]
+async fn a_cketh_leg_quotes_ethereum_with_headroom_under_the_expected_arrival() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote().times(1).returning(|request| {
+        assert_eq!(request.from.as_str(), "ethereum.eth");
+        assert_eq!(request.to.as_str(), "ethereum.usdt");
+        // 0.05 ckETH, less the ledger fee and the approve reserve, less the
+        // 0.0005 ETH withdrawal fee, less the same again as headroom.
+        assert_eq!(request.amount_in, "0.048996");
+        Ok(quote(&request.amount_in, "100"))
+    });
+    let bridge = minter_bridge("ckETH", 0.000_002, 0.000_5, 0.03);
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
+    let mut request = request(1);
+    request.pay_asset = cketh().asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(cketh(), Nat::from(50_000_000_000_000_000u64));
+
+    let preview = finalizer.preview(&context(), &request).await.unwrap();
+
+    assert_eq!(preview.quote.legs[0].route_id, "ethereum.eth>ethereum.usdt");
+    let saved: RiftState = serde_json::from_value(preview.initial_execution_state.state["rift"].clone()).unwrap();
+    assert_eq!(saved.pay_chain, "ethereum");
+    assert_eq!(saved.arrival_headroom.to_f64(), 0.000_5);
+}
+
+/// Only a minter that takes its fee out of the amount asks for headroom.
+#[test]
+fn only_routes_whose_minter_deducts_its_fee_ask_for_headroom() {
+    use crate::finalizers::rift::preview::order_headroom;
+    use liquidium_pipeline_connectors::backend::bridge_backend::resolve_route;
+    let budget = BridgeFeeBudget {
+        destination_fee_budget: 0.000_015,
+        ..BridgeFeeBudget::default()
+    };
+    let ckbtc = resolve_route("ckBTC", "ICP", "BTC").unwrap();
+    let cketh = resolve_route("ckETH", "ICP", "ETH").unwrap();
+    let ckusdc = resolve_route("ckUSDC", "ICP", "USDC").unwrap();
+    assert_eq!(order_headroom(ckbtc, &budget), 0.000_015);
+    assert_eq!(order_headroom(cketh, &budget), 0.000_015);
+    assert_eq!(order_headroom(ckusdc, &budget), 0.0);
 }
 
 /// The payout always comes back over the ckERC20 bridge, so ckBTC is a pay
@@ -153,18 +197,7 @@ async fn a_ckbtc_leg_quotes_bitcoin_with_headroom_under_the_expected_arrival() {
         assert_eq!(request.amount_in, "0.0099698");
         Ok(quote(&request.amount_in, "600"))
     });
-    let mut bridge = MockBridgeBackend::new();
-    bridge.expect_get_fee_budget().returning(|asset, _, _| match asset {
-        "ckBTC" => Ok(BridgeFeeBudget {
-            source_fee_budget: 0.000_000_1,
-            destination_fee_budget: 0.000_015,
-            ..BridgeFeeBudget::default()
-        }),
-        _ => Ok(BridgeFeeBudget::default()),
-    });
-    bridge
-        .expect_get_minimum_bridge_amount()
-        .returning(|asset, _, _| Ok(if asset == "ckBTC" { 0.000_5 } else { 0.0 }));
+    let bridge = minter_bridge("ckBTC", 0.000_000_1, 0.000_015, 0.000_5);
     let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
     let mut request = request(1_000_000);
     request.pay_asset = ckbtc().asset_id();

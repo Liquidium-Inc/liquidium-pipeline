@@ -1,8 +1,5 @@
 //! The chains Rift trades on, and every answer that depends on the chain:
-//! its name, where a refund goes, how long a deposit may take to be seen,
-//! and what an order asks below the expected arrival.
-use liquidium_pipeline_connectors::backend::bridge_backend::BridgeFeeBudget;
-
+//! its name, where a refund goes, and how long a deposit may take to be seen.
 use crate::finalizers::multi_venue::VenueStepError;
 
 /// Where a refunded order pays back. Rift refunds on the pay asset's chain,
@@ -57,15 +54,6 @@ impl RiftChain {
             Self::Bitcoin => 4 * 60 * 60,
         }
     }
-
-    /// What the order asks below the expected arrival. The ckBTC minter takes
-    /// the Bitcoin fee at burn time, so one more fee estimate covers a rise.
-    pub(super) fn order_headroom(self, budget: &BridgeFeeBudget) -> f64 {
-        match self {
-            Self::Ethereum => 0.0,
-            Self::Bitcoin => budget.destination_fee_budget.max(0.0),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -78,15 +66,5 @@ mod tests {
             assert_eq!(RiftChain::parse(chain.name()).unwrap(), chain);
         }
         assert!(RiftChain::parse("solana").is_err());
-    }
-
-    #[test]
-    fn only_bitcoin_asks_for_headroom() {
-        let budget = BridgeFeeBudget {
-            destination_fee_budget: 0.000_015,
-            ..BridgeFeeBudget::default()
-        };
-        assert_eq!(RiftChain::Bitcoin.order_headroom(&budget), 0.000_015);
-        assert_eq!(RiftChain::Ethereum.order_headroom(&budget), 0.0);
     }
 }

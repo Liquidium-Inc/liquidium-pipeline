@@ -85,6 +85,12 @@ impl BridgeRouteKind {
         matches!(self, Self::CkEthToEth | Self::IcpToSolana | Self::CkBtcToBtc)
     }
 
+    /// The minter burns the whole amount and takes its fee out of it at
+    /// execution time, so the far side receives less, and by a sum only known then.
+    pub fn fee_comes_out_of_amount(self) -> bool {
+        matches!(self, Self::CkBtcToBtc | Self::CkEthToEth)
+    }
+
     pub fn provider(self) -> BridgeProvider {
         match self {
             Self::CkEthErc20Forward | Self::CkEthErc20Reverse | Self::EthToCkEth | Self::CkEthToEth => {
