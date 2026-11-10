@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::rift_backend::RiftBackend;
 use log::warn;
 
-use super::{RiftVenueFinalizer, VenueStepError, order::AMOUNT_TOLERANCE, parse_amount};
+use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+
+use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
+use crate::finalizers::rift::preview::order_amount;
 use crate::{
     finalizers::{
         bridge_legs::{BridgeDestinationProvider, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out},
@@ -40,7 +43,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
     pub(super) async fn bridge_out(&self, state: &mut RiftState) -> Result<(), VenueStepError> {
         let order = state.order.as_ref().ok_or("missing Rift order before the bridge out")?;
         let order_id = order.id.clone();
-        let order_amount = parse_amount(&order.amount_in)?;
+        let ordered = rift_amount(&state.size_in.token, &order.amount_in)?;
         let destination = OrderDepositAddress(order.deposit_address.clone());
         // Until the minter call is saved, the deposit can still go to a new
         // order. Past that, the saved call names this order's address.
@@ -85,13 +88,20 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 // order is taken for what the bridge delivers now.
                 if funding_phase
                     && let Some(expected) = state.bridge_out.deposit_bridge_expected_amount
-                    && (expected - state.arrival_headroom - order_amount).abs() > AMOUNT_TOLERANCE
+                    && let expected = ChainTokenAmount::from_formatted(state.size_in.token.clone(), expected)
+                    && let Some(asks) = order_amount(&expected, &state.arrival_headroom)
+                    && asks.value != ordered.value
                 {
                     warn!(
-                        "[rift] liq_id={} the bridge would deliver {expected} {} with {} headroom, but order {} expects {order_amount}; a new order follows",
-                        state.liq_id, state.pay_symbol, state.arrival_headroom, order_id
+                        "[rift] liq_id={} the bridge would deliver {} {} with {} headroom, but order {} expects {}; a new order follows",
+                        state.liq_id,
+                        decimal_text(&expected),
+                        state.pay_symbol,
+                        decimal_text(&state.arrival_headroom),
+                        order_id,
+                        order.amount_in
                     );
-                    state.amount_in = expected - state.arrival_headroom;
+                    state.amount_in = asks;
                     state.reorder();
                     return Ok(());
                 }

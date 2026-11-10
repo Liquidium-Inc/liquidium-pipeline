@@ -1,7 +1,6 @@
 //! The amount-scoped preview: the bridge out sized as execution sizes it, a
 //! Rift quote for what arrives, and the bridge back's costs. Nothing moves.
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeDestinationKind, BridgeFeeBudget, BridgeRouteSpec};
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBackend, RiftQuoteRequest};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
@@ -9,7 +8,8 @@ use liquidium_pipeline_core::{
 };
 
 use super::{
-    finalizer::{RIFT_CHAIN, RiftVenueFinalizer, decimal_text, parse_amount},
+    chain::RiftChain,
+    finalizer::{RiftVenueFinalizer, decimal_text, rift_amount},
     state::{RiftState, RiftStep},
 };
 use crate::{
@@ -17,17 +17,20 @@ use crate::{
         bridge_legs::{bridged_deposit_arrival, ensure_return_gas},
         multi_venue::RIFT_VENUE_ID,
     },
-    swappers::model::{LIQUIDITY_EPS, SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, amount_after_bps_haircut},
+    swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, amount_after_bps_haircut},
     utils::now_ts,
 };
 
-/// What the order asks below the expected arrival. The minter deducts the
-/// Bitcoin fee at burn time, so one more fee estimate covers a rise in it.
-fn order_headroom(out: &BridgeRouteSpec, budget: &BridgeFeeBudget) -> f64 {
-    match out.destination_kind {
-        BridgeDestinationKind::BtcAddress => budget.destination_fee_budget.max(0.0),
-        _ => 0.0,
+/// What the order asks for: the expected arrival less the headroom, or
+/// nothing when the fees eat the arrival.
+pub(super) fn order_amount(expected: &ChainTokenAmount, headroom: &ChainTokenAmount) -> Option<ChainTokenAmount> {
+    if expected.value <= headroom.value {
+        return None;
     }
+    Some(ChainTokenAmount::from_raw(
+        expected.token.clone(),
+        expected.value.clone() - headroom.value.clone(),
+    ))
 }
 
 /// The one leg of a Rift route: the whole allocation for what Rift pays out.
@@ -37,7 +40,7 @@ fn swap_leg(state: &RiftState, receive_amount: &ChainTokenAmount, price: f64) ->
         route_id: format!(
             "{}>{}",
             RiftAsset::new(&state.pay_chain, &state.pay_symbol).as_str(),
-            RiftAsset::new(RIFT_CHAIN, &state.receive_symbol).as_str()
+            RiftAsset::new(RiftChain::PAYOUT.name(), &state.receive_symbol).as_str()
         ),
         pay_chain: state.size_in.token.chain(),
         pay_symbol: state.size_in.token.symbol(),
@@ -95,24 +98,25 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             .await
             .map_err(|error| error.to_string())?;
         let mut side_costs = arrival.sizing.fee_budget.side_costs.clone();
-        let arrival_headroom = order_headroom(out, &arrival.sizing.fee_budget);
-        let amount_in = arrival.expected_amount - arrival_headroom;
-        if amount_in <= LIQUIDITY_EPS {
-            return Err("the bridge fees leave nothing for Rift to swap".to_string());
-        }
-        let pair = format!("{pay_chain}.{}->{}", out.target_asset, back.source_asset);
+        let pay_token = &pay_amount.token;
+        let expected = ChainTokenAmount::from_formatted(pay_token.clone(), arrival.expected_amount);
+        let arrival_headroom =
+            ChainTokenAmount::from_formatted(pay_token.clone(), pay_chain.order_headroom(&arrival.sizing.fee_budget));
+        let amount_in = order_amount(&expected, &arrival_headroom).ok_or("the bridge fees leave nothing for Rift to swap")?;
+        let pair = format!("{}.{}->{}", pay_chain.name(), out.target_asset, back.source_asset);
         let quote = self
             .backend
             .quote(&RiftQuoteRequest {
-                from: RiftAsset::new(pay_chain, out.target_asset),
-                to: RiftAsset::new(RIFT_CHAIN, back.source_asset),
-                amount_in: decimal_text(amount_in, pay_amount.token.decimals()),
+                from: RiftAsset::new(pay_chain.name(), out.target_asset),
+                to: RiftAsset::new(RiftChain::PAYOUT.name(), back.source_asset),
+                amount_in: decimal_text(&amount_in),
+                venues: self.venues.clone(),
             })
             .await
             .map_err(|error| format!("Rift cannot quote {pair}: {error}"))?;
-        let amount_out = parse_amount(&quote.estimated_amount_out).map_err(|error| error.to_string())?;
-        if amount_out <= LIQUIDITY_EPS {
-            return Err(format!("Rift quotes nothing for {amount_in} {pair}"));
+        let receive_amount = rift_amount(&final_asset, &quote.estimated_amount_out).map_err(|error| error.to_string())?;
+        if receive_amount.value == 0u8 {
+            return Err(format!("Rift quotes nothing for {} {pair}", decimal_text(&amount_in)));
         }
         let budget = self
             .bridge
@@ -125,8 +129,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
 
         // Rift reports no impact and no fees inside the quote, so its price is
         // the only price: the plan's oracle guard judges it.
-        let price = amount_out / amount_in;
-        let receive_amount = ChainTokenAmount::from_formatted(final_asset.clone(), amount_out);
+        let price = receive_amount.to_f64() / amount_in.to_f64();
         let market_receive = ChainTokenAmount::from_formatted(final_asset.clone(), pay_amount.to_f64() * price).value;
         let haircut_bps = self
             .quote_route_fee_bps
@@ -144,12 +147,12 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             size_in: pay_amount.clone(),
             final_asset: final_asset.clone(),
             final_destination,
-            pay_chain: pay_chain.to_string(),
+            pay_chain: pay_chain.name().to_string(),
             pay_symbol: out.target_asset.to_string(),
             receive_symbol: back.source_asset.to_string(),
             amount_in,
             arrival_headroom,
-            min_amount_out: conservative_receive.to_f64(),
+            min_amount_out: conservative_receive.clone(),
             quote_id: None,
             order: None,
             funding: None,

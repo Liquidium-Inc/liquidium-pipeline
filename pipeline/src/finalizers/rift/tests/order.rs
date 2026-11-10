@@ -124,3 +124,25 @@ async fn a_throttled_rift_is_unreachable_too() {
 
     assert!(matches!(error, VenueStepError::Unreachable(_)), "{error}");
 }
+
+/// Rift refunds on the pay asset's chain, so a ckBTC order names the Bitcoin wallet.
+#[tokio::test]
+async fn a_bitcoin_order_refunds_to_the_bitcoin_wallet() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_create_order().times(1).returning(|_, _, refund_address| {
+        assert_eq!(refund_address.as_deref(), Some(BRIDGE_BTC_WALLET));
+        Ok(order("0.0006"))
+    });
+    let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
+    let mut state = state_at(RiftStep::Order);
+    state.order = None;
+    state.quote_id = Some("quote-1".to_string());
+    state.pay_chain = "bitcoin".to_string();
+    state.pay_symbol = "BTC".to_string();
+    state.size_in = ChainTokenAmount::from_raw(ckbtc(), Nat::from(60_010u64));
+    state.amount_in = ChainTokenAmount::from_formatted(ckbtc(), 0.0006);
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}

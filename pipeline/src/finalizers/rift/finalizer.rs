@@ -3,12 +3,16 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use candid::Principal;
+use candid::{Nat, Principal};
+
+pub use super::chain::RiftRefundAddresses;
+use super::chain::RiftChain;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::BridgeRouteSpec,
-    rift_backend::{RiftBackend, RiftError},
+    rift_backend::{RiftBackend, RiftError, RiftVenueLists},
 };
 use liquidium_pipeline_core::{
+    tokens::chain_token_amount::ChainTokenAmount,
     outbound::OutboundSender,
     tokens::{chain_token::ChainToken, token_registry::TokenRegistryTrait},
 };
@@ -31,18 +35,13 @@ mod order;
 #[path = "steps/wait.rs"]
 mod wait;
 
-/// The chain Rift swaps on for every asset this venue carries.
-/// The chain Rift delivers to: the ckERC20 bridge brings the payout back.
-pub(super) const RIFT_CHAIN: &str = "ethereum";
-pub(super) const BITCOIN: &str = "bitcoin";
-
 /// The ck assets this venue carries, with the chain and symbol Rift knows
 /// them by. ckETH waits for a fix to the fee drift between the order and the
 /// native bridge.
-const RIFT_ASSETS: [(&str, &str, &str); 3] = [
-    ("ckUSDC", RIFT_CHAIN, "USDC"),
-    ("ckUSDT", RIFT_CHAIN, "USDT"),
-    ("ckBTC", BITCOIN, "BTC"),
+const RIFT_ASSETS: [(&str, RiftChain, &str); 3] = [
+    ("ckUSDC", RiftChain::Ethereum, "USDC"),
+    ("ckUSDT", RiftChain::Ethereum, "USDT"),
+    ("ckBTC", RiftChain::Bitcoin, "BTC"),
 ];
 
 /// A throttled or unreachable Rift is a wait; every other refusal is a retry.
@@ -55,28 +54,35 @@ impl From<RiftError> for VenueStepError {
     }
 }
 
-/// The amount a Rift answer reports, as a number.
-pub(super) fn parse_amount(text: &str) -> Result<f64, VenueStepError> {
-    let amount = text
-        .trim()
-        .parse::<f64>()
-        .map_err(|error| VenueStepError::Other(format!("Rift amount `{text}` is not a number: {error}")))?;
-    if !amount.is_finite() || amount < 0.0 {
-        return Err(VenueStepError::Other(format!(
-            "Rift amount `{text}` is not a valid amount"
-        )));
+/// The amount a Rift answer reports, in the token's exact units. Rift may
+/// write more fraction digits than the token has; the extra are cut, never
+/// rounded up past what the wallet holds. A zero reads as zero.
+pub(super) fn rift_amount(token: &ChainToken, text: &str) -> Result<ChainTokenAmount, VenueStepError> {
+    let text = text.trim();
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let decimals = usize::from(token.decimals());
+    let fraction = &fraction[..fraction.len().min(decimals)];
+    let digits = format!("{whole}{fraction:0<decimals$}");
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(VenueStepError::Other(format!("Rift amount `{text}` is not a plain decimal")));
     }
-    Ok(amount)
+    let units = digits
+        .parse::<u128>()
+        .map_err(|error| VenueStepError::Other(format!("Rift amount `{text}` is out of range: {error}")))?;
+    Ok(ChainTokenAmount::from_raw(token.clone(), Nat::from(units)))
 }
 
-/// Decimal text with at most `decimals` places and no trailing zeros, as
-/// Rift reads an amount.
-pub(super) fn decimal_text(amount: f64, decimals: u8) -> String {
-    let text = format!("{amount:.*}", usize::from(decimals));
-    if !text.contains('.') {
-        return text;
+/// An amount as Rift reads it: a plain decimal with no trailing zeros.
+pub(super) fn decimal_text(amount: &ChainTokenAmount) -> String {
+    let decimals = usize::from(amount.token.decimals());
+    let digits = format!("{:0>width$}", amount.value.0, width = decimals + 1);
+    let (whole, fraction) = digits.split_at(digits.len() - decimals);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
     }
-    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 pub struct RiftVenueFinalizer<R: RiftBackend> {
@@ -86,10 +92,13 @@ pub struct RiftVenueFinalizer<R: RiftBackend> {
     pub(super) outbound: Arc<dyn OutboundSender>,
     pub(super) token_registry: Option<Arc<dyn TokenRegistryTrait>>,
     pub(super) liquidator_principal: Principal,
-    /// Where a refunded order pays back: the main EVM wallet.
-    pub(super) refund_address: String,
+    /// Where a refunded order pays back, on the pay asset's chain.
+    pub(super) refund_addresses: RiftRefundAddresses,
     pub(super) quote_route_fee_bps: u32,
     pub(super) quote_delay_buffer_bps: u32,
+    /// Which Rift venues may route an order. A venue's own confirmation
+    /// count sets the duration of a leg, and Rift does not tell it.
+    pub(super) venues: RiftVenueLists,
     /// Intents armed in this process. A leg whose intent is not here restarted.
     pub(super) multi_venue_armed_intents: Mutex<HashSet<String>>,
 }
@@ -100,7 +109,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         bridge: Arc<BridgeRuntime>,
         outbound: Arc<dyn OutboundSender>,
         liquidator_principal: Principal,
-        refund_address: String,
+        refund_addresses: RiftRefundAddresses,
     ) -> Self {
         Self {
             backend,
@@ -108,9 +117,10 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             outbound,
             token_registry: None,
             liquidator_principal,
-            refund_address,
+            refund_addresses,
             quote_route_fee_bps: 0,
             quote_delay_buffer_bps: 0,
+            venues: RiftVenueLists::default(),
             multi_venue_armed_intents: Mutex::new(HashSet::new()),
         }
     }
@@ -126,13 +136,18 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         self
     }
 
+    pub fn with_venues(mut self, venues: RiftVenueLists) -> Self {
+        self.venues = venues;
+        self
+    }
+
     /// Where Rift delivers: the bridge EVM wallet, which the leg back signs from.
     pub(super) fn delivery_address(&self) -> &str {
         &self.bridge.sources.evm
     }
 
     /// The chain and symbol Rift knows a ck asset by.
-    pub(super) fn rift_asset(asset: &ChainToken) -> Option<(&'static str, &'static str)> {
+    pub(super) fn rift_asset(asset: &ChainToken) -> Option<(RiftChain, &'static str)> {
         let symbol = asset.symbol();
         RIFT_ASSETS
             .iter()
@@ -149,10 +164,11 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let (_, pay_symbol) = Self::rift_asset(pay).ok_or_else(|| format!("Rift does not carry {}", pay.symbol()))?;
         let (receive_chain, receive_symbol) =
             Self::rift_asset(receive).ok_or_else(|| format!("Rift does not deliver {}", receive.symbol()))?;
-        if receive_chain != RIFT_CHAIN {
+        if receive_chain != RiftChain::PAYOUT {
             return Err(format!(
-                "Rift delivers only to Ethereum in this build, not {} on {receive_chain}",
-                receive.symbol()
+                "Rift delivers only to Ethereum in this build, not {} on {}",
+                receive.symbol(),
+                receive_chain.name()
             ));
         }
         if pay_symbol == receive_symbol {

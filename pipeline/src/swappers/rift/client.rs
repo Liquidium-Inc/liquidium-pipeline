@@ -69,18 +69,30 @@ impl RiftClient {
     }
 }
 
+/// The quote request as Rift reads it. Empty venue lists are left out, so
+/// Rift applies no restriction.
+pub(super) fn quote_body(request: &RiftQuoteRequest) -> serde_json::Value {
+    let mut body = json!({
+        "from": request.from.as_str(),
+        "to": request.to.as_str(),
+        "amount_in": request.amount_in,
+        "format": "formatted",
+        "quote_mode": "optimal",
+    });
+    if !request.venues.allow.is_empty() {
+        body["venue_allowlist"] = json!(request.venues.allow);
+    }
+    if !request.venues.block.is_empty() {
+        body["venue_blocklist"] = json!(request.venues.block);
+    }
+    body
+}
+
 #[async_trait]
 impl RiftBackend for RiftClient {
     async fn quote(&self, request: &RiftQuoteRequest) -> Result<RiftQuote, RiftError> {
-        let body = json!({
-            "from": request.from.as_str(),
-            "to": request.to.as_str(),
-            "amount_in": request.amount_in,
-            "format": "formatted",
-            "quote_mode": "optimal",
-        });
         let answer = self
-            .send(self.request(reqwest::Method::POST, "/quote").json(&body))
+            .send(self.request(reqwest::Method::POST, "/quote").json(&quote_body(request)))
             .await?;
         parse_quote(&answer)
     }

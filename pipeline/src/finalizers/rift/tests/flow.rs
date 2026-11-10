@@ -111,7 +111,7 @@ async fn a_leg_pays_the_order_through_the_bridge_and_mints_what_rift_delivered()
         .await
         .unwrap();
     let mut state = preview.state;
-    assert_eq!(state.amount_in, 100.0);
+    assert_eq!(state.amount_in.to_f64(), 100.0);
 
     let mut steps = Vec::new();
     for _ in 0..20 {
