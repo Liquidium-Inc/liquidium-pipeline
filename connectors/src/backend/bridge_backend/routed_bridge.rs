@@ -68,6 +68,16 @@ impl BridgeBackend for RoutedBridgeBackend {
         self.source(asset, chain).get_source_balance(asset, chain, address).await
     }
 
+    async fn get_gas_balance(&self, chain: &str, address: &str) -> Result<f64, String> {
+        // Gas is native to a chain, so the chain alone picks the backend.
+        let native = match chain.to_ascii_uppercase().as_str() {
+            "SOL" => "SOL",
+            "BTC" => "BTC",
+            _ => "ETH",
+        };
+        self.source(native, chain).get_gas_balance(chain, address).await
+    }
+
     async fn get_source_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
         self.source(asset, chain).get_source_fee_budget(asset, chain, target).await
     }

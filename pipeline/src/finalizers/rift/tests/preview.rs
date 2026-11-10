@@ -32,13 +32,10 @@ async fn preview_quotes_the_amount_the_bridge_delivers_and_keeps_both_bridge_cos
             })
         });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
-    bridge
-        .expect_get_source_balance()
-        .times(1)
-        .returning(|asset, chain, _| {
-            assert_eq!((asset, chain), ("ETH", "ETH"));
-            Ok(0.05)
-        });
+    bridge.expect_get_gas_balance().times(1).returning(|chain, _| {
+        assert_eq!(chain, "ETH");
+        Ok(0.05)
+    });
     let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
 
     let preview = finalizer.preview(&context(), &request(100_010_000)).await.unwrap();
@@ -76,15 +73,13 @@ async fn preview_refuses_the_route_while_the_bridge_wallet_lacks_return_gas() {
         })
     });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
-    bridge
-        .expect_get_source_balance()
-        .times(1)
-        .returning(|_, _, _| Ok(0.001));
+    bridge.expect_get_gas_balance().times(1).returning(|_, _| Ok(0.001));
     let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
 
     let error = finalizer.preview(&context(), &request(100_010_000)).await.unwrap_err();
 
-    assert!(error.contains("holds 0.001 ETH, below the 0.01 ETH"), "{error}");
+    // 0.01 ETH of gas at the quoted price, plus the 25 percent margin.
+    assert!(error.contains("holds 0.001 ETH, below the 0.0125 ETH"), "{error}");
 }
 
 #[tokio::test]

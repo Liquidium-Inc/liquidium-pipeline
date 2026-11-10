@@ -1045,6 +1045,21 @@ where
     B: IcpBackend,
     E: BridgeEvmBackend,
 {
+    async fn get_gas_balance(&self, chain: &str, address: &str) -> Result<f64, String> {
+        if !chain.eq_ignore_ascii_case("ETH") {
+            return Err(format!("the ckETH bridge holds no gas on chain '{chain}'"));
+        }
+        let owner = address
+            .parse::<Address>()
+            .map_err(|e| format!("invalid gas wallet address '{address}': {e}"))?;
+        let balance = self
+            .evm_backend
+            .native_balance_of(owner)
+            .await
+            .map_err(|e| format!("native ETH balance failed for owner {owner}: {e}"))?;
+        base_units_to_amount_via_core(balance, ETH_DECIMALS)
+    }
+
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String> {
         if let Some(route) = resolve_cketh_forward_route_by_source(asset, chain) {
             if route.route_kind == BridgeRouteKind::EthToCkEth {
