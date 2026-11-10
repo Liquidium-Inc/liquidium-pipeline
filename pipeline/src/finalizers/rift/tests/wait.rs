@@ -139,7 +139,7 @@ async fn a_delivery_of_nothing_is_ambiguous() {
 #[tokio::test]
 async fn a_delivery_under_the_floor_still_comes_back() {
     let mut state = waiting_state(60);
-    state.min_amount_out = 99.0;
+    state.min_amount_out = ChainTokenAmount::from_formatted(ckusdt(), 99.0);
     wait_with(RiftOrderStatus::Delivered, Some("95"), &mut state)
         .await
         .unwrap();

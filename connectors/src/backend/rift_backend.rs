@@ -24,11 +24,21 @@ impl RiftAsset {
 
 /// What to quote. The amount is decimal text in the asset's own units, as Rift
 /// reads and returns it in `formatted` mode.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RiftVenueLists {
+    /// Only these venues may route the order. Empty means any.
+    pub allow: Vec<String>,
+    /// These venues never route the order.
+    pub block: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RiftQuoteRequest {
     pub from: RiftAsset,
     pub to: RiftAsset,
     pub amount_in: String,
+    /// The order inherits the quote's route, so the lists go on the quote.
+    pub venues: RiftVenueLists,
 }
 
 /// A quote. It is indicative, it carries no price impact and no size limits,

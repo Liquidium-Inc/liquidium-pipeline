@@ -1,6 +1,9 @@
 //! The wire format as Rift sends it, and the typed failures per status.
-use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftError, RiftOrderStatus};
+use liquidium_pipeline_connectors::backend::rift_backend::{
+    RiftAsset, RiftError, RiftOrderStatus, RiftQuoteRequest, RiftVenueLists,
+};
 
+use super::client::quote_body;
 use super::protocol::{classify_failure, parse_order, parse_order_state, parse_quote};
 
 /// A live quote from 2026-11-09, trimmed to the fields the client reads plus the ones it ignores.
@@ -22,6 +25,28 @@ const QUOTE: &str = r#"{
   "integrator_fee_bps": null,
   "format": "formatted"
 }"#;
+
+/// A venue list pins or blocks Rift's venues on the quote; the order inherits
+/// the route. Empty lists send nothing, so Rift stays free to choose.
+#[test]
+fn venue_lists_go_on_the_quote_only_when_set() {
+    let mut request = RiftQuoteRequest {
+        from: RiftAsset::new("bitcoin", "btc"),
+        to: RiftAsset::new("ethereum", "usdt"),
+        amount_in: "0.0006".to_string(),
+        venues: RiftVenueLists::default(),
+    };
+    let body = quote_body(&request);
+    assert_eq!(body["from"], "bitcoin.btc");
+    assert!(body.get("venue_allowlist").is_none());
+    assert!(body.get("venue_blocklist").is_none());
+
+    request.venues.block = vec!["rift_otc".to_string()];
+    request.venues.allow = vec!["near_intents".to_string(), "relay".to_string()];
+    let body = quote_body(&request);
+    assert_eq!(body["venue_blocklist"], serde_json::json!(["rift_otc"]));
+    assert_eq!(body["venue_allowlist"], serde_json::json!(["near_intents", "relay"]));
+}
 
 #[test]
 fn a_quote_reads_its_amounts_as_text_and_its_venues_in_order() {

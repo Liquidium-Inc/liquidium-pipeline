@@ -5,8 +5,12 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use liquidium_pipeline_core::types::side_cost::SideCost;
 use serde::{Deserialize, Serialize};
 
+use super::chain::RiftChain;
 use crate::{
-    finalizers::bridge_legs::{BridgeInState, BridgeOutState},
+    finalizers::{
+        bridge_legs::{BridgeInState, BridgeOutState},
+        multi_venue::VenueStepError,
+    },
     outbound::driver::OutboundRecord,
     persistance::VenueLegFailure,
 };
@@ -75,14 +79,15 @@ pub struct RiftState {
     /// always on Ethereum.
     pub pay_symbol: String,
     pub receive_symbol: String,
-    /// What the order asks for: the expected bridge arrival less the headroom.
-    pub amount_in: f64,
+    /// What the order asks for, in the pay asset's units: the expected
+    /// bridge arrival less the headroom.
+    pub amount_in: ChainTokenAmount,
     /// What the order asks below the expected arrival. A Bitcoin fee can rise
     /// between the estimate and the burn, and an underfunded order is refunded.
-    #[serde(default)]
-    pub arrival_headroom: f64,
-    /// The planned floor for a fresh quote. A quote under it is refused.
-    pub min_amount_out: f64,
+    pub arrival_headroom: ChainTokenAmount,
+    /// The planned floor for a fresh quote, in the receive asset. A quote
+    /// under it is refused.
+    pub min_amount_out: ChainTokenAmount,
     /// The fresh quote, saved before the order is created from it. Rift
     /// returns the same order for the same quote id, so a repeat is safe.
     #[serde(default)]
@@ -116,6 +121,11 @@ pub struct RiftState {
 }
 
 impl RiftState {
+    /// The chain the pay asset is on, as the leg saved it.
+    pub(super) fn pay_chain(&self) -> Result<RiftChain, VenueStepError> {
+        RiftChain::parse(&self.pay_chain)
+    }
+
     /// Records side costs, replacing any earlier entry with the same label.
     pub fn record_side_costs(&mut self, costs: &[SideCost]) {
         for cost in costs {

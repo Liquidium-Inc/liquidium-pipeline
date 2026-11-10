@@ -31,6 +31,7 @@ mod preview;
 mod wait;
 
 pub(super) const MAIN_WALLET: &str = "0x1111111111111111111111111111111111111111";
+pub(super) const BRIDGE_BTC_WALLET: &str = "bc1p57z9rf82tcpcgcr373ya43lj4x66x2xnumkk995usg6c5nuus6lqv63wcr";
 pub(super) const DEPOSIT_ADDRESS: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
 
 pub(super) fn ckusdc() -> ChainToken {
@@ -158,7 +159,10 @@ pub(super) fn finalizer_with_runtime(
         Arc::new(runtime),
         Arc::new(trader_sender),
         Principal::anonymous(),
-        MAIN_WALLET.to_string(),
+        RiftRefundAddresses {
+            ethereum: MAIN_WALLET.to_string(),
+            bitcoin: BRIDGE_BTC_WALLET.to_string(),
+        },
     )
     .with_token_registry(registry())
     .with_quote_costs(10, 20)
@@ -176,9 +180,9 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
         pay_chain: "ethereum".to_string(),
         pay_symbol: "USDC".to_string(),
         receive_symbol: "USDT".to_string(),
-        amount_in: 100.0,
-        arrival_headroom: 0.0,
-        min_amount_out: 99.0,
+        amount_in: ChainTokenAmount::from_formatted(ckusdc(), 100.0),
+        arrival_headroom: ChainTokenAmount::from_raw(ckusdc(), Nat::from(0u8)),
+        min_amount_out: ChainTokenAmount::from_formatted(ckusdt(), 99.0),
         quote_id: None,
         order: Some(RiftOrderRecord {
             id: "order-1".to_string(),

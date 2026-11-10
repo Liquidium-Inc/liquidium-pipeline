@@ -175,10 +175,9 @@ async fn a_ckbtc_leg_quotes_bitcoin_with_headroom_under_the_expected_arrival() {
     assert_eq!(preview.quote.legs[0].route_id, "bitcoin.btc>ethereum.usdt");
     let rift_state = preview.initial_execution_state.state.get("rift").unwrap();
     assert_eq!(rift_state.get("pay_chain").and_then(|v| v.as_str()), Some("bitcoin"));
-    assert_eq!(
-        rift_state.get("arrival_headroom").and_then(|v| v.as_f64()),
-        Some(0.000_015)
-    );
+    let saved: RiftState = serde_json::from_value(rift_state.clone()).unwrap();
+    assert_eq!(saved.arrival_headroom.to_f64(), 0.000_015);
+    assert_eq!(saved.amount_in.to_f64(), 0.009_969_8);
     assert_eq!(preview.quote.receive_amount, Nat::from(600_000_000u64));
 }
 

@@ -3,27 +3,19 @@
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftBackend, RiftOrderStatus};
 use log::{debug, info, warn};
 
-use super::{BITCOIN, RiftVenueFinalizer, VenueStepError, parse_amount};
+use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
 use crate::{
     finalizers::rift::state::{RiftState, RiftStep},
     utils::{now_ts, waited_secs},
 };
 
-/// How long Rift may take to see a deposit the bridge already paid. A
-/// Bitcoin deposit needs Rift's own confirmations after the minter's.
-fn deposit_seen_timeout_secs(pay_chain: &str) -> i64 {
-    if pay_chain.eq_ignore_ascii_case(BITCOIN) {
-        4 * 60 * 60
-    } else {
-        2 * 60 * 60
-    }
-}
 /// How long a funded order may take to deliver.
 const DELIVERY_TIMEOUT_SECS: i64 = 6 * 60 * 60;
 
 impl<R: RiftBackend> RiftVenueFinalizer<R> {
     pub(super) async fn wait(&self, state: &mut RiftState) -> Result<(), VenueStepError> {
-        let refund_address = self.refund_address.clone();
+        let chain = state.pay_chain()?;
+        let refund_address = chain.refund_address(&self.refund_addresses).to_string();
         let liq_id = state.liq_id.clone();
         let order = state.order.as_mut().ok_or("missing Rift order while waiting")?;
         let answer = self.backend.order_state(&order.id).await?;
@@ -31,7 +23,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         order.status = Some(answer.status.as_api());
         let waited = waited_secs(&mut order.wait_since_ts);
         match answer.status {
-            RiftOrderStatus::AwaitingDeposit if waited <= deposit_seen_timeout_secs(&state.pay_chain) => {
+            RiftOrderStatus::AwaitingDeposit if waited <= chain.deposit_seen_timeout_secs() => {
                 debug!(
                     "[rift] liq_id={} order {} awaits its deposit {}s after the bridge paid it",
                     liq_id, order.id, waited
@@ -61,8 +53,8 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 let amount_out = answer.amount_out.ok_or_else(|| {
                     VenueStepError::Ambiguous(format!("Rift order {} delivered without an amount", order.id))
                 })?;
-                let delivered = parse_amount(&amount_out)?;
-                if delivered <= 0.0 {
+                let delivered = rift_amount(&state.final_asset, &amount_out)?;
+                if delivered.value == 0u8 {
                     return Err(VenueStepError::Ambiguous(format!(
                         "Rift order {} reports a delivery of {amount_out} {}",
                         order.id, state.receive_symbol
@@ -70,10 +62,14 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 }
                 // The money is already at the wallet, so the leg brings it
                 // back. The shortfall is visible here and in the leg's result.
-                if delivered < state.min_amount_out {
+                if delivered.value < state.min_amount_out.value {
                     warn!(
                         "[rift] liq_id={} order {} delivered {} {}, under the planned floor {}",
-                        liq_id, order.id, delivered, state.receive_symbol, state.min_amount_out
+                        liq_id,
+                        order.id,
+                        decimal_text(&delivered),
+                        state.receive_symbol,
+                        decimal_text(&state.min_amount_out)
                     );
                 }
                 info!(

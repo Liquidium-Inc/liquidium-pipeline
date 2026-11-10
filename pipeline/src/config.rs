@@ -110,6 +110,9 @@ pub struct Config {
     /// The most one Rift order may carry, in USD at the oracle price. A Rift
     /// quote has no slippage cap, so this bounds what one order can lose.
     pub rift_max_order_usd: f64,
+    /// Rift venues that may route an order, and venues that never may.
+    pub rift_venue_allowlist: Vec<String>,
+    pub rift_venue_blocklist: Vec<String>,
     /// Maximum intermediate hops allowed for Kraken route discovery.
     pub cex_kraken_max_hops: u8,
     pub icpswap_factory_canister: Principal,
@@ -382,6 +385,8 @@ impl Config {
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let rift_api_url = parse_rift_api_url_from_env();
         let rift_max_order_usd = parse_rift_max_order_usd_from_env();
+        let rift_venue_allowlist = parse_name_list_from_env("RIFT_VENUE_ALLOWLIST");
+        let rift_venue_blocklist = parse_name_list_from_env("RIFT_VENUE_BLOCKLIST");
         let rift_api_key = env::var("RIFT_API_KEY")
             .ok()
             .map(|key| key.trim().to_string())
@@ -470,6 +475,8 @@ impl Config {
             rift_api_url,
             rift_api_key,
             rift_max_order_usd,
+            rift_venue_allowlist,
+            rift_venue_blocklist,
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
@@ -749,6 +756,16 @@ fn parse_canister_from_env(name: &str, default: &str) -> Result<Principal, Strin
 
 /// A cap must be a positive number; anything else keeps the default, so a
 /// typo never lifts it.
+/// A comma-separated list of names; blank entries are dropped.
+fn parse_name_list_from_env(name: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
 fn parse_rift_max_order_usd_from_env() -> f64 {
     env::var("RIFT_MAX_ORDER_USD")
         .ok()

@@ -46,14 +46,14 @@ async fn a_sized_amount_that_drifts_from_the_order_takes_a_new_order_instead_of_
     let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), landing_sender());
     let mut state = state_at(RiftStep::BridgeOut);
     // The order was taken for 100.5; the bridge sizes 100 today.
-    state.amount_in = 100.5;
+    state.amount_in = ChainTokenAmount::from_formatted(ckusdc(), 100.5);
     state.order.as_mut().unwrap().amount_in = "100.5".to_string();
 
     finalizer.advance_current_step(&mut state).await.unwrap();
 
     assert!(state.funding.is_none(), "the unsent transfer is dropped");
     assert!(state.order.is_none());
-    assert_eq!(state.amount_in, 100.0, "the next order is for what the bridge delivers");
+    assert_eq!(state.amount_in.to_f64(), 100.0, "the next order is for what the bridge delivers");
     assert_eq!(state.step, RiftStep::Order);
     assert!(!state.send_saved);
 }
@@ -64,8 +64,8 @@ async fn a_sized_amount_that_drifts_from_the_order_takes_a_new_order_instead_of_
 async fn an_order_under_the_arrival_by_its_headroom_is_funded() {
     let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), landing_sender());
     let mut state = state_at(RiftStep::BridgeOut);
-    state.arrival_headroom = 0.5;
-    state.amount_in = 99.5;
+    state.arrival_headroom = ChainTokenAmount::from_formatted(ckusdc(), 0.5);
+    state.amount_in = ChainTokenAmount::from_formatted(ckusdc(), 99.5);
     state.order.as_mut().unwrap().amount_in = "99.5".to_string();
 
     finalizer.advance_current_step(&mut state).await.unwrap();
