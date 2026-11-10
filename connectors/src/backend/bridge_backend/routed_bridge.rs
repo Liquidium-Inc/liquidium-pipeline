@@ -3,8 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{
-    BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeRequest, BridgeSend, BridgeStatus,
-    BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, ckbtc_bridge::RETRIEVE_BRIDGE_ID_PREFIX,
+    BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeProvider, BridgeRequest, BridgeSend,
+    BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, ckbtc_bridge::RETRIEVE_BRIDGE_ID_PREFIX,
+    resolve_route_by_source,
 };
 
 /// Keeps provider-specific submission handles with the backend that issued them.
@@ -46,18 +47,13 @@ mod tests {
 }
 
 impl RoutedBridgeBackend {
+    /// The catalog names the minter behind a source. A pair outside the
+    /// catalog, and every pre-catalog handle, stays with the EVM backend.
     fn source(&self, asset: &str, chain: &str) -> &dyn BridgeBackend {
-        if (asset.eq_ignore_ascii_case("ckSOL") && chain.eq_ignore_ascii_case("ICP"))
-            || (asset.eq_ignore_ascii_case("SOL") && chain.eq_ignore_ascii_case("SOL"))
-        {
-            self.solana.as_ref()
-        } else if (asset.eq_ignore_ascii_case("ckBTC") && chain.eq_ignore_ascii_case("ICP"))
-            || (asset.eq_ignore_ascii_case("BTC") && chain.eq_ignore_ascii_case("BTC"))
-        {
-            // The BTC backend serves the retrieval only; it refuses `BTC@BTC` with the reason.
-            self.btc.as_ref()
-        } else {
-            self.evm.as_ref()
+        match resolve_route_by_source(asset, chain).map(|route| route.route_kind.provider()) {
+            Some(BridgeProvider::CkSolMinter) => self.solana.as_ref(),
+            Some(BridgeProvider::CkBtcMinter) => self.btc.as_ref(),
+            Some(BridgeProvider::CkEthMinter) | None => self.evm.as_ref(),
         }
     }
 }

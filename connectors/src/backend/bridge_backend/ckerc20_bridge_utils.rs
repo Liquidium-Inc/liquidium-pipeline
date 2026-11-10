@@ -4,8 +4,8 @@ use icrc_ledger_types::icrc1::account::{Account, principal_to_subaccount};
 use std::str::FromStr;
 
 use crate::backend::bridge_backend::{
-    BridgeDestination, BridgeDestinationKind, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, resolve_route,
-    validate_destination_for_route,
+    BridgeDestination, BridgeDestinationKind, BridgeProvider, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+    resolve_route, validate_destination_for_route,
 };
 
 /// Encodes an ICP account into the `bytes32` principal/subaccount tuple expected by
@@ -114,13 +114,7 @@ pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result
             request.asset, request.source_chain, request.target_asset
         ));
     };
-    if !matches!(
-        route.route_kind,
-        BridgeRouteKind::CkEthErc20Forward
-            | BridgeRouteKind::CkEthErc20Reverse
-            | BridgeRouteKind::EthToCkEth
-            | BridgeRouteKind::CkEthToEth
-    ) {
+    if route.route_kind.provider() != BridgeProvider::CkEthMinter {
         return Err(format!(
             "route {}@{} -> {} is not supported by CkErc20BridgeBackend",
             request.asset, request.source_chain, request.target_asset

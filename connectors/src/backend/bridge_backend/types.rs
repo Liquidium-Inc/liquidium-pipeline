@@ -45,11 +45,54 @@ pub enum BridgeRouteKind {
     IcpToSolana,
 }
 
+/// The minter behind a route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeProvider {
+    CkEthMinter,
+    CkSolMinter,
+    CkBtcMinter,
+}
+
 impl BridgeRouteKind {
     /// True when one send funds the route: the bridge signs it, and the
     /// outbound driver saves, sends and settles it.
     pub fn funded_by_signed_send(self) -> bool {
         matches!(self, Self::SolanaToIcp | Self::CkEthErc20Forward | Self::EthToCkEth)
+    }
+
+    /// A route the ckETH minter serves into ICP.
+    pub fn is_cketh_forward(self) -> bool {
+        matches!(self, Self::CkEthErc20Forward | Self::EthToCkEth)
+    }
+
+    /// A route the ckETH minter serves out of ICP.
+    pub fn is_cketh_reverse(self) -> bool {
+        matches!(self, Self::CkEthErc20Reverse | Self::CkEthToEth)
+    }
+
+    /// A withdrawal through a minter: it burns on ICP and pays out elsewhere.
+    /// The approve fee stays on the source account, so the leg reserves it.
+    pub fn is_minter_withdrawal(self) -> bool {
+        matches!(
+            self,
+            Self::CkEthErc20Reverse | Self::CkEthToEth | Self::IcpToSolana | Self::CkBtcToBtc
+        )
+    }
+
+    /// Whether the minter refuses a withdrawal under a minimum. ckERC20
+    /// withdrawals have none.
+    pub fn has_withdrawal_minimum(self) -> bool {
+        matches!(self, Self::CkEthToEth | Self::IcpToSolana | Self::CkBtcToBtc)
+    }
+
+    pub fn provider(self) -> BridgeProvider {
+        match self {
+            Self::CkEthErc20Forward | Self::CkEthErc20Reverse | Self::EthToCkEth | Self::CkEthToEth => {
+                BridgeProvider::CkEthMinter
+            }
+            Self::SolanaToIcp | Self::IcpToSolana => BridgeProvider::CkSolMinter,
+            Self::BtcToCkBtc | Self::CkBtcToBtc => BridgeProvider::CkBtcMinter,
+        }
     }
 }
 

@@ -1010,10 +1010,7 @@ where
     /// Forward routes leave no minter withdrawal, so they return `None`.
     fn reverse_route_source(request: &BridgeRequest) -> Result<Option<(&'static BridgeRouteSpec, Account)>, String> {
         let route = resolve_cketh_route_for_request(request)?;
-        if !matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
-        ) {
+        if !route.route_kind.is_cketh_reverse() {
             return Ok(None);
         }
         Ok(Some((route, parse_source_icp_account(&request.source_address)?)))
