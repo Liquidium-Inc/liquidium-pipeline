@@ -3,14 +3,21 @@
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftBackend, RiftOrderStatus};
 use log::{debug, info, warn};
 
-use super::{RiftVenueFinalizer, VenueStepError, parse_amount};
+use super::{BITCOIN, RiftVenueFinalizer, VenueStepError, parse_amount};
 use crate::{
     finalizers::rift::state::{RiftState, RiftStep},
     utils::{now_ts, waited_secs},
 };
 
-/// How long Rift may take to see a deposit the bridge already paid.
-const DEPOSIT_SEEN_TIMEOUT_SECS: i64 = 2 * 60 * 60;
+/// How long Rift may take to see a deposit the bridge already paid. A
+/// Bitcoin deposit needs Rift's own confirmations after the minter's.
+fn deposit_seen_timeout_secs(pay_chain: &str) -> i64 {
+    if pay_chain.eq_ignore_ascii_case(BITCOIN) {
+        4 * 60 * 60
+    } else {
+        2 * 60 * 60
+    }
+}
 /// How long a funded order may take to deliver.
 const DELIVERY_TIMEOUT_SECS: i64 = 6 * 60 * 60;
 
@@ -24,7 +31,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         order.status = Some(answer.status.as_api());
         let waited = waited_secs(&mut order.wait_since_ts);
         match answer.status {
-            RiftOrderStatus::AwaitingDeposit if waited <= DEPOSIT_SEEN_TIMEOUT_SECS => {
+            RiftOrderStatus::AwaitingDeposit if waited <= deposit_seen_timeout_secs(&state.pay_chain) => {
                 debug!(
                     "[rift] liq_id={} order {} awaits its deposit {}s after the bridge paid it",
                     liq_id, order.id, waited

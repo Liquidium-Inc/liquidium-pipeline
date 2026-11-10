@@ -48,6 +48,25 @@ async fn an_order_that_never_sees_the_paid_deposit_parks_as_ambiguous() {
     );
 }
 
+/// Rift counts its own Bitcoin confirmations after the minter's, so a BTC
+/// deposit has a longer bound than an Ethereum one.
+#[tokio::test]
+async fn a_bitcoin_deposit_may_take_longer_to_be_seen() {
+    let mut state = waiting_state(3 * 60 * 60);
+    state.pay_chain = "bitcoin".to_string();
+    wait_with(RiftOrderStatus::AwaitingDeposit, None, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(state.step, RiftStep::Wait);
+
+    let mut state = waiting_state(5 * 60 * 60);
+    state.pay_chain = "bitcoin".to_string();
+    let error = wait_with(RiftOrderStatus::AwaitingDeposit, None, &mut state)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, VenueStepError::Ambiguous(_)), "{error}");
+}
+
 #[tokio::test]
 async fn a_funded_order_waits_for_delivery() {
     let mut state = waiting_state(60);

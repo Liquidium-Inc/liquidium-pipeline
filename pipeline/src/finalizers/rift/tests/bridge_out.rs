@@ -58,6 +58,23 @@ async fn a_sized_amount_that_drifts_from_the_order_takes_a_new_order_instead_of_
     assert!(!state.send_saved);
 }
 
+/// The headroom is by design, not a drift: the order asks for less than the
+/// bridge delivers.
+#[tokio::test]
+async fn an_order_under_the_arrival_by_its_headroom_is_funded() {
+    let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), landing_sender());
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.arrival_headroom = 0.5;
+    state.amount_in = 99.5;
+    state.order.as_mut().unwrap().amount_in = "99.5".to_string();
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.order.is_some(), "no new order");
+    assert!(state.funding.is_some(), "the funding transfer is saved");
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}
+
 #[tokio::test]
 async fn a_deadline_that_is_not_a_date_is_an_error_not_a_send() {
     let finalizer = finalizer(

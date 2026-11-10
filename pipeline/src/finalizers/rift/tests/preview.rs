@@ -1,6 +1,7 @@
 //! The preview: sized from the bridge arrival, quoted by Rift, haircut for the plan.
 use super::*;
 use crate::finalizers::multi_venue::{MultiVenueAdapter, VenueAmountError, VenuePlanningContext};
+use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::types::side_cost::SideCost;
 
 fn context() -> VenuePlanningContext {
@@ -105,16 +106,85 @@ async fn an_asset_rift_does_not_carry_is_unavailable_before_any_call() {
         MockBridgeBackend::new(),
         MockOutboundSender::new(),
     );
+    let cketh = ChainToken::Icp {
+        ledger: Principal::from_slice(&[9]),
+        symbol: "ckETH".to_string(),
+        decimals: 18,
+        fee: Nat::from(2_000_000_000_000u64),
+    };
     let mut request = request(100_010_000);
-    request.pay_asset = ckbtc().asset_id();
-    request.pay_amount = ChainTokenAmount::from_raw(ckbtc(), Nat::from(1_000_000u64));
+    request.pay_asset = cketh.asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(cketh, Nat::from(1_000_000_000_000_000u64));
 
     let error = finalizer.check_amount(&request).await.unwrap_err();
 
     assert!(
-        matches!(error, VenueAmountError::Unavailable(ref reason) if reason.contains("ckBTC")),
+        matches!(error, VenueAmountError::Unavailable(ref reason) if reason.contains("ckETH")),
         "{error}"
     );
+}
+
+/// The payout always comes back over the ckERC20 bridge, so ckBTC is a pay
+/// asset only until the BTC deposit route exists.
+#[tokio::test]
+async fn ckbtc_is_not_a_receive_asset_yet() {
+    let finalizer = finalizer(
+        MockRiftBackend::new(),
+        MockBridgeBackend::new(),
+        MockOutboundSender::new(),
+    );
+    let mut request = request(100_010_000);
+    request.receive_asset = ckbtc().asset_id();
+
+    let error = finalizer.check_amount(&request).await.unwrap_err();
+
+    assert!(
+        matches!(error, VenueAmountError::Unavailable(ref reason) if reason.contains("only to Ethereum")),
+        "{error}"
+    );
+}
+
+/// A ckBTC leg pays Rift on Bitcoin. The minter takes its fee out of the
+/// amount, and the order asks for one more fee estimate less, so a fee rise
+/// at burn time cannot underfund it.
+#[tokio::test]
+async fn a_ckbtc_leg_quotes_bitcoin_with_headroom_under_the_expected_arrival() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote().times(1).returning(|request| {
+        assert_eq!(request.from.as_str(), "bitcoin.btc");
+        assert_eq!(request.to.as_str(), "ethereum.usdt");
+        // 0.01 ckBTC, less the ledger fee and the approve fee (10 satoshi each),
+        // less the 1,500 satoshi withdrawal fee, less the same again as headroom.
+        assert_eq!(request.amount_in, "0.0099698");
+        Ok(quote(&request.amount_in, "600"))
+    });
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_fee_budget().returning(|asset, _, _| match asset {
+        "ckBTC" => Ok(BridgeFeeBudget {
+            source_fee_budget: 0.000_000_1,
+            destination_fee_budget: 0.000_015,
+            ..BridgeFeeBudget::default()
+        }),
+        _ => Ok(BridgeFeeBudget::default()),
+    });
+    bridge
+        .expect_get_minimum_bridge_amount()
+        .returning(|asset, _, _| Ok(if asset == "ckBTC" { 0.000_5 } else { 0.0 }));
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
+    let mut request = request(1_000_000);
+    request.pay_asset = ckbtc().asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(ckbtc(), Nat::from(1_000_000u64));
+
+    let preview = finalizer.preview(&context(), &request).await.unwrap();
+
+    assert_eq!(preview.quote.legs[0].route_id, "bitcoin.btc>ethereum.usdt");
+    let rift_state = preview.initial_execution_state.state.get("rift").unwrap();
+    assert_eq!(rift_state.get("pay_chain").and_then(|v| v.as_str()), Some("bitcoin"));
+    assert_eq!(
+        rift_state.get("arrival_headroom").and_then(|v| v.as_f64()),
+        Some(0.000_015)
+    );
+    assert_eq!(preview.quote.receive_amount, Nat::from(600_000_000u64));
 }
 
 #[tokio::test]
