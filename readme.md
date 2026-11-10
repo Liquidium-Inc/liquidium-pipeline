@@ -917,11 +917,28 @@ A Rift leg takes these steps, each saved before it acts:
 
 1. A fresh quote. A quote under the plan's conservative output is refused.
 2. The order. Rift delivers to the bridge EVM wallet and refunds to the main EVM wallet.
-3. The ckERC20 bridge, or the ckBTC minter for ckBTC, pays the order's deposit address straight from the minter. Nothing passes through our wallets on the way in. The ckBTC minter takes the Bitcoin fee out of the amount at burn time, so a ckBTC order asks for one fee estimate less than the expected arrival; a fee rise cannot underfund it.
+3. The ckERC20 bridge, or the ckBTC minter for ckBTC, pays the order's deposit address straight from the minter. Nothing passes through our wallets on the way in. The ckBTC minter takes the Bitcoin fee out of the amount at burn time, so a ckBTC order asks for one fee estimate less than the expected arrival; a fee rise cannot underfund it. Rift swaps a deposit above the order amount whole, so the headroom is not lost.
 4. The order status until Rift delivers. An underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide. A refunded order parks too; the operator finds the refund on Ethereum and answers `landed <tx>`, which ends the leg as refunded and reports the row failed. The funds sit at the main EVM wallet, outside the pipeline.
 5. The ckERC20 bridge brings the delivered asset back to ICP as its ck form.
 
 Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
+
+### Checking Rift without a liquidation
+
+`rift-swap-check` runs one Rift leg from the trader account, the way the daemon
+would run it inside a liquidation: the quote, the order, the bridge out, the
+wait for Rift, the bridge back. Without `--confirm` it only prints the preview.
+
+```bash
+liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20
+liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20 --confirm
+```
+
+The leg is saved to `rift-check-<ts>.json` in the working directory after every
+cycle. A stopped run continues with `--resume <file>`. A parked leg prints its
+open question; answer it on the resume with `--answer absent` or
+`--answer landed:<receipt>`. The trader account pays the amount plus one ledger
+fee, and the proceeds mint to the liquidator account.
 
 ## Native Simulator
 
