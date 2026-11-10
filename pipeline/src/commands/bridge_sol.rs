@@ -556,6 +556,10 @@ async fn notify_until_queued(
             Ok(DepositNotice::NotYet { reason }) => {
                 println!("Deposit not queued yet ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {reason}")
             }
+            Ok(DepositNotice::Held { reason }) => {
+                println!("Deposit held by the minter: {reason}");
+                return None;
+            }
             Err(error) => println!("Deposit notice failed ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {error}"),
         }
     }

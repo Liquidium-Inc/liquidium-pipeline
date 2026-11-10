@@ -166,7 +166,7 @@ fn route_label(route: &BridgeRouteSpec) -> String {
 
 /// The bridge status. A failed read says nothing about the bridge, so it reads
 /// as pending with the reason kept for the wait note.
-async fn read_bridge_status(
+pub async fn read_bridge_status(
     bridge: &BridgeRuntime,
     bridge_id: &str,
 ) -> Result<(BridgeStatus, Option<String>), BridgeLegError> {
@@ -178,7 +178,7 @@ async fn read_bridge_status(
 }
 
 /// The error for a bridge the provider reports as failed or canceled.
-fn bridge_failure(what: &str, leg_id: &str, bridge_id: &str, status: BridgeStatus) -> BridgeLegError {
+pub fn bridge_failure(what: &str, leg_id: &str, bridge_id: &str, status: BridgeStatus) -> BridgeLegError {
     let (verb, reason) = match status {
         BridgeStatus::Failed { reason } => ("failed", reason.unwrap_or_else(|| "unknown failure".to_string())),
         BridgeStatus::Canceled { reason } => ("canceled", reason.unwrap_or_else(|| "no reason provided".to_string())),

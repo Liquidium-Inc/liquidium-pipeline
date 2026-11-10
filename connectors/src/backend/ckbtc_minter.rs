@@ -1,6 +1,6 @@
-//! The ckBTC minter as the bridge calls it: `retrieve_btc_with_approval` and
-//! its status, the fee estimate and the minimum. The minter takes its fee
-//! out of the amount.
+//! The ckBTC minter as the bridge calls it. Out: `retrieve_btc_with_approval`
+//! and its status, the fee estimate and the minimum. In: the deposit address
+//! of an account and `update_balance`, which mints what arrived there.
 use std::sync::Arc;
 
 use candid::{CandidType, Encode, Principal};
@@ -14,6 +14,100 @@ pub const BTC_DECIMALS: u8 = 8;
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CkBtcMinterInfo {
     pub retrieve_btc_min_amount: u64,
+    /// A deposit under it never mints.
+    pub deposit_btc_min_amount: Option<u64>,
+    /// Bitcoin confirmations a deposit needs before the mint.
+    pub min_confirmations: u32,
+    /// Taken out of every deposit before the mint.
+    pub kyt_fee: u64,
+}
+
+/// The account whose deposit address or balance the call is about.
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MinterAccountArgs {
+    pub owner: Option<Principal>,
+    pub subaccount: Option<Vec<u8>>,
+}
+
+impl From<&Account> for MinterAccountArgs {
+    fn from(account: &Account) -> Self {
+        Self {
+            owner: Some(account.owner),
+            subaccount: account.subaccount.map(|bytes| bytes.to_vec()),
+        }
+    }
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct OutPoint {
+    /// In the minter's byte order; see [`display_txid`].
+    pub txid: Vec<u8>,
+    pub vout: u32,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Utxo {
+    pub height: u32,
+    pub value: u64,
+    pub outpoint: OutPoint,
+}
+
+/// What `update_balance` did with one deposit.
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum UtxoStatus {
+    /// Under the deposit minimum; it never mints.
+    ValueTooSmall(Utxo),
+    /// Quarantined by the minter's compliance check. Only its support moves it.
+    Tainted(Utxo),
+    Minted {
+        minted_amount: u64,
+        block_index: u64,
+        utxo: Utxo,
+    },
+    Checked(Utxo),
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingUtxo {
+    pub confirmations: u32,
+    pub value: u64,
+    pub outpoint: OutPoint,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum SuspendedReason {
+    ValueTooSmall,
+    Quarantined,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SuspendedUtxo {
+    pub utxo: Utxo,
+    pub earliest_retry: u64,
+    pub reason: SuspendedReason,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum UpdateBalanceError {
+    GenericError {
+        error_message: String,
+        error_code: u64,
+    },
+    TemporarilyUnavailable(String),
+    AlreadyProcessing,
+    /// Nothing new to mint. The pending list says what still confirms.
+    NoNewUtxos {
+        suspended_utxos: Option<Vec<SuspendedUtxo>>,
+        required_confirmations: u32,
+        pending_utxos: Option<Vec<PendingUtxo>>,
+        current_confirmations: Option<u32>,
+    },
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum UpdateBalanceRet {
+    Ok(Vec<UtxoStatus>),
+    Err(UpdateBalanceError),
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -160,6 +254,22 @@ impl<A: PipelineAgent> CkBtcMinter<A> {
 
     pub async fn minter_info(&self) -> Result<CkBtcMinterInfo, String> {
         self.query("get_minter_info", &()).await
+    }
+
+    /// The Bitcoin address whose deposits mint to `account`.
+    pub async fn get_btc_address(&self, account: &Account) -> Result<String, String> {
+        self.update("get_btc_address", &MinterAccountArgs::from(account)).await
+    }
+
+    /// Mints the confirmed deposits of `account`. Safe to repeat: a deposit
+    /// mints once, and a repeat reports what is pending.
+    pub async fn update_balance(&self, account: &Account) -> Result<UpdateBalanceRet, String> {
+        self.update("update_balance", &MinterAccountArgs::from(account)).await
+    }
+
+    /// The deposits the minter has minted to `account`, whoever asked.
+    pub async fn get_known_utxos(&self, account: &Account) -> Result<Vec<Utxo>, String> {
+        self.query("get_known_utxos", &MinterAccountArgs::from(account)).await
     }
 
     /// The fee a retrieval of `amount` pays, or the fee of a typical one.

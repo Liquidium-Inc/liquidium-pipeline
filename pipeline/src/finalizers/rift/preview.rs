@@ -9,8 +9,7 @@ use liquidium_pipeline_core::{
 };
 
 use super::{
-    chain::RiftChain,
-    finalizer::{RiftVenueFinalizer, decimal_text, rift_amount},
+    finalizer::{RiftVenueFinalizer, decimal_text, leg_routes, rift_amount, rift_asset},
     state::{RiftState, RiftStep},
 };
 use crate::{
@@ -33,15 +32,14 @@ pub(super) fn order_headroom(out: &BridgeRouteSpec, budget: &BridgeFeeBudget) ->
     }
 }
 
-/// What the order asks for: the expected arrival less the headroom, or
-/// nothing when the fees eat the arrival.
-pub(super) fn order_amount(expected: &ChainTokenAmount, headroom: &ChainTokenAmount) -> Option<ChainTokenAmount> {
-    if expected.value <= headroom.value {
+/// `amount` less `taken`, or nothing when that leaves nothing to swap.
+pub(super) fn net_of(amount: &ChainTokenAmount, taken: &ChainTokenAmount) -> Option<ChainTokenAmount> {
+    if amount.value <= taken.value {
         return None;
     }
     Some(ChainTokenAmount::from_raw(
-        expected.token.clone(),
-        expected.value.clone() - headroom.value.clone(),
+        amount.token.clone(),
+        amount.value.clone() - taken.value.clone(),
     ))
 }
 
@@ -52,7 +50,7 @@ fn swap_leg(state: &RiftState, receive_amount: &ChainTokenAmount, price: f64) ->
         route_id: format!(
             "{}>{}",
             RiftAsset::new(&state.pay_chain, &state.pay_symbol).as_str(),
-            RiftAsset::new(RiftChain::PAYOUT.name(), &state.receive_symbol).as_str()
+            RiftAsset::new(&state.receive_chain, &state.receive_symbol).as_str()
         ),
         pay_chain: state.size_in.token.chain(),
         pay_symbol: state.size_in.token.symbol(),
@@ -103,9 +101,11 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         request: &SwapRequest,
     ) -> Result<RiftPreview, String> {
         let (pay_amount, final_asset, final_destination) = self.swap_request_parts(request)?;
-        let (pay_chain, _) = Self::rift_asset(&pay_amount.token)
+        let (pay_chain, _) = rift_asset(&pay_amount.token)
             .ok_or_else(|| format!("Rift does not carry {}", pay_amount.token.symbol()))?;
-        let (out, back) = Self::leg_routes(&pay_amount.token, &final_asset)?;
+        let (receive_chain, _) =
+            rift_asset(&final_asset).ok_or_else(|| format!("Rift does not deliver {}", final_asset.symbol()))?;
+        let (out, back) = leg_routes(&pay_amount.token, &final_asset)?;
         let arrival = bridged_deposit_arrival(&self.bridge, out, &pay_amount.token, &pay_amount)
             .await
             .map_err(|error| error.to_string())?;
@@ -114,23 +114,36 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let expected = ChainTokenAmount::from_formatted(pay_token.clone(), arrival.expected_amount);
         let arrival_headroom =
             ChainTokenAmount::from_formatted(pay_token.clone(), order_headroom(out, &arrival.sizing.fee_budget));
-        let amount_in =
-            order_amount(&expected, &arrival_headroom).ok_or("the bridge fees leave nothing for Rift to swap")?;
+        let amount_in = net_of(&expected, &arrival_headroom).ok_or("the bridge fees leave nothing for Rift to swap")?;
         let pair = format!("{}.{}->{}", pay_chain.name(), out.target_asset, back.source_asset);
         let quote = self
             .backend
             .quote(&RiftQuoteRequest {
                 from: RiftAsset::new(pay_chain.name(), out.target_asset),
-                to: RiftAsset::new(RiftChain::PAYOUT.name(), back.source_asset),
+                to: RiftAsset::new(receive_chain.name(), back.source_asset),
                 amount_in: decimal_text(&amount_in),
                 venues: self.venues.clone(),
             })
             .await
             .map_err(|error| format!("Rift cannot quote {pair}: {error}"))?;
-        let receive_amount =
-            rift_amount(&final_asset, &quote.estimated_amount_out).map_err(|error| error.to_string())?;
-        if receive_amount.value == 0u8 {
+        let delivered = rift_amount(&final_asset, &quote.estimated_amount_out).map_err(|error| error.to_string())?;
+        if delivered.value == 0u8 {
             return Err(format!("Rift quotes nothing for {} {pair}", decimal_text(&amount_in)));
+        }
+        // A payout under the provider's deposit minimum never mints, and Rift
+        // would already have been paid.
+        let minimum = self
+            .bridge
+            .backend
+            .get_minimum_bridge_amount(back.source_asset, back.source_chain, back.target_asset)
+            .await
+            .map_err(|error| error.to_string())?;
+        if delivered.to_f64() < minimum {
+            return Err(format!(
+                "Rift delivers {} {}, under the {minimum} deposit minimum of the leg back",
+                decimal_text(&delivered),
+                back.source_asset
+            ));
         }
         let budget = self
             .bridge
@@ -140,6 +153,10 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             .map_err(|error| error.to_string())?;
         ensure_return_gas(&self.bridge, back, &budget).await?;
         side_costs.extend(budget.side_costs);
+        // The leg back's provider may take a fee out of the payout before it mints.
+        let return_fee = ChainTokenAmount::from_formatted(final_asset.clone(), budget.destination_fee_budget.max(0.0));
+        let receive_amount = net_of(&delivered, &return_fee)
+            .ok_or_else(|| format!("the return fee eats what Rift delivers for {pair}"))?;
 
         // Rift reports no impact and no fees inside the quote, so its price is
         // the only price: the plan's oracle guard judges it.
@@ -162,6 +179,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             final_asset: final_asset.clone(),
             final_destination,
             pay_chain: pay_chain.name().to_string(),
+            receive_chain: receive_chain.name().to_string(),
             pay_symbol: out.target_asset.to_string(),
             receive_symbol: back.source_asset.to_string(),
             amount_in,

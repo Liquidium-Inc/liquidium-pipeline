@@ -3,7 +3,7 @@
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBackend, RiftError, RiftQuoteRequest};
 use log::info;
 
-use super::{RiftChain, RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
+use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
 use crate::finalizers::rift::state::{RiftOrderRecord, RiftState, RiftStep};
 
 impl<R: RiftBackend> RiftVenueFinalizer<R> {
@@ -11,7 +11,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
     pub(super) fn quote_request(&self, state: &RiftState) -> RiftQuoteRequest {
         RiftQuoteRequest {
             from: RiftAsset::new(&state.pay_chain, &state.pay_symbol),
-            to: RiftAsset::new(RiftChain::PAYOUT.name(), &state.receive_symbol),
+            to: RiftAsset::new(&state.receive_chain, &state.receive_symbol),
             amount_in: decimal_text(&state.amount_in),
             venues: self.venues.clone(),
         }
@@ -54,9 +54,10 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         };
 
         let refund_address = state.pay_chain()?.refund_address(&self.refund_addresses).to_string();
+        let to_address = self.delivery_address(state).await?;
         let order = match self
             .backend
-            .create_order(&quote_id, self.delivery_address(), Some(refund_address.clone()))
+            .create_order(&quote_id, &to_address, Some(refund_address.clone()))
             .await
         {
             Ok(order) => order,
@@ -88,7 +89,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             order.amount_in,
             state.pay_symbol,
             order.deposit_deadline,
-            self.delivery_address(),
+            to_address,
             refund_address
         );
         state.order = Some(RiftOrderRecord {
@@ -104,6 +105,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             wait_since_ts: None,
             delivered_at_ts: None,
             refund_tx: None,
+            to_address: Some(to_address),
         });
         state.step = RiftStep::BridgeOut;
         Ok(())

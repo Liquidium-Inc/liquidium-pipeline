@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::finalizers::cex::profile::CexVenueProfile;
-use crate::finalizers::multi_venue::RIFT_VENUE_ID;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
+use crate::finalizers::multi_venue::RIFT_VENUE_ID;
 use crate::persistance::{
     FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
     WalProfitSnapshot,
@@ -28,10 +28,7 @@ use super::super::reconcile::ReconcilePanel;
 fn draw_reconcile(f: &mut Frame<'_>, area: Rect, panel: &ReconcilePanel) {
     let mut lines: Vec<Line> = match &panel.reply {
         Ok(report) => report.lines().map(|line| Line::from(line.to_string())).collect(),
-        Err(error) => vec![Line::from(Span::styled(
-            error.clone(),
-            Style::default().fg(Color::Red),
-        ))],
+        Err(error) => vec![Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red)))],
     };
     lines.push(Line::from(""));
     lines.push(Line::from(format!("> {}_", panel.input)));
@@ -568,6 +565,9 @@ fn append_rift_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
         let id = text(order.get("id")).unwrap_or_default();
         let status = text(order.get("status")).unwrap_or_else(|| "created".to_string());
         lines.push(Line::from(format!("   Rift order: {id} ({status})")));
+        if let Some(to) = text(order.get("to_address")) {
+            lines.push(Line::from(format!("   Rift pays to: {to}")));
+        }
         if let Some(payout) = text(order.get("payout_tx")) {
             lines.push(Line::from(format!("   Rift payout tx: {payout}")));
         }
@@ -955,8 +955,7 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary,
-        icpswap_account_principal,
+        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary, icpswap_account_principal,
         profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
     };
     use crate::{
@@ -1115,7 +1114,10 @@ mod tests {
             "   Kraken withdraw txid: 0xd81a",
             "   Kraken withdraw bridge txid: 0x6c93",
         ] {
-            assert!(text.iter().any(|line| line == expected), "missing {expected:?} in {text:?}");
+            assert!(
+                text.iter().any(|line| line == expected),
+                "missing {expected:?} in {text:?}"
+            );
         }
     }
 
