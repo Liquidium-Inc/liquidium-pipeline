@@ -1,42 +1,92 @@
+//! The exchange leg as the shared leg driver sees it: its state, its step,
+//! its settlement wait, and its planning checks.
+use std::{collections::HashSet, sync::Mutex};
+
 use async_trait::async_trait;
-use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeRouteKind, resolve_route};
+use liquidium_pipeline_connectors::backend::bridge_backend::resolve_route;
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
 use super::finalizer::CexVenueFinalizer;
-use crate::finalizers::bridge_legs::{BridgeLegError, bridge_minimum_shortfall, size_bridged_deposit};
+use crate::finalizers::bridge_legs::check_bridged_minimum;
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
         cex::state::{CexState, CexStep},
         multi_venue::{
-            GateOpening, MultiVenueAdapter, OperatorQuestion, StepVerdict, VenueAmountError, VenueGate,
-            VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext, VenueRoutePreview, VenueStepError,
+            GatedLeg, LegPreview, LegState, OperatorQuestion, StepFlow, VenueAmountError, VenueGate, VenueLeg,
+            VenuePlanningContext, VenueStepError,
         },
     },
     outbound::driver::OperatorDecision,
-    persistance::{VenueExecutionState, VenueLegFailure, VenueLegState, VenueLegStatus},
-    swappers::model::SwapRequest,
+    persistance::{VenueLegFailure, VenueLegState},
+    swappers::model::{SwapExecution, SwapRequest},
     utils::now_ts,
 };
 
-/// How long a leg keeps re-offering an order that the exchange rejects as not yet
-/// tradable before an operator has to look at it.
-///
-/// Deposit credit and matching-engine availability are minutes apart on MEXC,
-/// while the finalizer's retry budget is spent in about two, so the wait has to
-/// live here rather than in the retry counter. The deadline still bounds it:
-/// an account that is genuinely short never resolves and must not loop forever.
+/// How long a leg keeps re-offering an order that the exchange rejects as not
+/// yet tradable before an operator has to look at it. Deposit credit and the
+/// matching engine are minutes apart on MEXC, longer than the retry budget.
 const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
 
-/// The exchange leg's complete venue-local state plus the persistence gate.
-/// The gate keeps its keys at the top level, as every saved row has them.
+/// The exchange leg's state plus the persistence gate. The gate keeps its
+/// keys at the top level, as every saved row has them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CexVenueExecutionState {
+pub struct CexVenueExecutionState {
     cex: CexState,
     #[serde(flatten)]
     gate: VenueGate,
+}
+
+impl GatedLeg for CexVenueExecutionState {
+    type State = CexState;
+    fn state(&self) -> &CexState {
+        &self.cex
+    }
+    fn state_mut(&mut self) -> &mut CexState {
+        &mut self.cex
+    }
+    fn gate(&self) -> &VenueGate {
+        &self.gate
+    }
+    fn gate_mut(&mut self) -> &mut VenueGate {
+        &mut self.gate
+    }
+}
+
+impl LegState for CexState {
+    fn liq_id(&self) -> &str {
+        &self.liq_id
+    }
+    fn step_label(&self) -> String {
+        format!("{:?}", self.step)
+    }
+    fn is_completed(&self) -> bool {
+        self.step == CexStep::Completed
+    }
+    fn is_failed(&self) -> bool {
+        self.step == CexStep::Failed
+    }
+    fn end_below_minimum(&mut self) {
+        self.step = CexStep::Failed;
+    }
+    /// A minimum refusal is the only way an exchange leg fails for good.
+    fn failure(&self) -> Option<VenueLegFailure> {
+        (self.step == CexStep::Failed).then_some(VenueLegFailure::BelowMinimum)
+    }
+    fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+    fn set_last_error(&mut self, error: Option<String>) {
+        self.last_error = error;
+    }
+    fn take_send_saved(&mut self) -> bool {
+        std::mem::take(&mut self.send_saved)
+    }
+    fn funds_left_trader_account(&self) -> bool {
+        CexState::funds_left_trader_account(self)
+    }
 }
 
 /// A pending settlement is the exchange's own wait; the four shared kinds pass through.
@@ -53,294 +103,157 @@ impl From<CexBackendError> for VenueStepError {
 
 impl<B> CexVenueFinalizer<B>
 where
-    B: CexBackend,
+    B: CexBackend + 'static,
 {
-    /// Translates the amount-scoped CEX preview into the generic venue shape;
-    /// route preparation stays in the CEX machine.
-    async fn preview_leg_request(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String> {
-        let execution_id = crate::utils::new_venue_execution_id(self.profile.venue_id());
-        let preview = self.preview_swap_request(&execution_id, request).await?;
-        let execution = CexVenueExecutionState {
-            cex: preview.state,
-            gate: VenueGate::default(),
+    /// Holds a leg whose funds the exchange reports as not tradable yet. The
+    /// deposit is in the account, but the matching engine refuses it; only
+    /// the exchange can say when that changes, so the wait has its own bound.
+    async fn settlement_hold(&self, state: &mut CexState, error: String) -> Result<StepFlow, VenueStepError> {
+        let now = now_ts();
+        let waiting_since = *state.trade.trade_settlement_waiting_since_ts.get_or_insert(now);
+        let waited = now.saturating_sub(waiting_since);
+        if waited < SETTLEMENT_WAIT_TIMEOUT_SECS {
+            info!(
+                "[cex] liq_id={} waiting for venue settlement: waited={}s timeout={}s err={}",
+                state.liq_id, waited, SETTLEMENT_WAIT_TIMEOUT_SECS, error
+            );
+            return Ok(StepFlow::Hold(error));
+        }
+        // The wait is over and the venue never released the funds. One balance
+        // read tells the operator which case they have: funds present and
+        // stuck, or an account that never held them.
+        let asset = <Self as BridgePlanner>::planned_deposit_asset(state);
+        let observed = match self.backend.get_balance(&asset).await {
+            Ok(balance) => format!("{balance}"),
+            Err(balance_error) => format!("unavailable ({balance_error})"),
         };
-
-        Ok(VenueRoutePreview {
-            market_receive: Some(preview.market_receive),
-            side_costs: preview.side_costs,
-            ..VenueRoutePreview::new(
-                self.profile.venue_id(),
-                request.clone(),
-                preview.quote,
-                preview.conservative_receive,
-                VenueExecutionState::new(self.profile.venue_id(), &execution)?,
-            )
-        })
+        warn!(
+            "[cex] liq_id={} venue settlement wait expired after {}s free_{}={} err={}",
+            state.liq_id, waited, asset, observed, error
+        );
+        Err(VenueStepError::Ambiguous(format!(
+            "{} leg not settled after {waited}s: {error} (free {asset}={observed})",
+            self.profile.name()
+        )))
     }
 
-    /// Decodes this leg only and verifies that its persisted allocation
-    /// still matches the immutable request committed by the parent plan.
-    fn decode_leg_state(&self, leg: &VenueLegState) -> Result<CexVenueExecutionState, String> {
-        if leg.venue_id != self.profile.venue_id() {
-            return Err(format!(
-                "{} adapter cannot advance venue `{}`",
-                self.profile.name(),
-                leg.venue_id
-            ));
+    #[cfg(test)]
+    pub(super) async fn advance_decoded_leg(
+        &self,
+        execution: CexVenueExecutionState,
+        checkpoint: &dyn crate::finalizers::multi_venue::VenueLegCheckpoint,
+    ) -> Result<crate::finalizers::multi_venue::VenueLegProgress, String> {
+        crate::finalizers::multi_venue::advance_execution(self, execution, checkpoint).await
+    }
+}
+
+#[async_trait]
+impl<B> VenueLeg for CexVenueFinalizer<B>
+where
+    B: CexBackend + 'static,
+{
+    type Exec = CexVenueExecutionState;
+
+    fn leg_venue_id(&self) -> &'static str {
+        self.profile.venue_id()
+    }
+
+    fn venue_name(&self) -> String {
+        self.profile.name().to_string()
+    }
+
+    fn armed_intents(&self) -> &Mutex<HashSet<String>> {
+        &self.multi_venue_armed_intents
+    }
+
+    fn new_execution(&self, state: CexState) -> CexVenueExecutionState {
+        CexVenueExecutionState {
+            cex: state,
+            gate: VenueGate::default(),
         }
-        let state = leg
-            .execution
-            .decode::<CexVenueExecutionState>(self.profile.venue_id())?
-            .ok_or_else(|| format!("{} leg execution state decoded to the wrong venue", self.profile.name()))?;
-        if state.cex.size_in != leg.request.pay_amount {
+    }
+
+    fn check_allocation(&self, state: &CexState, leg: &VenueLegState) -> Result<(), String> {
+        if state.size_in != leg.request.pay_amount {
             return Err(format!(
                 "{} persisted allocation does not match the leg request",
                 self.profile.name()
             ));
         }
-        if state.cex.withdraw.withdraw_asset.asset_id() != leg.request.receive_asset {
+        if state.withdraw.withdraw_asset.asset_id() != leg.request.receive_asset {
             return Err(format!(
                 "{} persisted receive asset does not match the leg request",
                 self.profile.name()
             ));
         }
-        Ok(state)
+        Ok(())
     }
 
-    /// Advances exactly one venue-local state-machine phase. This method never
-    /// receives a WAL handle and therefore cannot change the parent row status.
-    async fn advance_leg(
-        &self,
-        leg: &VenueLegState,
-        checkpoint: &dyn VenueLegCheckpoint,
-    ) -> Result<VenueLegProgress, String> {
-        self.advance_decoded_leg(self.decode_leg_state(leg)?, checkpoint).await
-    }
-
-    /// Whether a restarted leg may advance without its submission gate.
-    ///
-    /// Legacy plan backfilling can turn a direct step into a bridged one, so
-    /// the plan is resolved here before the durable-id check runs.
-    fn can_resume_by_polling(&self, state: &mut CexState) -> bool {
+    /// A restarted leg may go on only from a durable id it can poll. Legacy
+    /// plan backfilling can turn a direct step into a bridged one, so the plan
+    /// is resolved first.
+    fn resume_after_restart(&self, state: &mut CexState, intent_id: &str) -> Result<(), String> {
         self.ensure_plan_on_state(state);
-        state.resume_after_restart(now_ts())
+        if state.resume_after_restart(now_ts()) {
+            return Ok(());
+        }
+        Err(format!(
+            "persisted {} intent `{intent_id}` has ambiguous submission state after restart",
+            self.profile.name()
+        ))
     }
 
-    /// Advances an already validated state so recovery does not decode the
-    /// same persisted JSON twice in one orchestrator cycle.
-    async fn advance_decoded_leg(
-        &self,
-        mut execution: CexVenueExecutionState,
-        checkpoint: &dyn VenueLegCheckpoint,
-    ) -> Result<VenueLegProgress, String> {
-        if execution.cex.step == CexStep::Completed {
-            return self.progress_for(execution, None);
-        }
-        if execution.cex.step == CexStep::Failed {
-            let last_error = execution.cex.last_error.clone();
-            return self.progress_for(execution, last_error);
-        }
-        if execution.gate.operator_required {
-            let error = execution
-                .cex
-                .last_error
-                .clone()
-                .unwrap_or_else(|| format!("{} leg requires operator reconciliation", self.profile.name()));
-            return self.operator_required_progress(execution, error);
-        }
-
-        let intent_id = match execution
-            .gate
-            .open(self.profile.venue_id(), &self.multi_venue_armed_intents)?
-        {
-            GateOpening::Armed => return self.progress_for(execution, None),
-            GateOpening::Open { intent_id, armed_here } => {
-                if !armed_here && !self.can_resume_by_polling(&mut execution.cex) {
-                    return self.operator_required_progress(
-                        execution,
-                        format!(
-                            "persisted {} intent `{intent_id}` has ambiguous submission state after restart",
-                            self.profile.name()
-                        ),
-                    );
-                }
-                intent_id
-            }
-        };
-        execution.gate.close();
-        execution.cex.last_error = None;
-
-        let mut outcome = self.advance_current_step(&mut execution.cex).await;
-        // A step that saved a send writes it to the WAL with the gate still
-        // set, then sends it in the same cycle. A crash during the send then
-        // restarts into the saved send, which parks unless a replay is safe.
-        if outcome.is_ok() && std::mem::take(&mut execution.cex.send_saved) {
-            let mut saved = execution.clone();
-            saved.gate = execution.gate.held(intent_id);
-            checkpoint.checkpoint(self.progress_for(saved, None)?).await?;
-            outcome = self.advance_current_step(&mut execution.cex).await;
-            execution.cex.send_saved = false;
-        }
-
-        let outcome = match outcome {
-            Err(error @ CexBackendError::PendingSettlement(_)) => {
-                execution.gate.unreachable_since_ts = None;
-                execution.cex.last_error = Some(error.to_string());
-                return self.settlement_wait_progress(execution, error.to_string()).await;
-            }
-            // Any step that completes without an error proves the venue is
-            // caught up, so a later wait starts from its own first refusal.
+    async fn step(&self, state: &mut CexState) -> Result<StepFlow, VenueStepError> {
+        match self.advance_current_step(state).await {
+            // A step that completes proves the venue is caught up, so a later
+            // wait starts from its own first refusal.
             Ok(()) => {
-                execution.cex.trade.trade_settlement_waiting_since_ts = None;
-                Ok(())
+                state.trade.trade_settlement_waiting_since_ts = None;
+                Ok(StepFlow::Done)
             }
-            Err(error) => Err(VenueStepError::from(error)),
-        };
-        if let Err(error) = &outcome {
-            execution.cex.last_error = Some(error.to_string());
-        }
-        let funds_left = execution.cex.funds_left_trader_account();
-        let context = format!("liq_id={} step={:?}", execution.cex.liq_id, execution.cex.step);
-        match execution.gate.judge(outcome, funds_left, "cex", &context) {
-            StepVerdict::Continue => self.progress_for(execution, None),
-            StepVerdict::Wait => self.progress_for(execution, None),
-            StepVerdict::Retry(message) => self.progress_for(execution, Some(message)),
-            StepVerdict::Park(message) => self.operator_required_progress(execution, message),
-            StepVerdict::EndBelowMinimum(message) => {
-                execution.cex.step = CexStep::Failed;
-                let mut progress = self.progress_for(execution, Some(message))?;
-                progress.failure = Some(VenueLegFailure::BelowMinimum);
-                Ok(progress)
-            }
+            Err(error @ CexBackendError::PendingSettlement(_)) => self.settlement_hold(state, error.to_string()).await,
+            Err(error) => Err(error.into()),
         }
     }
 
-    /// Holds a leg whose funds the venue reports as not tradable yet.
-    ///
-    /// Nothing failed here: the exchange accepted the deposit into the account balance
-    /// but its matching engine still refuses to trade it, and only the venue
-    /// can say when that changes. The leg therefore keeps its `Running` status
-    /// and reports no retryable error, so the orchestrator re-offers the same
-    /// order under the same client id on later cycles without spending the
-    /// finalization retry budget. The error stays in `last_error` for the TUI.
-    async fn settlement_wait_progress(
-        &self,
-        mut execution: CexVenueExecutionState,
-        error: String,
-    ) -> Result<VenueLegProgress, String> {
-        let now = now_ts();
-        let waiting_since = *execution.cex.trade.trade_settlement_waiting_since_ts.get_or_insert(now);
-        let waited = now.saturating_sub(waiting_since);
+    fn finish(&self, state: &CexState) -> Result<SwapExecution, String> {
+        self.finish_state(state)
+    }
 
-        if waited < SETTLEMENT_WAIT_TIMEOUT_SECS {
-            info!(
-                "[cex] liq_id={} waiting for venue settlement: waited={}s timeout={}s err={}",
-                execution.cex.liq_id, waited, SETTLEMENT_WAIT_TIMEOUT_SECS, error
-            );
-            return Ok(VenueLegProgress {
-                execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
-                status: VenueLegStatus::Running,
-                result: None,
-                last_error: Some(error),
-                retryable_error: None,
-                failure: None,
-            });
+    /// The CEX machine uses its Pending phases as durable restart points, so
+    /// recovery accepts them even without a last error.
+    fn may_recover(&self, state: &CexState) -> Result<(), String> {
+        if state.last_error.is_none()
+            && !matches!(
+                state.step,
+                CexStep::DepositPending | CexStep::TradePending | CexStep::WithdrawPending | CexStep::Failed
+            )
+        {
+            return Err(format!(
+                "{} leg at {:?} is not in recovery",
+                self.profile.name(),
+                state.step
+            ));
         }
-
-        // The wait is over and the venue never released the funds. One balance
-        // read costs nothing here and tells the operator which case they have:
-        // funds present and stuck, or an account that never held them.
-        let asset = <Self as BridgePlanner>::planned_deposit_asset(&execution.cex);
-        let observed = match self.backend.get_balance(&asset).await {
-            Ok(balance) => format!("{}", balance),
-            Err(balance_error) => format!("unavailable ({})", balance_error),
-        };
-        warn!(
-            "[cex] liq_id={} venue settlement wait expired after {}s free_{}={} err={}",
-            execution.cex.liq_id, waited, asset, observed, error
-        );
-        self.operator_required_progress(
-            execution,
-            format!(
-                "{} leg not settled after {waited}s: {error} (free {asset}={observed})",
-                self.profile.name()
-            ),
-        )
+        Ok(())
     }
 
-    /// Maps the detailed CEX state onto the generic leg status and creates a
-    /// result only after this exchange leg itself reaches `Completed`.
-    fn progress_for(
-        &self,
-        execution: CexVenueExecutionState,
-        error: Option<String>,
-    ) -> Result<VenueLegProgress, String> {
-        let status = match execution.cex.step {
-            CexStep::Completed => VenueLegStatus::Completed,
-            CexStep::Failed => VenueLegStatus::FailedPermanent,
-            _ => VenueLegStatus::Running,
-        };
-        let result = if execution.cex.step == CexStep::Completed {
-            Some(self.finish_state(&execution.cex)?)
-        } else {
-            None
-        };
-        let last_error = error.clone().or_else(|| execution.cex.last_error.clone());
-        // A permanently failed leg keeps its error for diagnostics but must never
-        // advertise it as retryable. Both paths that reach here with an error --
-        // the `CexStep::Failed` short-circuit and the amount-floor rejection --
-        // describe a swap that cannot succeed on a later cycle, so the retry
-        // signal has to be dropped at the source rather than relying on the
-        // orchestrator to filter it back out.
-        let retryable_error = match status {
-            VenueLegStatus::FailedPermanent => None,
-            _ => error,
-        };
-        Ok(VenueLegProgress {
-            execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
-            status,
-            result,
-            last_error,
-            retryable_error,
-            failure: None,
-        })
+    fn questions(&self, state: &CexState) -> Vec<OperatorQuestion> {
+        Self::operator_questions_for(state)
     }
 
-    fn operator_required_progress(
-        &self,
-        mut execution: CexVenueExecutionState,
-        error: String,
-    ) -> Result<VenueLegProgress, String> {
-        execution.gate.operator_required = true;
-        execution.cex.last_error = Some(error.clone());
-        Ok(VenueLegProgress {
-            execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
-            status: VenueLegStatus::OperatorRequired,
-            result: None,
-            last_error: Some(error),
-            retryable_error: None,
-            failure: None,
-        })
-    }
-}
-
-#[async_trait]
-impl<B> MultiVenueAdapter for CexVenueFinalizer<B>
-where
-    B: CexBackend + 'static,
-{
-    fn venue_id(&self) -> &'static str {
-        self.profile.venue_id()
+    fn answer(&self, state: &mut CexState, answer: Option<&OperatorDecision>) -> Result<(), String> {
+        Self::answer_operator(state, answer)
     }
 
-    fn validate_configuration(&self) -> Result<(), String> {
+    fn check_configuration(&self) -> Result<(), String> {
         if self.token_registry.is_none() {
             return Err("token registry is required for amount-scoped CEX previews".to_string());
         }
         Ok(())
     }
 
-    async fn check_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
+    async fn check_leg_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
         let state = self
             .prepare_swap_request("amount-check", request)
             .map_err(VenueAmountError::Unavailable)?;
@@ -351,102 +264,25 @@ where
         ) else {
             return Ok(());
         };
-        // Only these minters enforce a withdrawal minimum; ckERC20 does not.
-        if !matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthToEth | BridgeRouteKind::IcpToSolana
-        ) {
-            return Ok(());
-        }
         let bridge = self.bridge_runtime().map_err(VenueAmountError::Unavailable)?;
-        let sizing = size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in)
-            .await
-            .map_err(|error| match error {
-                BridgeLegError::BelowMinimum(message) => VenueAmountError::BelowMinimum(message),
-                other => VenueAmountError::Unavailable(other.to_string()),
-            })?;
-        match bridge_minimum_shortfall(bridge, route, &sizing.bridge_amount)
-            .await
-            .map_err(VenueAmountError::Unavailable)?
-        {
-            Some((amount, minimum)) => Err(VenueAmountError::BelowMinimum(format!(
-                "{} -> {} bridge amount ({amount}) after fee reserves is below minimum ({minimum})",
-                route.source_asset, route.target_asset
-            ))),
-            None => Ok(()),
-        }
+        check_bridged_minimum(bridge, route, &state.deposit.deposit_asset, &state.size_in).await
     }
 
-    async fn preview(
+    /// The amount-scoped CEX preview; route preparation stays in the CEX machine.
+    async fn preview_leg(
         &self,
         _context: &VenuePlanningContext,
         request: &SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
-        self.preview_leg_request(request).await
-    }
-
-    async fn advance(
-        &self,
-        leg: &VenueLegState,
-        checkpoint: &dyn VenueLegCheckpoint,
-    ) -> Result<VenueLegProgress, String> {
-        self.advance_leg(leg, checkpoint).await
-    }
-
-    fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
-        let execution = self.decode_leg_state(leg)?;
-        Ok(Self::operator_questions_for(&execution.cex))
-    }
-
-    fn operator_release(
-        &self,
-        leg: &VenueLegState,
-        answer: Option<&OperatorDecision>,
-    ) -> Result<VenueExecutionState, String> {
-        let mut execution = self.decode_leg_state(leg)?;
-        Self::answer_operator(&mut execution.cex, answer)?;
-        execution.gate.release_park();
-        VenueExecutionState::new(self.profile.venue_id(), &execution)
-    }
-
-    async fn recover(
-        &self,
-        leg: &VenueLegState,
-        checkpoint: &dyn VenueLegCheckpoint,
-    ) -> Result<VenueLegProgress, String> {
-        let mut execution = self.decode_leg_state(leg)?;
-        if execution.cex.step == CexStep::Completed {
-            return Err(format!(
-                "completed {} leg does not require recovery",
-                self.profile.name()
-            ));
-        }
-        // OperatorRequired rows are excluded from automatic WAL polling. An
-        // explicit re-enqueue is therefore the operator's authorization to
-        // discard the old in-memory submission token and retry the persisted
-        // CEX step through a newly persisted intent. This call only arms that
-        // intent; the external action still happens in a later WAL cycle.
-        if execution.gate.operator_required {
-            execution.gate.release_park();
-        }
-        // The legacy CEX machine uses its Pending phases as durable restart
-        // reconciliation points; unlike ICPSwap it has no separate Recover
-        // variants. Recovery therefore accepts pending phases even without a
-        // last error, but still passes through the persistence gate before the
-        // state machine can poll or submit an idempotent follow-up action.
-        if execution.cex.last_error.is_none()
-            && !matches!(
-                execution.cex.step,
-                CexStep::DepositPending | CexStep::TradePending | CexStep::WithdrawPending | CexStep::Failed
-            )
-        {
-            return Err(format!(
-                "{} leg at {:?} is not in recovery",
-                self.profile.name(),
-                execution.cex.step
-            ));
-        }
-        self.advance_decoded_leg(execution, checkpoint).await
+    ) -> Result<LegPreview<CexState>, String> {
+        let execution_id = crate::utils::new_venue_execution_id(self.profile.venue_id());
+        let preview = self.preview_swap_request(&execution_id, request).await?;
+        Ok(LegPreview {
+            state: preview.state,
+            quote: preview.quote,
+            conservative_receive: preview.conservative_receive,
+            market_receive: preview.market_receive,
+            side_costs: preview.side_costs,
+        })
     }
 }
 

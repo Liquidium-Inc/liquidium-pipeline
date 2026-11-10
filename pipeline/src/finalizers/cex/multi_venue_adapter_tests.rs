@@ -12,6 +12,7 @@ use liquidium_pipeline_core::{
 use num_traits::ToPrimitive;
 
 use super::*;
+use crate::finalizers::multi_venue::VenueRoutePreview;
 use crate::{
     finalizers::{
         cex::{finalizer::tests::support::free_withdrawals, state::CexRouteLeg},
