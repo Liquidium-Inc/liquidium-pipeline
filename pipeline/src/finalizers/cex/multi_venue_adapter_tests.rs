@@ -1448,7 +1448,6 @@ mod bridged_deposit_restart {
     use super::*;
     use crate::bridge::call_sender::{BridgeCall, prepare_bridge_call};
     use crate::bridge::claims::{BridgeClaims, MockBridgeClaimLookup};
-    use crate::bridge::legacy::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
     use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_connectors::backend::bridge_backend::{
         BridgeFeeBudget, BridgeSubmissionCandidate, MockBridgeBackend,
@@ -1480,19 +1479,6 @@ mod bridged_deposit_restart {
     }
 
     /// An attempt that the bridge journal saved long ago, before the driver.
-    fn journal_attempt(parked: bool) -> LegacyBridgeSubmitPhase {
-        LegacyBridgeSubmitPhase::Submitting(LegacyBridgeSubmitAttempt {
-            id: "mine".into(),
-            asset: "ckETH".into(),
-            destination: DESTINATION.into(),
-            amount: 0.009,
-            cursor: Some(100),
-            started_at_ts: 1,
-            called_at_ts: None,
-            parked_for_operator: parked,
-        })
-    }
-
     fn saved_call(phase: OutboundPhase) -> OutboundRecord {
         let call = BridgeCall {
             asset: "ckETH".into(),
@@ -1539,42 +1525,9 @@ mod bridged_deposit_restart {
     }
 
     #[tokio::test]
-    async fn a_journal_funding_wait_resumes_without_the_gate_and_without_a_call() {
-        let mut bridge = MockBridgeBackend::new();
-        zero_fee(&mut bridge);
-        bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(0.0));
-        bridge.expect_prepare_submission().times(0);
-        bridge.expect_submit_bridge().times(0);
-        let mut restarted = deposit_poll_finalizer(bridge);
-        Arc::get_mut(&mut restarted.backend)
-            .unwrap()
-            .expect_get_deposit_address()
-            .times(1)
-            .returning(|asset, network| {
-                Ok(liquidium_pipeline_connectors::backend::cex_backend::DepositAddress {
-                    asset: asset.into(),
-                    network: network.into(),
-                    address: DESTINATION.into(),
-                    tag: None,
-                })
-            });
-        let mut cex = cketh_state(&restarted);
-        cex.deposit.bridge.legacy_bridge_submit_phase = Some(LegacyBridgeSubmitPhase::WaitingFunds);
-
-        let progress = restarted.advance_decoded_leg(after_restart(cex), &NoopCheckpoint).await.unwrap();
-
-        assert_eq!(progress.status, VenueLegStatus::Running);
-        let execution = decode(&progress);
-        assert!(!execution.gate.operator_required);
-        assert!(execution.cex.deposit.bridge.deposit_bridge_call.is_none());
-        assert!(execution.cex.deposit.bridge.legacy_bridge_submit_phase.is_none());
-        assert!(execution.cex.deposit.bridge.deposit_bridge_id.is_none());
-    }
-
-    #[tokio::test]
     async fn a_call_that_may_have_run_is_looked_up_and_attached_before_any_call() {
-        // A journal attempt, and a saved call that a restart interrupted.
-        for restored in ["journal", "saved"] {
+        // A saved call that a restart interrupted.
+        for restored in ["saved"] {
             let mut bridge = MockBridgeBackend::new();
             zero_fee(&mut bridge);
             bridge.expect_submit_bridge().times(0);
@@ -1588,10 +1541,7 @@ mod bridged_deposit_restart {
             });
             let restarted = lookup_finalizer(bridge);
             let mut cex = cketh_state(&restarted);
-            match restored {
-                "journal" => cex.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(false)),
-                _ => cex.deposit.bridge.deposit_bridge_call = Some(saved_call(OutboundPhase::Prepared)),
-            }
+            cex.deposit.bridge.deposit_bridge_call = Some(saved_call(OutboundPhase::Prepared));
 
             let progress = restarted.advance_decoded_leg(after_restart(cex), &NoopCheckpoint).await.unwrap();
 
@@ -1621,7 +1571,10 @@ mod bridged_deposit_restart {
         });
         let restarted = lookup_finalizer(bridge);
         let mut cex = cketh_state(&restarted);
-        cex.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(false));
+        // Sent before the grace period; the lookup is the last word.
+        cex.deposit.bridge.deposit_bridge_call = Some(saved_call(OutboundPhase::Submitted {
+            at: crate::utils::now_ts() - 11 * 60,
+        }));
 
         let progress = restarted.advance_decoded_leg(after_restart(cex), &NoopCheckpoint).await.unwrap();
 

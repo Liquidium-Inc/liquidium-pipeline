@@ -186,7 +186,6 @@ where
                     deposit_bridge_expected_amount: None,
                     deposit_bridge_provider_fee_budget_native_units: None,
                     deposit_bridge_call: None,
-                    legacy_bridge_submit_phase: None,
                     deposit_bridge_call_unrecorded: false,
                 },
             },

@@ -8,10 +8,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use crate::{
-    bridge::{
-        call_sender::{self, OpenBridgeCall},
-        legacy::LegacyBridgeSubmitPhase,
-    },
+    bridge::call_sender::{self, OpenBridgeCall},
     outbound::driver::OutboundRecord,
     persistance::{LiqResultRecord, ResultStatus, WalStore},
 };
@@ -122,11 +119,6 @@ fn visit(value: &Value, claims: &mut BridgeClaims) {
                     if let Some(call) = open_bridge_call(child) {
                         claims.open_calls.push(call);
                     }
-                } else if key == "deposit_bridge_submit_phase" {
-                    // Rows saved before the outbound driver keep blocking.
-                    if let Ok(LegacyBridgeSubmitPhase::Submitting(attempt)) = serde_json::from_value(child.clone()) {
-                        claims.open_calls.push(attempt.open_call());
-                    }
                 } else {
                     visit(child, claims);
                 }
@@ -196,24 +188,15 @@ mod tests {
         }
     }
 
-    fn attempt_json(amount: f64) -> String {
-        format!(
-            r#"{{"Submitting":{{"id":"a1","asset":"ckUSDC","destination":"0xabc","amount":{amount},"cursor":100,"started_at_ts":5,"called_at_ts":null}}}}"#
-        )
-    }
-
     #[tokio::test]
-    async fn claims_cover_both_leg_sides_legacy_bytes_and_journal_attempts_once_per_row() {
+    async fn claims_cover_both_leg_sides_and_legacy_bytes_once_per_row() {
         let own = row(
             "1720",
             r#"{"venue_execution":{"state":{"deposit_bridge_id":"ic-withdraw:1:2"}}}"#,
         );
         let multi_venue = row(
             "1721",
-            &format!(
-                r#"{{"meta_v2":{{"legs":[{{"execution":{{"state":{{"deposit_bridge_id":"ic-withdraw:3:4","withdraw_bridge_id":"0xdead","deposit_bridge_submit_phase":{}}}}}}},{{"execution":{{"state":{{"deposit_bridge_submit_phase":"WaitingFunds"}}}}}}]}}}}"#,
-                attempt_json(1.5)
-            ),
+            r#"{"meta_v2":{"legs":[{"execution":{"state":{"deposit_bridge_id":"ic-withdraw:3:4","withdraw_bridge_id":"0xdead"}}},{"execution":{"state":{}}}]}}"#,
         );
         let legacy_bytes = serde_json::to_string(&serde_json::json!({
             "meta": br#"{"deposit_bridge_id":"ic-withdraw-eth:9"}"#.to_vec(),
@@ -245,10 +228,7 @@ mod tests {
             claims.bridge_ids,
             vec!["ic-withdraw:1:2", "ic-withdraw:3:4", "0xdead", "ic-withdraw-eth:9"]
         );
-        assert_eq!(claims.open_calls.len(), 1);
-        assert_eq!(claims.open_calls[0].id, "a1");
-        assert_eq!(claims.open_calls[0].call.amount, 1.5);
-        assert_eq!(claims.open_calls[0].call.cursor, Some(100));
+        assert!(claims.open_calls.is_empty());
     }
 
     #[tokio::test]

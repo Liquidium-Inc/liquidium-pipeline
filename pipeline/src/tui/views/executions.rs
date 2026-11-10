@@ -10,7 +10,6 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::bridge::legacy::LegacyBridgeSubmitPhase;
 use crate::finalizers::cex::profile::CexVenueProfile;
 use crate::finalizers::multi_venue::RIFT_VENUE_ID;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
@@ -551,11 +550,6 @@ fn append_cex_leg_transactions(lines: &mut Vec<Line<'static>>, venue: &str, exec
             "   {venue} deposit bridge call: {}",
             describe_bridge_call(call)
         )));
-    } else if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {
-        lines.push(Line::from(format!(
-            "   {venue} deposit bridge phase: {}",
-            describe_bridge_submit_phase(phase)
-        )));
     }
 }
 
@@ -634,22 +628,6 @@ fn describe_bridge_call(record: &Value) -> String {
             call.cursor.map_or("none".to_string(), |cursor| cursor.to_string()),
         ),
         Err(_) => phase,
-    }
-}
-
-/// Rows saved before the outbound driver, until the bridge step upgrades them.
-fn describe_bridge_submit_phase(phase: &Value) -> String {
-    match serde_json::from_value::<LegacyBridgeSubmitPhase>(phase.clone()) {
-        Ok(LegacyBridgeSubmitPhase::WaitingFunds) => "waiting for bridge funds".to_string(),
-        Ok(LegacyBridgeSubmitPhase::Submitting(attempt)) => format!(
-            "attempt {} {} -> {} cursor={} called={}",
-            attempt.amount,
-            attempt.asset,
-            attempt.destination,
-            attempt.cursor.map_or("none".to_string(), |cursor| cursor.to_string()),
-            if attempt.called_at_ts.is_some() { "yes" } else { "no" }
-        ),
-        Err(_) => truncate(&phase.to_string(), 80),
     }
 }
 
@@ -977,7 +955,7 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary, describe_bridge_submit_phase,
+        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary,
         icpswap_account_principal,
         profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
     };
@@ -1067,17 +1045,7 @@ mod tests {
                         "deposit_bridge_id": "bridge-deposit-456",
                         "withdraw_id": "mexc-withdraw-789",
                         "withdraw_txid": "ic-ledger-withdraw-987",
-                        "withdraw_bridge_id": "bridge-withdraw-654",
-                        "deposit_bridge_submit_phase": {
-                            "Submitting": {
-                                "asset": "ckUSDC",
-                                "destination": "0xabc",
-                                "amount": 33.917291,
-                                "cursor": 1114868,
-                                "started_at_ts": 1,
-                                "called_at_ts": 2
-                            }
-                        }
+                        "withdraw_bridge_id": "bridge-withdraw-654"
                     }
                 }),
             },
@@ -1113,8 +1081,6 @@ mod tests {
                 .any(|line| line == "   MEXC withdraw bridge txid: bridge-withdraw-654")
         );
         assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
-        assert!(text.iter().any(|line| line
-            == "   MEXC deposit bridge phase: attempt 33.917291 ckUSDC -> 0xabc cursor=1114868 called=yes"));
     }
 
     /// A Kraken leg saved its transaction ids under the same keys as MEXC,
@@ -1151,19 +1117,6 @@ mod tests {
         ] {
             assert!(text.iter().any(|line| line == expected), "missing {expected:?} in {text:?}");
         }
-    }
-
-    #[test]
-    fn bridge_phase_line_covers_waits_and_unknown_shapes() {
-        assert_eq!(
-            describe_bridge_submit_phase(&serde_json::json!("WaitingFunds")),
-            "waiting for bridge funds"
-        );
-        assert_eq!(
-            describe_bridge_submit_phase(&serde_json::json!({"Submitting": {"asset": "ckETH", "destination": "0xd", "amount": 0.5, "cursor": null, "started_at_ts": 1, "called_at_ts": null}})),
-            "attempt 0.5 ckETH -> 0xd cursor=none called=no"
-        );
-        assert_eq!(describe_bridge_submit_phase(&serde_json::json!({"Later": 1})), "{\"Later\":1}");
     }
 
     #[test]

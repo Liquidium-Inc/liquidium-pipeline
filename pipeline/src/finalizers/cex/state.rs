@@ -280,7 +280,6 @@ mod tests {
                     deposit_bridge_expected_amount: None,
                     deposit_bridge_provider_fee_budget_native_units: None,
                     deposit_bridge_call: None,
-                    legacy_bridge_submit_phase: None,
                     deposit_bridge_call_unrecorded: false,
                 },
             },
@@ -390,30 +389,6 @@ mod tests {
         assert!(read_back.deposit.bridge.deposit_bridge_required);
         assert_eq!(read_back.deposit.bridge.deposit_bridge_id.as_deref(), Some("bridge-7"));
         assert!(read_back.withdraw.bridge.deposit_send_started());
-    }
-
-    #[test]
-    fn a_legacy_journal_phase_survives_a_save_until_it_is_upgraded() {
-        let saved = r#"{"deposit_bridge_required":true,"deposit_bridge_submit_phase":{"Submitting":{"id":"a1","asset":"ckUSDC","destination":"0xabc","amount":1.5,"cursor":100,"started_at_ts":5,"called_at_ts":null,"parked_for_operator":true}}}"#;
-        let state: CexDepositBridgeState = serde_json::from_str(saved).unwrap();
-        use crate::bridge::legacy::LegacyBridgeSubmitPhase;
-        let Some(LegacyBridgeSubmitPhase::Submitting(attempt)) = &state.legacy_bridge_submit_phase else {
-            panic!("the saved attempt is read");
-        };
-        assert_eq!((attempt.id.as_str(), attempt.cursor), ("a1", Some(100)));
-        assert!(attempt.parked_for_operator);
-        let saved_again: CexDepositBridgeState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-        assert_eq!(saved_again.legacy_bridge_submit_phase, state.legacy_bridge_submit_phase);
-        assert!(state.deposit_bridge_call_unrecorded, "an old row may hold a call without a record");
-        let upgraded = CexDepositBridgeState::default();
-        let upgraded_json = serde_json::to_string(&upgraded).unwrap();
-        assert!(!upgraded_json.contains("deposit_bridge_submit_phase"));
-        let read_back: CexDepositBridgeState = serde_json::from_str(&upgraded_json).unwrap();
-        assert!(!read_back.deposit_bridge_call_unrecorded);
-
-        let waiting: CexDepositBridgeState =
-            serde_json::from_str(r#"{"deposit_bridge_submit_phase":"WaitingFunds"}"#).unwrap();
-        assert_eq!(waiting.legacy_bridge_submit_phase, Some(LegacyBridgeSubmitPhase::WaitingFunds));
     }
 
     #[test]
