@@ -10,7 +10,10 @@ use liquidium_pipeline_core::{
 };
 
 use super::BridgeLegError;
-use crate::{bridge::runtime::BridgeRuntime, finalizers::bridge_planner::parse_icp_account_like};
+use crate::{
+    bridge::runtime::BridgeRuntime,
+    finalizers::{bridge_planner::parse_icp_account_like, multi_venue::VenueAmountError},
+};
 
 /// A bridged deposit sends no approval bumps, so only its transfer fee is held back.
 const BRIDGED_DEPOSIT_FEE_COUNT: u8 = 1;
@@ -107,13 +110,8 @@ pub fn reverse_bridge_source_fee_reserve(
     transfer_value: &Nat,
     source_fee_budget: f64,
 ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, BridgeLegError> {
-    if !matches!(
-        route.route_kind,
-        BridgeRouteKind::CkEthErc20Reverse
-            | BridgeRouteKind::CkEthToEth
-            | BridgeRouteKind::IcpToSolana
-            | BridgeRouteKind::CkBtcToBtc
-    ) || !route.source_chain.eq_ignore_ascii_case("ICP")
+    if !route.route_kind.is_minter_withdrawal()
+        || !route.source_chain.eq_ignore_ascii_case("ICP")
         || !asset.symbol().eq_ignore_ascii_case(route.source_asset)
         || !asset.chain().eq_ignore_ascii_case(route.source_chain)
     {
@@ -230,6 +228,35 @@ pub async fn bridged_deposit_arrival(
         submit_amount,
         expected_amount,
     })
+}
+
+/// Refuses an allocation whose bridged deposit, after the fee reserves,
+/// lands under the minter's minimum. Routes without a minimum pass at once.
+pub async fn check_bridged_minimum(
+    bridge: &BridgeRuntime,
+    route: &BridgeRouteSpec,
+    asset: &ChainToken,
+    size_in: &ChainTokenAmount,
+) -> Result<(), VenueAmountError> {
+    if !route.route_kind.has_withdrawal_minimum() {
+        return Ok(());
+    }
+    let sizing = size_bridged_deposit(bridge, route, asset, size_in)
+        .await
+        .map_err(|error| match error {
+            BridgeLegError::BelowMinimum(message) => VenueAmountError::BelowMinimum(message),
+            other => VenueAmountError::Unavailable(other.to_string()),
+        })?;
+    match bridge_minimum_shortfall(bridge, route, &sizing.bridge_amount)
+        .await
+        .map_err(VenueAmountError::Unavailable)?
+    {
+        Some((amount, minimum)) => Err(VenueAmountError::BelowMinimum(format!(
+            "{} -> {} bridge amount ({amount}) after fee reserves is below minimum ({minimum})",
+            route.source_asset, route.target_asset
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The route minimum this amount falls short of, as `(amount, minimum)`.

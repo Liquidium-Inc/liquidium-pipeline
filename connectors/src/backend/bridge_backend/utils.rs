@@ -7,7 +7,7 @@ use icrc_ledger_types::{
 use std::str::FromStr;
 
 use super::{
-    BridgeDestination, BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec, BridgeSweepRoute,
+    BridgeDestination, BridgeDestinationKind, BridgeRouteSpec, BridgeSweepRoute,
     catalog::BRIDGE_ROUTE_CATALOG,
 };
 use crate::pipeline_agent::PipelineAgent;
@@ -111,15 +111,20 @@ pub fn resolve_route(source_asset: &str, source_chain: &str, target_asset: &str)
     })
 }
 
+/// The route that moves `source_asset` off `source_chain`, whatever serves it.
+pub fn resolve_route_by_source(source_asset: &str, source_chain: &str) -> Option<&'static BridgeRouteSpec> {
+    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
+        source_asset.eq_ignore_ascii_case(route.source_asset) && source_chain.eq_ignore_ascii_case(route.source_chain)
+    })
+}
+
 pub fn resolve_cketh_forward_route_by_source(
     source_asset: &str,
     source_chain: &str,
 ) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
-        ) && source_asset.eq_ignore_ascii_case(route.source_asset)
+        route.route_kind.is_cketh_forward()
+            && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
     })
 }
@@ -129,10 +134,8 @@ pub fn resolve_cketh_reverse_route_by_source(
     source_chain: &str,
 ) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
-        ) && source_asset.eq_ignore_ascii_case(route.source_asset)
+        route.route_kind.is_cketh_reverse()
+            && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
     })
 }
@@ -160,22 +163,14 @@ pub fn resolve_forward_route_by_target(target_asset: &str) -> Option<&'static Br
 
 pub fn resolve_cketh_forward_route_by_target(target_asset: &str) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
-        ) && target_asset.eq_ignore_ascii_case(route.target_asset)
+        route.route_kind.is_cketh_forward() && target_asset.eq_ignore_ascii_case(route.target_asset)
     })
 }
 
 pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {
     BRIDGE_ROUTE_CATALOG
         .iter()
-        .filter(|route| {
-            matches!(
-                route.route_kind,
-                BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
-            )
-        })
+        .filter(|route| route.route_kind.is_cketh_forward())
         .map(|route| BridgeSweepRoute {
             source_asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -188,12 +183,7 @@ pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {
 pub fn cketh_reverse_routes() -> Vec<BridgeSweepRoute> {
     BRIDGE_ROUTE_CATALOG
         .iter()
-        .filter(|route| {
-            matches!(
-                route.route_kind,
-                BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
-            )
-        })
+        .filter(|route| route.route_kind.is_cketh_reverse())
         .map(|route| BridgeSweepRoute {
             source_asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -259,9 +249,9 @@ mod tests {
         assert!(super::resolve_forward_route_by_target("ckBTC").is_none());
     }
 
-    use super::super::BridgeDestinationKind;
+    use super::super::{BridgeDestinationKind, BridgeRouteKind};
     use super::{
-        BridgeDestination, BridgeRouteKind, BridgeRouteSpec, cketh_forward_routes, cketh_reverse_routes,
+        BridgeDestination, BridgeRouteSpec, cketh_forward_routes, cketh_reverse_routes,
         resolve_cketh_forward_route_by_target, resolve_route, validate_destination_for_route,
     };
     use icrc_ledger_types::icrc1::account::Account;
