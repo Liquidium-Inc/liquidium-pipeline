@@ -113,9 +113,6 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
     /// the leg asks until it does, within the chain's bound.
     async fn mint_bitcoin_payout(&self, state: &mut RiftState, payout: Payout) -> Result<(), VenueStepError> {
         let destination = bridge_destination(payout.route.destination_kind, &state.final_destination)?;
-        let payout_tx = payout.transaction.ok_or_else(|| {
-            VenueStepError::Ambiguous("Rift delivered Bitcoin without a payout transaction".to_string())
-        })?;
         let liq_id = state.liq_id.clone();
         let order = state
             .order
@@ -124,6 +121,26 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let mut wait = WaitBound {
             since: &mut order.delivered_at_ts,
             timeout_secs: payout.chain.return_timeout_secs(),
+        };
+        // Rift can report the delivery before it names the transaction, so the
+        // order is read again; a parked leg could never learn the id.
+        let payout_tx = match payout.transaction {
+            Some(payout_tx) => payout_tx,
+            None => match self.backend.order_state(&order.id).await?.payout_tx {
+                Some(payout_tx) => {
+                    info!(
+                        "[rift] liq_id={liq_id} order {} now names its payout {payout_tx}",
+                        order.id
+                    );
+                    order.payout_tx = Some(payout_tx.clone());
+                    payout_tx
+                }
+                None => {
+                    let reason = "Rift delivered without a payout transaction";
+                    wait_within_bound(&liq_id, &mut wait, "Rift payout transaction", reason)?;
+                    return Ok(());
+                }
+            },
         };
 
         let bridge_id = match state.bridge_in.withdraw_bridge_id.clone() {
