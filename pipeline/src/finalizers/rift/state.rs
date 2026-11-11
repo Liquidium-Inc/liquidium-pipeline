@@ -22,8 +22,10 @@ pub enum RiftStep {
     /// The pay asset to the bridge wallet, the minter call that pays the
     /// order's deposit address, then the bridge poll.
     BridgeOut,
-    /// The order status, until Rift delivers to the bridge EVM wallet.
-    Wait,
+    /// Rift swaps and pays out; the leg polls the order until Rift delivers to
+    /// the bridge EVM wallet. Rows saved before the rename say `Wait`.
+    #[serde(alias = "Wait")]
+    Swap,
     /// The delivered asset from the bridge EVM wallet to its ck form on ICP.
     BridgeBack,
     Completed,

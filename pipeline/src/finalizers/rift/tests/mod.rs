@@ -104,6 +104,18 @@ fn an_older_saved_leg_receives_on_ethereum() {
     assert_eq!(state.order.unwrap().to_address, None);
 }
 
+/// The step was called `Wait` before; a row saved then still loads, and saves the new name.
+#[test]
+fn a_leg_saved_at_the_old_wait_step_loads_at_swap() {
+    let mut saved = serde_json::to_value(state_at(RiftStep::Swap)).unwrap();
+    saved["step"] = serde_json::json!("Wait");
+
+    let state: RiftState = serde_json::from_value(saved).unwrap();
+
+    assert_eq!(state.step, RiftStep::Swap);
+    assert_eq!(serde_json::to_value(&state).unwrap()["step"], "Swap");
+}
+
 /// A state at `step` for a leg that pays ckUSDT and receives ckBTC on Bitcoin.
 pub(super) fn state_receiving_ckbtc(step: RiftStep) -> RiftState {
     let mut state = state_at(step);
