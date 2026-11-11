@@ -224,6 +224,7 @@ mod tests {
             }),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_release: None,
         }
     }
 

@@ -205,6 +205,7 @@ fn receipt() -> ExecutionReceipt {
         }),
         status: ExecutionStatus::Success,
         change_received: true,
+        collateral_release: None,
     }
 }
 

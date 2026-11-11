@@ -79,16 +79,25 @@ impl LiquidationFunding {
         }
     }
 
-    /// Candid arguments for [`Self::liquidate_method`]. Supply mode also names how collateral is
-    /// delivered; the bot takes it in cash so the swap can follow.
+    /// Whether a refused cash payout is worth one more call that takes the collateral as supply.
+    /// Only the two refusals an illiquid collateral pool produces qualify: no cash at all, or a
+    /// partial fill that the minimum-collateral guard turned down. Any other cause refuses the
+    /// second call the same way, and a refusal moves nothing.
+    pub fn retries_with_supply_payout(self, refusal: &ProtocolError) -> bool {
+        self == Self::Supply && matches!(refusal, ProtocolError::NoLiquidity | ProtocolError::NotAllowed(_))
+    }
+
+    /// Candid arguments for [`Self::liquidate_method`]. Only supply mode can name how collateral
+    /// is delivered; wallet mode always gets cash.
     pub fn encode_liquidate_args(
         self,
         request: &LiquidationRequest,
         min_collateral_amount: &Nat,
+        payout: CollateralPayout,
     ) -> Result<Vec<u8>, String> {
         match self {
             Self::Wallet => Encode!(request, min_collateral_amount),
-            Self::Supply => Encode!(request, min_collateral_amount, &CollateralPayout::Cash),
+            Self::Supply => Encode!(request, min_collateral_amount, &payout),
         }
         .map_err(|e| format!("liquidation args encode error: {e}"))
     }
@@ -112,9 +121,48 @@ struct PositionSupplyView {
 
 /// The subset of the lending `Pool` record this module needs.
 #[derive(Debug, Clone, CandidType, Deserialize)]
-struct LendingPoolView {
-    principal: Principal,
-    asset_type: AssetType,
+pub(crate) struct LendingPoolView {
+    pub(crate) principal: Principal,
+    pub(crate) asset_type: AssetType,
+    pub(crate) total_supply_at_last_sync: Nat,
+    pub(crate) total_debt_at_last_sync: Nat,
+    pub(crate) lending_index: Nat,
+    pub(crate) borrow_index: Nat,
+}
+
+/// The part of the lending `OutflowDetails` a withdrawal answer is read for.
+#[derive(Debug, Clone, CandidType, Deserialize)]
+pub(crate) struct WithdrawOutflow {
+    pub(crate) amount: Nat,
+}
+
+/// Where collateral that was credited as supply stands on its way to the swap account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CollateralRelease {
+    /// Still supplied in the collateral pool under the liquidator's profile.
+    Held,
+    /// A withdrawal call was started. If this is read back after a restart, the call may or
+    /// may not have run, so only an operator can decide it.
+    Withdrawing,
+    /// The withdrawal was accepted at this unix time; the payout is on its way.
+    Requested { at: i64 },
+}
+
+/// Why collateral held as supply was not released on this attempt.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReleaseError {
+    /// The collateral pool cannot pay the amount out yet. Nothing was called.
+    #[error("collateral pool has {available} free, {needed} needed")]
+    NotYetLiquid { available: Nat, needed: Nat },
+    /// The canister refused the withdrawal. Nothing moved; a later attempt is safe.
+    #[error("withdrawal rejected: {0}")]
+    Rejected(String),
+    /// The call got no decided answer, so the withdrawal may have run.
+    #[error("withdrawal has no decided answer: {0}")]
+    Ambiguous(String),
+    /// The liquidity read failed before any call was made.
+    #[error("{0}")]
+    NotAttempted(String),
 }
 
 #[derive(Debug, Clone, CandidType)]
@@ -245,9 +293,34 @@ pub async fn withdraw_supply<A: PipelineAgent>(
     pool_id: Principal,
     amount: Nat,
 ) -> Result<(), String> {
+    withdraw_to(
+        agent,
+        lending_canister,
+        liquidator,
+        profile,
+        pool_id,
+        liquidator,
+        amount,
+    )
+    .await?
+    .map(|_| ())
+    .map_err(|e| format!("withdraw rejected: {e:?}"))
+}
+
+/// Calls the lending `withdraw` and pays `receiver`. The outer error is a call with no decided
+/// answer; the inner one is a refusal by the canister, which moved nothing.
+async fn withdraw_to<A: PipelineAgent>(
+    agent: &A,
+    lending_canister: &Principal,
+    liquidator: Principal,
+    profile: Principal,
+    pool_id: Principal,
+    receiver: Principal,
+    amount: Nat,
+) -> Result<Result<Nat, ProtocolError>, String> {
     let request = SignedRequest {
         data: WithdrawRequest {
-            account: AccountType::Native(liquidator),
+            account: AccountType::Native(receiver),
             pool_id,
             amount,
             expiry_timestamp: request_expiry()?,
@@ -255,11 +328,62 @@ pub async fn withdraw_supply<A: PipelineAgent>(
         signature_info: caller_auth(liquidator),
     };
     let args = Encode!(&profile, &request).map_err(|e| format!("withdraw encode error: {e}"))?;
-    agent
-        .call_update::<Result<candid::Reserved, ProtocolError>>(lending_canister, "withdraw", args)
-        .await?
-        .map(|_| ())
-        .map_err(|e| format!("withdraw rejected: {e:?}"))
+    let answer = agent
+        .call_update::<Result<WithdrawOutflow, ProtocolError>>(lending_canister, "withdraw", args)
+        .await?;
+    Ok(answer.map(|outflow| outflow.amount))
+}
+
+/// Cash the pool can pay out right now, from its last synced totals.
+pub async fn pool_free_liquidity<A: PipelineAgent>(
+    agent: &A,
+    lending_canister: &Principal,
+    pool_id: Principal,
+) -> Result<Nat, String> {
+    let args = Encode!().map_err(|e| format!("list_pools encode error: {e}"))?;
+    let pool = agent
+        .call_query::<Vec<LendingPoolView>>(lending_canister, "list_pools", args)
+        .await
+        .map_err(|e| format!("list_pools failed: {e}"))?
+        .into_iter()
+        .find(|pool| pool.principal == pool_id)
+        .ok_or_else(|| format!("lending pool {pool_id} not found"))?;
+
+    let supply = spendable_native(&pool.total_supply_at_last_sync, &pool.lending_index);
+    // Debt is rounded up so the free amount is never overstated.
+    let debt = spendable_native(&pool.total_debt_at_last_sync, &pool.borrow_index) + Nat::from(1u8);
+    Ok(if supply > debt { supply - debt } else { Nat::from(0u8) })
+}
+
+/// Moves collateral that a liquidation credited as supply out to `receiver`.
+///
+/// The withdrawal is only called once the pool shows enough free cash, because the canister
+/// traps on an illiquid withdrawal and a trap cannot be told apart from a lost answer here.
+/// Returns the amount the canister withdrew, before the ledger fee of the payout.
+pub async fn release_collateral<A: PipelineAgent>(
+    agent: &A,
+    lending_canister: &Principal,
+    liquidator: Principal,
+    profile: Principal,
+    pool_id: Principal,
+    receiver: Principal,
+    amount: Nat,
+) -> Result<Nat, ReleaseError> {
+    let available = pool_free_liquidity(agent, lending_canister, pool_id)
+        .await
+        .map_err(ReleaseError::NotAttempted)?;
+    if available < amount {
+        return Err(ReleaseError::NotYetLiquid {
+            available,
+            needed: amount,
+        });
+    }
+
+    match withdraw_to(agent, lending_canister, liquidator, profile, pool_id, receiver, amount).await {
+        Ok(Ok(withdrawn)) => Ok(withdrawn),
+        Ok(Err(refusal)) => Err(ReleaseError::Rejected(format!("{refusal:?}"))),
+        Err(reason) => Err(ReleaseError::Ambiguous(reason)),
+    }
 }
 
 /// Largest offer the canister accepts for `shares`: it burns `ceil(offer / index)` shares, so
@@ -879,11 +1003,12 @@ mod tests {
         };
 
         // when
+        let cash = CollateralPayout::Cash;
         let wallet = LiquidationFunding::Wallet
-            .encode_liquidate_args(&request, &Nat::from(1u8))
+            .encode_liquidate_args(&request, &Nat::from(1u8), cash)
             .unwrap();
         let supply = LiquidationFunding::Supply
-            .encode_liquidate_args(&request, &Nat::from(1u8))
+            .encode_liquidate_args(&request, &Nat::from(1u8), cash)
             .unwrap();
 
         // then

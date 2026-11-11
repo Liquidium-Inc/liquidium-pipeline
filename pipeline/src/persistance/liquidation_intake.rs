@@ -111,6 +111,8 @@ impl LiquidationIntentStore for SqliteWalStore {
         // A row without a swap is enqueued too: the finalize stage records its
         // profit, export and notification (audit L03).
         let status = match liquidation.collateral_tx.status {
+            // Collateral credited as supply still has to reach the swap account.
+            TransferStatus::Success if receipt.collateral_release.is_some() => ResultStatus::WaitingCollateral,
             TransferStatus::Success => ResultStatus::Enqueued,
             TransferStatus::Pending | TransferStatus::Failed(_) => ResultStatus::WaitingCollateral,
         };
@@ -347,6 +349,7 @@ mod tests {
             }),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_release: None,
         }
     }
 

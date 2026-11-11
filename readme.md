@@ -574,9 +574,16 @@ liquidator supply resolve-top-up --asset ckUSDC --absent         # the transfer 
 Profit figures in this mode charge two ledger fees per liquidation for the top-up (the wallet
 transfer and the pool's sweep) instead of the wallet-mode transfer fees.
 
-The bot takes seized collateral in cash (`CollateralPayout::Cash`). The canister can also credit
-it as supply (`Supply`), which works when the collateral pool has no free liquidity; the bot does
-not use that yet.
+The bot asks for seized collateral in cash. When the canister refuses that because the
+collateral pool has no free cash (`NoLiquidity`, or a partial fill below the minimum collateral),
+it calls once more and takes the collateral as supply in its own profile. That liquidation still
+closes the position. The receipt then waits in `WaitingCollateral`: every settlement pass checks
+the pool's free cash and, once there is enough, withdraws the collateral to the account that
+swaps it. Until then the liquidator holds the collateral and its price risk.
+
+A withdrawal is marked in the WAL before it is called. If the call gets no answer, or the bot
+stops in the middle of it, the row moves to `OperatorRequired` and alerts the operator channel
+instead of withdrawing a second time.
 
 Requirements: the lending canister must expose `liquidate_from_supply`, and the liquidator's
 Liquidium profile must not borrow.

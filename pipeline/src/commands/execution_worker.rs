@@ -448,6 +448,7 @@ mod tests {
             }),
             status,
             change_received: true,
+            collateral_release: None,
         }
     }
 

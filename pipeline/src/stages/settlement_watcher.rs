@@ -5,11 +5,25 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::liquidation::lending_queries::get_liquidation;
+use crate::liquidation::supply_funding::{CollateralRelease, ReleaseError, release_collateral};
 use crate::persistance::{LiqResultRecord, ResultStatus, WalStore};
-use crate::stages::executor::ExecutionReceipt;
+use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+use crate::utils::now_ts;
 use crate::wal::{decode_receipt_wrapper, wal_save_receipt};
+use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::TransferStatus;
+
+/// How long after an accepted withdrawal the collateral counts as arrived. The canister pays
+/// it out right after accepting; the finalizer retries if the payout is slower than this.
+const COLLATERAL_RELEASE_SETTLE_SECS: i64 = 30;
+
+/// Who withdraws collateral that a supply-funded liquidation left in the liquidator's supply.
+#[derive(Debug, Clone, Copy)]
+pub struct SupplyRelease {
+    pub liquidator: Principal,
+    pub profile: Principal,
+}
 
 /// Rows checked per status in one tick. The watcher walks all rows in pages,
 /// so rows that never settle cannot hide newer ones (audit L09).
@@ -23,6 +37,8 @@ where
     pub wal: Arc<D>,
     pub agent: Arc<A>,
     pub lending_canister: Principal,
+    supply_release: Option<SupplyRelease>,
+    watchdog: Arc<dyn Watchdog>,
     /// The last row id each walk reached. `None` starts from the first row.
     collateral_cursor: Mutex<Option<String>>,
     profit_cursor: Mutex<Option<String>>,
@@ -39,9 +55,18 @@ where
             wal,
             agent,
             lending_canister,
+            supply_release: None,
+            watchdog: noop_watchdog(),
             collateral_cursor: Mutex::new(None),
             profit_cursor: Mutex::new(None),
         }
+    }
+
+    /// Enables the release of collateral held as supply (supply funding mode).
+    pub fn with_supply_release(mut self, release: SupplyRelease, watchdog: Arc<dyn Watchdog>) -> Self {
+        self.supply_release = Some(release);
+        self.watchdog = watchdog;
+        self
     }
 
     pub(crate) async fn tick(&self) -> Result<(), String> {
@@ -86,6 +111,10 @@ where
             .ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id))?;
         let mut receipt: ExecutionReceipt = meta.receipt;
 
+        if let Some(release) = receipt.collateral_release.clone() {
+            return self.release_held_collateral(row, receipt, release).await;
+        }
+
         let liq_id = receipt
             .liquidation_result
             .as_ref()
@@ -127,6 +156,115 @@ where
             .await
             .map_err(|e| e.to_string())?;
         info!("[settlement] ✅ liq_id={} -> enqueued for finalization", liq.id);
+        Ok(())
+    }
+
+    /// Moves collateral that sits in the liquidator's supply to the account that swaps it, then
+    /// enqueues the row. A withdrawal is marked in the WAL before it is called, so a crash in
+    /// between never leads to a second withdrawal.
+    async fn release_held_collateral(
+        &self,
+        row: LiqResultRecord,
+        mut receipt: ExecutionReceipt,
+        release: CollateralRelease,
+    ) -> Result<(), String> {
+        let liq_id = receipt.liquidation_result.as_ref().map(|liq| liq.id);
+        match release {
+            CollateralRelease::Requested { at } => {
+                if now_ts().saturating_sub(at) < COLLATERAL_RELEASE_SETTLE_SECS {
+                    return Ok(());
+                }
+                receipt.collateral_release = None;
+                receipt.status = ExecutionStatus::Success;
+                self.update_receipt_meta(&row, &receipt, true).await?;
+                self.wal
+                    .update_status(&row.id, ResultStatus::Enqueued, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                info!("[settlement] ✅ liq_id={liq_id:?} collateral released -> enqueued for finalization");
+                Ok(())
+            }
+            // Read back after a restart: the call may have run.
+            CollateralRelease::Withdrawing => {
+                self.park_release(&row, "the bot stopped during the withdrawal call")
+                    .await
+            }
+            CollateralRelease::Held => {
+                let Some(supply) = self.supply_release else {
+                    return Err(format!(
+                        "row {} holds collateral as supply but supply funding is not enabled",
+                        row.id
+                    ));
+                };
+                let liq = receipt
+                    .liquidation_result
+                    .clone()
+                    .ok_or_else(|| format!("missing liquidation_result for WAL id {}", row.id))?;
+                let request = receipt.request.liquidation.clone();
+
+                receipt.collateral_release = Some(CollateralRelease::Withdrawing);
+                self.update_receipt_meta(&row, &receipt, false).await?;
+
+                let outcome = release_collateral(
+                    self.agent.as_ref(),
+                    &self.lending_canister,
+                    supply.liquidator,
+                    supply.profile,
+                    request.collateral_pool_id,
+                    request.receiver_address,
+                    liq.amounts.collateral_received.clone(),
+                )
+                .await;
+
+                match outcome {
+                    Ok(withdrawn) => {
+                        // The receiver gets the withdrawn amount less the payout's ledger fee.
+                        let fee = receipt.request.collateral_asset.fee();
+                        let arriving = if withdrawn > fee { withdrawn - fee } else { 0u8.into() };
+                        if let Some(result) = receipt.liquidation_result.as_mut() {
+                            result.amounts.collateral_received = arriving;
+                        }
+                        receipt.collateral_release = Some(CollateralRelease::Requested { at: now_ts() });
+                        self.update_receipt_meta(&row, &receipt, true).await?;
+                        info!("[settlement] liq_id={liq_id:?} collateral withdrawal accepted");
+                        Ok(())
+                    }
+                    Err(ReleaseError::Ambiguous(reason)) => self.park_release(&row, &reason).await,
+                    // Nothing was called or the canister refused it: back to waiting.
+                    Err(not_released) => {
+                        receipt.collateral_release = Some(CollateralRelease::Held);
+                        self.update_receipt_meta(&row, &receipt, false).await?;
+                        info!("[settlement] liq_id={liq_id:?} collateral stays supplied: {not_released}");
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hands a withdrawal with no decided answer to an operator. The row is never retried.
+    async fn park_release(&self, row: &LiqResultRecord, reason: &str) -> Result<(), String> {
+        self.wal
+            .update_status(&row.id, ResultStatus::OperatorRequired, true)
+            .await
+            .map_err(|e| e.to_string())?;
+        let details = format!(
+            "collateral of liquidation row {} was credited as supply, and its withdrawal may or may not have run: {reason}. Check the liquidator's supply in the collateral pool and the receiver's balance before retrying",
+            row.id
+        );
+        warn!("[settlement] {details}");
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: row.id.clone(),
+                venue: "protocol".to_string(),
+                pending_step: "collateral-release".to_string(),
+                owner: self
+                    .supply_release
+                    .map(|supply| supply.profile.to_text())
+                    .unwrap_or_default(),
+                details,
+            })
+            .await;
         Ok(())
     }
 
@@ -280,6 +418,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_release: None,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
         let row_id = row.id.clone();
@@ -315,6 +454,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_release: None,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
         let row_id = row.id.clone();
@@ -351,6 +491,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_release: None,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt);
         let row_id = row.id.clone();
@@ -440,6 +581,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_release: None,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
         let row_id = row.id.clone();
@@ -480,6 +622,7 @@ mod tests {
                 liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
                 status: ExecutionStatus::Success,
                 change_received: true,
+                collateral_release: None,
             },
         );
         let row_id = row.id.clone();
@@ -513,12 +656,14 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Pending)),
             status: ExecutionStatus::CollateralTransferFailed("pending".to_string()),
             change_received: true,
+            collateral_release: None,
         };
         let new_receipt = ExecutionReceipt {
             request: make_request(false, Some(make_swap_args())),
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_release: None,
         };
 
         let mut row = make_row(ResultStatus::WaitingCollateral, old_receipt.clone());
@@ -574,5 +719,222 @@ mod tests {
             .update_receipt_meta(&row, &new_receipt, true)
             .await
             .expect("receipt meta update should succeed");
+    }
+
+    mod collateral_release {
+        use super::*;
+        use crate::liquidation::supply_funding::{LendingPoolView, WithdrawOutflow};
+        use liquidium_pipeline_core::types::protocol_types::AssetType;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const LIQ_ID: u128 = 77;
+        const SEIZED: u64 = 500_000;
+        const FEE: u64 = 1_000;
+
+        #[derive(Default)]
+        struct CountingWatchdog(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl Watchdog for CountingWatchdog {
+            async fn notify(&self, _ev: WatchdogEvent<'_>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn held_receipt(release: CollateralRelease) -> ExecutionReceipt {
+            let mut liq = make_liq_result(LIQ_ID, TransferStatus::Success);
+            liq.amounts.collateral_received = Nat::from(SEIZED);
+            ExecutionReceipt {
+                request: make_request(false, Some(make_swap_args())),
+                liquidation_result: Some(liq),
+                status: ExecutionStatus::CollateralTransferFailed("held as supply".to_string()),
+                change_received: true,
+                collateral_release: Some(release),
+            }
+        }
+
+        /// A WAL that serves `row` once and records every receipt written back.
+        fn wal_with(row: LiqResultRecord) -> (MockWalStore, Arc<Mutex<Vec<ExecutionReceipt>>>) {
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let mut wal = MockWalStore::new();
+            expect_pages(&mut wal, vec![row], vec![]);
+            let sink = saved.clone();
+            wal.expect_upsert_result().returning(move |row| {
+                let receipt = decode_receipt_wrapper(&row).unwrap().unwrap().receipt;
+                sink.lock().unwrap().push(receipt);
+                Ok(())
+            });
+            (wal, saved)
+        }
+
+        /// An agent whose collateral pool has `free` cash.
+        fn agent_with_pool_liquidity(free: u64) -> MockPipelineAgent {
+            let ray = Nat::from(1_000_000_000_000_000_000_000_000_000u128);
+            let mut agent = MockPipelineAgent::new();
+            agent
+                .expect_call_query::<Vec<LendingPoolView>>()
+                .returning(move |_, _, _| {
+                    Ok(vec![LendingPoolView {
+                        principal: Principal::anonymous(),
+                        asset_type: AssetType::Unknown,
+                        // One unit above `free`: the debt side is rounded up by one.
+                        total_supply_at_last_sync: Nat::from(1_000_000u64 + free + 1),
+                        total_debt_at_last_sync: Nat::from(1_000_000u64),
+                        lending_index: ray.clone(),
+                        borrow_index: ray.clone(),
+                    }])
+                });
+            agent
+        }
+
+        fn watcher(
+            wal: MockWalStore,
+            agent: MockPipelineAgent,
+            watchdog: Arc<CountingWatchdog>,
+        ) -> SettlementWatcher<MockPipelineAgent, MockWalStore> {
+            SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous()).with_supply_release(
+                SupplyRelease {
+                    liquidator: Principal::anonymous(),
+                    profile: Principal::anonymous(),
+                },
+                watchdog,
+            )
+        }
+
+        #[tokio::test]
+        async fn held_collateral_is_withdrawn_once_the_pool_is_liquid() {
+            // given
+            let row = make_row(ResultStatus::WaitingCollateral, held_receipt(CollateralRelease::Held));
+            let (mut wal, saved) = wal_with(row);
+            wal.expect_update_status().times(0);
+            let mut agent = agent_with_pool_liquidity(SEIZED);
+            agent
+                .expect_call_update::<Result<WithdrawOutflow, ProtocolError>>()
+                .withf(|_, method, _| method == "withdraw")
+                .times(1)
+                .returning(|_, _, _| {
+                    Ok(Ok(WithdrawOutflow {
+                        amount: Nat::from(SEIZED),
+                    }))
+                });
+
+            // when
+            watcher(wal, agent, Arc::default()).tick().await.unwrap();
+
+            // then the call is marked first, and the accepted withdrawal is recorded after it
+            let saved = saved.lock().unwrap();
+            assert_eq!(saved[0].collateral_release, Some(CollateralRelease::Withdrawing));
+            let last = saved.last().unwrap();
+            assert!(matches!(
+                last.collateral_release,
+                Some(CollateralRelease::Requested { .. })
+            ));
+            assert_eq!(
+                last.liquidation_result.as_ref().unwrap().amounts.collateral_received,
+                Nat::from(SEIZED - FEE),
+                "the swap sees what arrives after the payout's ledger fee"
+            );
+        }
+
+        #[tokio::test]
+        async fn held_collateral_waits_while_the_pool_is_illiquid() {
+            // given a pool one unit short
+            let row = make_row(ResultStatus::WaitingCollateral, held_receipt(CollateralRelease::Held));
+            let (mut wal, saved) = wal_with(row);
+            wal.expect_update_status().times(0);
+            let mut agent = agent_with_pool_liquidity(SEIZED - 1);
+            agent
+                .expect_call_update::<Result<WithdrawOutflow, ProtocolError>>()
+                .times(0);
+
+            // when
+            watcher(wal, agent, Arc::default()).tick().await.unwrap();
+
+            // then no withdrawal is called and the row goes back to waiting
+            assert_eq!(
+                saved.lock().unwrap().last().unwrap().collateral_release,
+                Some(CollateralRelease::Held)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_withdrawal_without_an_answer_goes_to_an_operator_and_is_not_repeated() {
+            // given
+            let row = make_row(ResultStatus::WaitingCollateral, held_receipt(CollateralRelease::Held));
+            let row_id = row.id.clone();
+            let (mut wal, saved) = wal_with(row);
+            wal.expect_update_status()
+                .with(eq(row_id), eq(ResultStatus::OperatorRequired), eq(true))
+                .times(1)
+                .returning(|_, _, _| Ok(()));
+            let mut agent = agent_with_pool_liquidity(SEIZED);
+            agent
+                .expect_call_update::<Result<WithdrawOutflow, ProtocolError>>()
+                .times(1)
+                .returning(|_, _, _| Err("request timed out".to_string()));
+            let watchdog = Arc::new(CountingWatchdog::default());
+
+            // when
+            watcher(wal, agent, watchdog.clone()).tick().await.unwrap();
+
+            // then
+            assert_eq!(
+                saved.lock().unwrap().last().unwrap().collateral_release,
+                Some(CollateralRelease::Withdrawing)
+            );
+            assert_eq!(watchdog.0.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn a_withdrawal_interrupted_by_a_restart_goes_to_an_operator() {
+            // given a row left in the middle of the withdrawal call
+            let row = make_row(
+                ResultStatus::WaitingCollateral,
+                held_receipt(CollateralRelease::Withdrawing),
+            );
+            let row_id = row.id.clone();
+            let (mut wal, _saved) = wal_with(row);
+            wal.expect_update_status()
+                .with(eq(row_id), eq(ResultStatus::OperatorRequired), eq(true))
+                .times(1)
+                .returning(|_, _, _| Ok(()));
+            let mut agent = MockPipelineAgent::new();
+            agent
+                .expect_call_update::<Result<WithdrawOutflow, ProtocolError>>()
+                .times(0);
+            let watchdog = Arc::new(CountingWatchdog::default());
+
+            // when
+            watcher(wal, agent, watchdog.clone()).tick().await.unwrap();
+
+            // then
+            assert_eq!(watchdog.0.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn an_accepted_withdrawal_is_enqueued_after_the_settle_window() {
+            // given a withdrawal accepted long ago
+            let row = make_row(
+                ResultStatus::WaitingCollateral,
+                held_receipt(CollateralRelease::Requested { at: 0 }),
+            );
+            let row_id = row.id.clone();
+            let (mut wal, saved) = wal_with(row);
+            wal.expect_update_status()
+                .with(eq(row_id), eq(ResultStatus::Enqueued), eq(true))
+                .times(1)
+                .returning(|_, _, _| Ok(()));
+
+            // when
+            watcher(wal, MockPipelineAgent::new(), Arc::default())
+                .tick()
+                .await
+                .unwrap();
+
+            // then
+            let saved = saved.lock().unwrap();
+            assert_eq!(saved.last().unwrap().collateral_release, None);
+            assert!(matches!(saved.last().unwrap().status, ExecutionStatus::Success));
+        }
     }
 }

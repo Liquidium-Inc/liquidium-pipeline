@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     liquidation::lending_queries::get_liquidation_inflow,
+    liquidation::supply_funding::{CollateralPayout, CollateralRelease},
     persistance::LiquidationIntentStore,
     stage::PipelineStage,
     watchdog::WatchdogEvent,
@@ -51,6 +52,10 @@ pub struct ExecutionReceipt {
     /// Whether the change transfer had settled at the last read of the
     /// liquidation. For display only; no retry or recovery reads it.
     pub change_received: bool,
+    /// Set while seized collateral sits in the liquidator's supply and has not reached the
+    /// account that swaps it. Cleared once it has.
+    #[serde(default)]
+    pub collateral_release: Option<CollateralRelease>,
 }
 
 impl ExecutionReceipt {
@@ -94,6 +99,7 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     liquidation_result: None,
                     status: ExecutionStatus::Success,
                     change_received: true,
+                    collateral_release: None,
                 };
 
                 let liq_req = executor_request.liquidation.clone();
@@ -101,9 +107,11 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
 
                 info!("[executor] ⚡ liquidation req | {summary}");
 
-                let args = self
-                    .funding
-                    .encode_liquidate_args(&liq_req, &executor_request.min_collateral_amount)?;
+                let args = self.funding.encode_liquidate_args(
+                    &liq_req,
+                    &executor_request.min_collateral_amount,
+                    CollateralPayout::Cash,
+                )?;
                 // Every call gets a new intent, also for a borrower whose last call lost its answer
                 // (audit L02). A repeat is a valid liquidation, or the pool rejects it and refunds the debt.
                 let intent_id = uuid::Uuid::new_v4().to_string();
@@ -112,15 +120,39 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     .await
                     .map_err(|error| format!("failed to persist liquidation intent {intent_id}: {error}"))?;
 
-                let liq_call = match self
+                let mut liq_call = self
                     .agent
                     .call_update::<Result<LiquidationResult, ProtocolError>>(
                         &self.lending_canister,
                         self.funding.liquidate_method(),
                         args,
                     )
-                    .await
+                    .await;
+
+                // The cash payout was refused and nothing moved. When the collateral pool cannot
+                // pay it out, taking the collateral as supply still closes the position.
+                let mut collateral_as_supply = false;
+                if let Ok(Err(refusal)) = &liq_call
+                    && self.funding.retries_with_supply_payout(refusal)
                 {
+                    info!("[executor] cash payout refused ({refusal:?}); retrying with collateral as supply | {summary}");
+                    let args = self.funding.encode_liquidate_args(
+                        &liq_req,
+                        &executor_request.min_collateral_amount,
+                        CollateralPayout::Supply,
+                    )?;
+                    liq_call = self
+                        .agent
+                        .call_update::<Result<LiquidationResult, ProtocolError>>(
+                            &self.lending_canister,
+                            self.funding.liquidate_method(),
+                            args,
+                        )
+                        .await;
+                    collateral_as_supply = true;
+                }
+
+                let liq_call = match liq_call {
                     Ok(v) => v,
                     Err(err) => {
                         warn!("Liquidation call failed {err}");
@@ -173,6 +205,11 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 receipt.change_received = matches!(liq.change_tx.status, TransferStatus::Success);
 
                 let collateral_error = match &liq.collateral_tx.status {
+                    // Credited as supply: the settlement watcher withdraws it to the receiver.
+                    TransferStatus::Success if collateral_as_supply => {
+                        receipt.collateral_release = Some(CollateralRelease::Held);
+                        Some("collateral held as supply until the pool can pay it out".to_string())
+                    }
                     TransferStatus::Success => None,
                     TransferStatus::Pending => Some("collateral pending".to_string()),
                     TransferStatus::Failed(err) => Some(err.clone()),
@@ -500,6 +537,64 @@ mod tests {
         // then
         assert!(matches!(receipts[0].status, ExecutionStatus::Success));
         assert_eq!(in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn supply_funded_executor_takes_collateral_as_supply_when_the_cash_payout_is_refused() {
+        // given a collateral pool with no cash: the cash payout is refused, the supply payout works
+        let lending_canister = p("nja4y-2yaaa-aaaae-qddxa-cai");
+        let ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let payout_of = |arg: &[u8]| {
+            candid::Decode!(arg, LiquidationRequest, Nat, CollateralPayout)
+                .ok()
+                .map(|args| args.2)
+        };
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .withf(move |_, _, arg| payout_of(arg) == Some(CollateralPayout::Cash))
+            .times(1)
+            .returning(|_, _, _| Ok(Err(ProtocolError::NoLiquidity)));
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .withf(move |_, _, arg| payout_of(arg) == Some(CollateralPayout::Supply))
+            .times(1)
+            .returning(|_, _, _| Ok(Ok(make_liquidation_result(8u128))));
+
+        let executor = BasicExecutor::new(
+            Arc::new(agent),
+            Account {
+                owner: p("2vxsx-fae"),
+                subaccount: None,
+            },
+            lending_canister,
+            Arc::new(accepting_intent_store(1)),
+            Arc::new(ApprovalState::new()),
+        )
+        .with_funding(LiquidationFunding::Supply);
+
+        let request = make_request(
+            p("2vxsx-fae"),
+            ChainToken::Icp {
+                ledger,
+                symbol: "ckUSDC".to_string(),
+                decimals: 6,
+                fee: Nat::from(10_000u64),
+            },
+        );
+
+        // when
+        let receipts = executor
+            .process(&vec![request])
+            .await
+            .expect("executor process should succeed");
+
+        // then the receipt waits for the collateral to be released from supply
+        assert_eq!(receipts[0].collateral_release, Some(CollateralRelease::Held));
+        assert!(matches!(
+            receipts[0].status,
+            ExecutionStatus::CollateralTransferFailed(_)
+        ));
     }
 
     #[tokio::test]

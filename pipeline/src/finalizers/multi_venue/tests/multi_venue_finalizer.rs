@@ -694,6 +694,7 @@ fn receipt_with_id(liquidation_id: u128) -> ExecutionReceipt {
         }),
         status: ExecutionStatus::Success,
         change_received: true,
+        collateral_release: None,
     }
 }
 
