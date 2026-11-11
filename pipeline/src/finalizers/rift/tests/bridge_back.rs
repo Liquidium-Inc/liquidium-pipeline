@@ -143,17 +143,54 @@ async fn a_held_deposit_parks_the_leg() {
     );
 }
 
+/// The order is read again for the id; with the id, the mint is tracked in the same cycle.
 #[tokio::test]
-async fn a_bitcoin_delivery_without_a_payout_transaction_is_ambiguous() {
-    let finalizer = finalizer(
-        MockRiftBackend::new(),
-        MockBridgeBackend::new(),
-        MockOutboundSender::new(),
-    );
+async fn a_bitcoin_delivery_without_a_payout_transaction_reads_the_order_again() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_order_state().times(1).returning(|_| {
+        let mut answer = order_state(RiftOrderStatus::Delivered, Some("0.0013"));
+        answer.payout_tx = Some(PAYOUT_TX.to_string());
+        Ok(answer)
+    });
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_track_deposit().times(1).returning(|_, _, _, _, receipt| {
+        assert_eq!(receipt, PAYOUT_TX);
+        Ok(DepositNotice::NotYet {
+            reason: "0 of 4 confirmations".to_string(),
+        })
+    });
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
     let mut state = delivered_on_bitcoin(60);
     state.order.as_mut().unwrap().payout_tx = None;
 
-    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
+    finalizer.advance_current_step(&mut state).await.unwrap();
 
-    assert!(matches!(error, VenueStepError::Ambiguous(_)), "{error}");
+    assert_eq!(state.order.unwrap().payout_tx.as_deref(), Some(PAYOUT_TX));
+}
+
+/// Without the id the leg waits within the return bound, then errors every cycle.
+#[tokio::test]
+async fn a_payout_transaction_rift_never_names_waits_then_errors() {
+    for (delivered_secs_ago, waits) in [(60, true), (5 * 60 * 60, false)] {
+        let mut rift = MockRiftBackend::new();
+        rift.expect_order_state().times(1).returning(|_| {
+            let mut answer = order_state(RiftOrderStatus::Delivered, Some("0.0013"));
+            answer.payout_tx = None;
+            Ok(answer)
+        });
+        let finalizer = finalizer(rift, MockBridgeBackend::new(), MockOutboundSender::new());
+        let mut state = delivered_on_bitcoin(delivered_secs_ago);
+        state.order.as_mut().unwrap().payout_tx = None;
+
+        let outcome = finalizer.advance_current_step(&mut state).await;
+
+        match outcome {
+            Ok(()) => assert!(waits, "past the bound the leg must error"),
+            Err(error) => assert!(
+                !waits && matches!(error, VenueStepError::Other(ref m) if m.contains("still waits")),
+                "{error}"
+            ),
+        }
+        assert_eq!(state.step, RiftStep::BridgeBack);
+    }
 }
