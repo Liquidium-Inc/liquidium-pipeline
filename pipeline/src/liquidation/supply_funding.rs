@@ -212,10 +212,11 @@ impl<D: WalStore> HeldCollateral for WalHeldCollateral<D> {
                     continue;
                 }
                 // Until the collateral transfer has landed, the amount may still be in supply.
+                // The canister holds the gross amount: what the receiver gets plus the ledger fee.
                 if let Some(liquidation) = &receipt.liquidation_result
                     && !matches!(liquidation.collateral_tx.status, TransferStatus::Success)
                 {
-                    held += liquidation.amounts.collateral_received.clone();
+                    held += liquidation.amounts.collateral_received.clone() + receipt.request.collateral_asset.fee();
                 }
             }
             if rows.len() < HELD_COLLATERAL_PAGE_SIZE {
@@ -1083,8 +1084,9 @@ mod tests {
         let held = WalHeldCollateral::new(Arc::new(wal));
 
         // when / then only collateral that can still be in supply counts
-        assert_eq!(held.held_native(pool_a).await.unwrap(), Nat::from(500u64));
-        assert_eq!(held.held_native(pool_b).await.unwrap(), Nat::from(70u64));
+        // then only collateral that can still be in supply counts, at its gross amount
+        assert_eq!(held.held_native(pool_a).await.unwrap(), Nat::from(510u64));
+        assert_eq!(held.held_native(pool_b).await.unwrap(), Nat::from(80u64));
     }
 
     #[test]
