@@ -10,7 +10,7 @@ use crate::executors::executor::ExecutorRequest;
 use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::liquidation::settlement_speed::{SettlementSpeed, debt_return_speed, pair_speeds};
-use crate::liquidation::supply_funding::{SUPPLY_BURN_ROUNDING_RESERVE, SupplyBalanceSource};
+use crate::liquidation::supply_funding::{SUPPLY_BURN_ROUNDING_RESERVE, SupplyBalanceSource, supply_cycle_cost};
 use crate::stage::PipelineStage;
 
 use candid::{Int, Nat, Principal};
@@ -156,11 +156,13 @@ where
         self
     }
 
-    /// Whether an ICRC-2 approval is needed and what the funding leg costs on top of the offer.
-    /// Supply funding moves no tokens in; it only holds back the share-rounding reserve.
-    fn debt_funding_cost(&self, token: &ChainToken) -> (bool, Nat) {
+    /// Whether an ICRC-2 approval is needed, what the funding leg holds back from the budget on
+    /// top of the offer, and what it costs the profit estimate.
+    /// Supply funding moves no tokens in, so it only holds back the share-rounding reserve; its
+    /// cost is paid later, when the proceeds are supplied again.
+    fn debt_funding_cost(&self, token: &ChainToken) -> (bool, Nat, Nat) {
         if self.supply_balances.is_some() {
-            return (false, Nat::from(SUPPLY_BURN_ROUNDING_RESERVE));
+            return (false, Nat::from(SUPPLY_BURN_ROUNDING_RESERVE), supply_cycle_cost(token));
         }
 
         let approval_needed = self.debt_approval_needed(token);
@@ -168,7 +170,7 @@ where
         if approval_needed {
             fee_total += token.fee();
         }
-        (approval_needed, fee_total)
+        (approval_needed, fee_total.clone(), fee_total)
     }
 
     /// Sets the assets that reach an exchange without a bridge.
@@ -453,7 +455,7 @@ where
                 continue;
             };
 
-            let (debt_approval_needed, debt_fee_total) = self.debt_funding_cost(&repayment_token);
+            let (debt_approval_needed, debt_fee_total, debt_profit_cost) = self.debt_funding_cost(&repayment_token);
 
             if available_balance.clone() <= debt_fee_total.clone() {
                 self.watchdog
@@ -489,7 +491,7 @@ where
             let amount_received: Nat = Nat::from(0u64);
             let profit = Int::from(amount_received.clone())
                 - Int::from(repay_amount.clone())
-                - Int::from(debt_fee_total.clone());
+                - Int::from(debt_profit_cost);
 
             info!(
                 "🧯 Bad debt buy: repay={} {} | profit={} {}",
@@ -534,6 +536,7 @@ where
                 swap_args: None,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,
+                supply_funded: self.supply_balances.is_some(),
                 min_collateral_amount: Nat::from(0u8),
             });
         }
@@ -701,7 +704,7 @@ where
                 continue;
             };
 
-            let (debt_approval_needed, debt_fee_total) = self.debt_funding_cost(&repayment_token);
+            let (debt_approval_needed, debt_fee_total, debt_profit_cost) = self.debt_funding_cost(&repayment_token);
 
             if available_balance.clone() <= debt_fee_total.clone() {
                 self.watchdog
@@ -857,7 +860,7 @@ where
 
             let profit = Int::from(amount_received)
                 - Int::from(expected_repaid_debt.clone())
-                - Int::from(debt_fee_total.clone());
+                - Int::from(debt_profit_cost);
             let is_bad_debt = profit <= 0;
             let buy_bad_debt = is_bad_debt;
 
@@ -927,6 +930,7 @@ where
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,
+                supply_funded: self.supply_balances.is_some(),
                 min_collateral_amount,
             });
             work_users[user_idx] = candidate_user;
@@ -1217,6 +1221,7 @@ mod tests {
         // then
         assert_eq!(res.len(), 1);
         assert!(!res[0].debt_approval_needed, "supply funding never needs an approval");
+        assert!(res[0].supply_funded, "the request records how it was funded");
     }
 
     // Fails fast when balance fetch errors.

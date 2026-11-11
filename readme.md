@@ -560,6 +560,17 @@ tokens move in and no ICRC-2 approvals are needed. Every 60 seconds the daemon s
 debt-asset balances in the main wallet (swap proceeds) back to their pools. It skips any pass where a
 liquidation is in flight.
 
+Each top-up transfer is saved to `<DB_PATH>.resupply.json` before it is sent. A lost answer or a
+restart resumes that same transfer, which the ledger applies at most once, and no new top-up
+starts for that asset until it is decided. One that stays undecided alerts the operator channel.
+
+Profit figures in this mode charge two ledger fees per liquidation for the top-up (the wallet
+transfer and the pool's sweep) instead of the wallet-mode transfer fees.
+
+The bot takes seized collateral in cash (`CollateralPayout::Cash`). The canister can also credit
+it as supply (`Supply`), which works when the collateral pool has no free liquidity; the bot does
+not use that yet.
+
 Requirements: the lending canister must expose `liquidate_from_supply`, and the liquidator's
 Liquidium profile must not borrow.
 

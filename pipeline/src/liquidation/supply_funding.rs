@@ -15,10 +15,16 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::balance_service::BalanceService;
+use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender};
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
-use liquidium_pipeline_core::transfer::actions::TransferActions;
-use liquidium_pipeline_core::types::protocol_types::{AssetType, ProtocolError};
+use liquidium_pipeline_core::transfer::actions::{TransferActions, TransferFailure};
+use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidationRequest, ProtocolError};
 use serde::{Deserialize, Serialize};
+
+use crate::liquidation::supply_resupply_journal::ResupplyJournal;
+use crate::outbound::driver::{OutboundError, OutboundPhase, step_outbound};
+use crate::utils::now_ts;
+use crate::watchdog::{Watchdog, WatchdogEvent};
 
 /// Lending endpoint used in wallet mode: the canister pulls the debt asset from the wallet.
 pub const WALLET_LIQUIDATE_METHOD: &str = "liquidate_with_slippage";
@@ -32,6 +38,14 @@ const ONE_RAY: u128 = 1_000_000_000_000_000_000_000_000_000;
 /// Native units held back per supply-funded offer. Each burn rounds its shares up, which can
 /// cost up to one share (a couple of native units at realistic indices) beyond the offer.
 pub const SUPPLY_BURN_ROUNDING_RESERVE: u64 = 2;
+/// What one supply-funded liquidation costs in debt-asset native units, beyond the repaid debt:
+/// the share-rounding reserve, plus the two ledger fees paid to supply the proceeds again (the
+/// wallet transfer and the pool's sweep of the deposit subaccount). A top-up can cover several
+/// liquidations, so this is the upper bound per liquidation.
+pub fn supply_cycle_cost(token: &ChainToken) -> Nat {
+    Nat::from(SUPPLY_BURN_ROUNDING_RESERVE) + token.fee() * Nat::from(2u8)
+}
+
 /// How often idle wallet balances are supplied back to the pools.
 pub const RESUPPLY_INTERVAL: Duration = Duration::from_secs(60);
 /// Wallet balances below this many ledger fees are left alone to avoid dust deposits.
@@ -64,6 +78,29 @@ impl LiquidationFunding {
             Self::Supply => SUPPLY_LIQUIDATE_METHOD,
         }
     }
+
+    /// Candid arguments for [`Self::liquidate_method`]. Supply mode also names how collateral is
+    /// delivered; the bot takes it in cash so the swap can follow.
+    pub fn encode_liquidate_args(
+        self,
+        request: &LiquidationRequest,
+        min_collateral_amount: &Nat,
+    ) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Wallet => Encode!(request, min_collateral_amount),
+            Self::Supply => Encode!(request, min_collateral_amount, &CollateralPayout::Cash),
+        }
+        .map_err(|e| format!("liquidation args encode error: {e}"))
+    }
+}
+
+/// Mirrors the lending canister's `CollateralPayout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CandidType, Deserialize)]
+pub enum CollateralPayout {
+    /// Transfer the collateral out of the collateral pool.
+    Cash,
+    /// Credit the collateral to the caller's profile as supply.
+    Supply,
 }
 
 /// The subset of the lending `PositionView` this module needs.
@@ -319,10 +356,24 @@ pub async fn sweep_deposit<A: PipelineAgent>(agent: &A, pool: Principal, subacco
         .map_err(|_| "check_subaccount rejected the sweep".to_string())
 }
 
+/// Why a one-off deposit did not finish. The variant says whether tokens may have moved.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DepositError {
+    /// Nothing was sent.
+    #[error("{0}")]
+    NotSent(String),
+    /// The transfer may or may not have happened. Check the deposit subaccount before sending again.
+    #[error("supply transfer has no decided answer: {0}")]
+    Ambiguous(String),
+    /// The transfer landed but the pool has not credited it yet. A later sweep credits it.
+    #[error("supply transfer {tx} landed but is not credited yet: {reason}")]
+    NotCredited { tx: String, reason: String },
+}
+
 /// Supplies `amount` of an ICP-ledger token to `pool` on behalf of `profile`.
 ///
 /// Transfers to the pool's deposit subaccount for the profile, then asks the pool to sweep it.
-/// If either step fails, or the transfer outcome is unknown, the tokens may sit in the
+/// On [`DepositError::Ambiguous`] or [`DepositError::NotCredited`] the tokens may sit in the
 /// subaccount. Recover them with [`unswept_deposit`] and [`sweep_deposit`], never by sending again.
 pub async fn deposit<A: PipelineAgent>(
     agent: &A,
@@ -331,12 +382,17 @@ pub async fn deposit<A: PipelineAgent>(
     pool: Principal,
     profile: Principal,
     amount: Nat,
-) -> Result<String, String> {
+) -> Result<String, DepositError> {
     if !matches!(token, ChainToken::Icp { .. }) {
-        return Err(format!("{} is not an ICP ledger token", token.symbol()));
+        return Err(DepositError::NotSent(format!(
+            "{} is not an ICP ledger token",
+            token.symbol()
+        )));
     }
 
-    let subaccount = deposit_subaccount(agent, pool, profile).await?;
+    let subaccount = deposit_subaccount(agent, pool, profile)
+        .await
+        .map_err(DepositError::NotSent)?;
     let to = ChainAccount::Icp(Account {
         owner: pool,
         subaccount: Some(subaccount),
@@ -344,11 +400,14 @@ pub async fn deposit<A: PipelineAgent>(
     let tx = transfers
         .transfer(token, &to, amount)
         .await
-        .map_err(|e| format!("supply transfer failed: {e}"))?;
+        .map_err(|failure| match failure {
+            TransferFailure::Rejected(reason) => DepositError::NotSent(reason),
+            TransferFailure::Ambiguous(reason) => DepositError::Ambiguous(reason),
+        })?;
 
     sweep_deposit(agent, pool, subaccount)
         .await
-        .map_err(|e| format!("supply transfer {tx} landed but is not credited yet: {e}"))?;
+        .map_err(|reason| DepositError::NotCredited { tx: tx.clone(), reason })?;
     Ok(tx)
 }
 
@@ -362,13 +421,6 @@ pub(crate) fn resupply_amount(balance: &Nat, fee: &Nat) -> Option<Nat> {
     Some(balance.clone() - fee.clone())
 }
 
-/// Periodically supplies the liquidator wallet's debt-asset balances (swap proceeds) back to
-/// their pools, so capital does not sit idle between liquidations.
-///
-/// Each pass reads the wallet balance first and only then checks that no liquidation is in
-/// flight. Anything that lands after the read is left for the next pass, so a sweep never
-/// moves tokens that arrived from a liquidation not yet recorded in the WAL. Amounts come from
-/// live balances, so an ambiguous transfer is never repeated blindly.
 struct ResupplyTarget {
     token: ChainToken,
     ledger: Principal,
@@ -376,24 +428,39 @@ struct ResupplyTarget {
     subaccount: [u8; 32],
 }
 
+/// Periodically supplies the liquidator wallet's debt-asset balances (swap proceeds) back to
+/// their pools, so capital does not sit idle between liquidations.
+///
+/// Each pass reads the wallet balance first and only then checks that no liquidation is in
+/// flight. Anything that lands after the read is left for the next pass, so a top-up never
+/// moves tokens that arrived from a liquidation not yet recorded in the WAL.
+///
+/// Every transfer is saved in the [`ResupplyJournal`] before it is sent. A lost answer or a
+/// restart resumes that same transfer, which the ledger applies at most once. No new top-up
+/// starts for an asset while one is undecided, and one that stays undecided alerts an operator.
 pub struct Resupplier<A: PipelineAgent> {
     agent: Arc<A>,
     profile: Principal,
     balances: Arc<BalanceService>,
-    transfers: Arc<dyn TransferActions + Send + Sync>,
+    sender: Arc<dyn OutboundSender>,
+    journal: ResupplyJournal,
+    watchdog: Arc<dyn Watchdog>,
     targets: Vec<ResupplyTarget>,
     in_flight: Arc<AtomicUsize>,
 }
 
 impl<A: PipelineAgent + 'static> Resupplier<A> {
     /// Resolves the debt pool for every ICP-ledger debt token.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         agent: Arc<A>,
         lending_canister: Principal,
         profile: Principal,
         debt_tokens: Vec<ChainToken>,
         balances: Arc<BalanceService>,
-        transfers: Arc<dyn TransferActions + Send + Sync>,
+        sender: Arc<dyn OutboundSender>,
+        journal: ResupplyJournal,
+        watchdog: Arc<dyn Watchdog>,
         in_flight: Arc<AtomicUsize>,
     ) -> Result<Self, String> {
         let mut targets = Vec::new();
@@ -416,7 +483,9 @@ impl<A: PipelineAgent + 'static> Resupplier<A> {
             agent,
             profile,
             balances,
-            transfers,
+            sender,
+            journal,
+            watchdog,
             targets,
             in_flight,
         })
@@ -424,40 +493,95 @@ impl<A: PipelineAgent + 'static> Resupplier<A> {
 
     pub async fn run_once(&self) {
         for target in &self.targets {
-            // Finish any earlier deposit whose sweep failed or whose transfer outcome was unknown.
+            // Credit any earlier deposit that landed but was not swept.
             self.sweep_leftover(target).await;
 
-            let token = &target.token;
-            let balance = match self.balances.get_balance(&token.asset_id()).await {
-                Ok(balance) => balance.value,
-                Err(err) => {
-                    tracing::warn!(asset = %token.symbol(), error = %err, "resupply balance read failed");
-                    continue;
-                }
-            };
-            let Some(amount) = resupply_amount(&balance, &token.fee()) else {
+            let key = target.ledger.to_text();
+            if self.journal.get(&key).is_none() && !self.start_top_up(target, &key).await {
                 continue;
-            };
-            if self.in_flight.load(Ordering::SeqCst) > 0 {
-                return;
             }
+            self.advance_top_up(target, &key).await;
+        }
+    }
 
-            match deposit(
-                self.agent.as_ref(),
-                self.transfers.as_ref(),
-                token,
-                target.pool,
-                self.profile,
-                amount.clone(),
-            )
-            .await
-            {
-                Ok(tx) => {
-                    tracing::info!(asset = %token.symbol(), amount = %amount, tx = %tx, "Supplied idle wallet balance")
-                }
+    /// Saves a new top-up for the wallet's idle balance. Returns false when there is nothing to
+    /// send or the send could not be saved; nothing has moved in either case.
+    async fn start_top_up(&self, target: &ResupplyTarget, key: &str) -> bool {
+        let token = &target.token;
+        let balance = match self.balances.get_balance(&token.asset_id()).await {
+            Ok(balance) => balance.value,
+            Err(err) => {
+                tracing::warn!(asset = %token.symbol(), error = %err, "resupply balance read failed");
+                return false;
+            }
+        };
+        let Some(amount) = resupply_amount(&balance, &token.fee()) else {
+            return false;
+        };
+        if self.in_flight.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+
+        let intent = OutboundIntent {
+            token: token.clone(),
+            to: ChainAccount::Icp(Account {
+                owner: target.pool,
+                subaccount: Some(target.subaccount),
+            }),
+            amount_native: amount,
+        };
+        let mut record = None;
+        if let Err(err) = step_outbound(&mut record, self.sender.as_ref(), Some(&intent), now_ts()).await {
+            tracing::warn!(asset = %token.symbol(), error = %err, "could not prepare a supply top-up");
+            return false;
+        }
+        // The send only runs once its record is on disk.
+        if let Err(err) = self.journal.set(key, record) {
+            tracing::warn!(asset = %token.symbol(), error = %err, "could not save a supply top-up; not sending it");
+            return false;
+        }
+        true
+    }
+
+    /// Sends or settles the saved top-up, and credits it once it has landed.
+    async fn advance_top_up(&self, target: &ResupplyTarget, key: &str) {
+        let token = &target.token;
+        let mut record = self.journal.get(key);
+        let was_parked = matches!(record.as_ref().map(|r| &r.phase), Some(OutboundPhase::Parked { .. }));
+
+        let result = step_outbound(&mut record, self.sender.as_ref(), None, now_ts()).await;
+        if let Err(err) = self.journal.set(key, record) {
+            // The stale record resumes the same send, which the ledger applies at most once.
+            tracing::warn!(asset = %token.symbol(), error = %err, "could not update the supply top-up record");
+        }
+
+        match result {
+            Ok(Some(tx)) => match sweep_deposit(self.agent.as_ref(), target.pool, target.subaccount).await {
+                Ok(()) => tracing::info!(asset = %token.symbol(), tx = %tx, "Supplied idle wallet balance"),
                 Err(err) => {
-                    tracing::warn!(asset = %token.symbol(), error = %err, "resupply failed; retrying next pass")
+                    tracing::warn!(asset = %token.symbol(), tx = %tx, error = %err, "supply top-up landed but is not credited yet")
                 }
+            },
+            Ok(None) => tracing::info!(asset = %token.symbol(), "supply top-up has no decided answer yet"),
+            Err(OutboundError::Park(reason)) => {
+                tracing::error!(asset = %token.symbol(), reason = %reason, "supply top-up needs an operator");
+                if !was_parked {
+                    self.watchdog
+                        .notify(WatchdogEvent::OperatorRequired {
+                            execution_id: format!("supply-top-up-{key}"),
+                            venue: "protocol".to_string(),
+                            pending_step: "supply-top-up".to_string(),
+                            owner: self.profile.to_text(),
+                            details: format!(
+                                "a {} supply top-up may or may not have been sent, and no new top-up runs for it until this is decided: {reason}",
+                                token.symbol()
+                            ),
+                        })
+                        .await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(asset = %token.symbol(), error = %err, "supply top-up did not happen; a new one starts next pass")
             }
         }
     }
@@ -544,5 +668,223 @@ mod tests {
         // given / when / then
         assert_eq!(LiquidationFunding::Wallet.liquidate_method(), "liquidate_with_slippage");
         assert_eq!(LiquidationFunding::Supply.liquidate_method(), "liquidate_from_supply");
+    }
+
+    mod resupplier {
+        use super::*;
+        use crate::outbound::driver::OutboundRecord;
+        use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
+        use liquidium_pipeline_core::account::actions::MockAccountInfo;
+        use liquidium_pipeline_core::outbound::{MockOutboundSender, PreparedSend, SendOutcome};
+        use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+        use liquidium_pipeline_core::tokens::token_registry::MockTokenRegistryTrait;
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        const FEE: u64 = 10_000;
+
+        fn token() -> ChainToken {
+            ChainToken::Icp {
+                ledger: Principal::from_slice(b"ckUSDC"),
+                symbol: "ckUSDC".to_string(),
+                decimals: 6,
+                fee: Nat::from(FEE),
+            }
+        }
+
+        fn journal_path(name: &str) -> PathBuf {
+            let path = std::env::temp_dir().join(format!("resupplier-{name}-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            path
+        }
+
+        fn prepared() -> PreparedSend {
+            PreparedSend {
+                sender: "icp".into(),
+                identity: "id-1".into(),
+                payload: "{}".into(),
+                replay_safe: true,
+            }
+        }
+
+        #[derive(Default)]
+        struct CountingWatchdog(Mutex<usize>);
+
+        #[async_trait]
+        impl Watchdog for CountingWatchdog {
+            async fn notify(&self, _ev: WatchdogEvent<'_>) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+
+        /// A resupplier whose wallet holds `wallet_balance` and whose deposit subaccount is empty.
+        fn resupplier(
+            agent: MockPipelineAgent,
+            sender: MockOutboundSender,
+            journal: ResupplyJournal,
+            watchdog: Arc<CountingWatchdog>,
+            wallet_balance: u64,
+        ) -> Resupplier<MockPipelineAgent> {
+            let mut registry = MockTokenRegistryTrait::new();
+            registry.expect_get().returning(|_| Some(token()));
+            let mut account = MockAccountInfo::new();
+            account
+                .expect_sync_balance()
+                .returning(move |token| Ok(ChainTokenAmount::from_raw(token.clone(), Nat::from(wallet_balance))));
+
+            Resupplier {
+                agent: Arc::new(agent),
+                profile: Principal::anonymous(),
+                balances: Arc::new(BalanceService::new(Arc::new(registry), Arc::new(account))),
+                sender: Arc::new(sender),
+                journal,
+                watchdog,
+                targets: vec![ResupplyTarget {
+                    token: token(),
+                    ledger: Principal::from_slice(b"ckUSDC"),
+                    pool: Principal::from_slice(b"pool"),
+                    subaccount: [7u8; 32],
+                }],
+                in_flight: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn agent_with_empty_subaccount() -> MockPipelineAgent {
+            let mut agent = MockPipelineAgent::new();
+            agent.expect_call_query::<Nat>().returning(|_, _, _| Ok(Nat::from(0u8)));
+            agent
+        }
+
+        #[tokio::test]
+        async fn a_top_up_is_saved_before_it_is_sent_and_credited_once_it_lands() {
+            // given a wallet holding 5 ckUSDC
+            let path = journal_path("happy");
+            let mut agent = agent_with_empty_subaccount();
+            agent
+                .expect_call_update::<Result<(), candid::Reserved>>()
+                .withf(|_, method, _| method == "check_subaccount")
+                .times(1)
+                .returning(|_, _, _| Ok(Ok(())));
+
+            let mut sender = MockOutboundSender::new();
+            sender
+                .expect_prepare()
+                .withf(|intent| intent.amount_native == Nat::from(5_000_000u64 - FEE))
+                .times(1)
+                .returning(|_| Ok(prepared()));
+            let saved_path = path.clone();
+            sender.expect_submit().times(1).returning(move |_| {
+                let saved = std::fs::read_to_string(&saved_path).expect("the send is on disk before it runs");
+                assert!(saved.contains("id-1"));
+                SendOutcome::Landed {
+                    receipt: "block-9".into(),
+                }
+            });
+
+            let journal = ResupplyJournal::open(path.clone(), 0).unwrap();
+            let resupplier = resupplier(agent, sender, journal, Arc::default(), 5_000_000);
+
+            // when
+            resupplier.run_once().await;
+
+            // then the decided send is cleared from the journal
+            assert_eq!(ResupplyJournal::open(path.clone(), 0).unwrap().get(&token_key()), None);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn an_undecided_top_up_blocks_new_ones_and_alerts_once() {
+            // given a top-up sent long ago that the ledger still cannot decide
+            let path = journal_path("undecided");
+            let journal = ResupplyJournal::open(path.clone(), 0).unwrap();
+            let mut record = OutboundRecord::prepared(prepared());
+            record.phase = OutboundPhase::Submitted { at: 0 };
+            journal.set(&token_key(), Some(record)).unwrap();
+
+            let mut sender = MockOutboundSender::new();
+            sender.expect_prepare().times(0);
+            sender.expect_submit().times(0);
+            sender.expect_settle().returning(|_| SendOutcome::Open {
+                reason: "no answer".into(),
+            });
+            sender.expect_open_window_secs().returning(|_| 60);
+
+            let watchdog = Arc::new(CountingWatchdog::default());
+            let resupplier = resupplier(
+                agent_with_empty_subaccount(),
+                sender,
+                journal,
+                watchdog.clone(),
+                5_000_000,
+            );
+
+            // when two passes run
+            resupplier.run_once().await;
+            resupplier.run_once().await;
+
+            // then the send is parked for an operator, and the operator was told once
+            let saved = ResupplyJournal::open(path.clone(), 0)
+                .unwrap()
+                .get(&token_key())
+                .unwrap();
+            assert!(matches!(saved.phase, OutboundPhase::Parked { .. }));
+            assert_eq!(*watchdog.0.lock().unwrap(), 1);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn no_top_up_starts_while_a_liquidation_is_in_flight() {
+            // given
+            let path = journal_path("in-flight");
+            let mut sender = MockOutboundSender::new();
+            sender.expect_prepare().times(0);
+            let journal = ResupplyJournal::open(path.clone(), 0).unwrap();
+            let resupplier = resupplier(
+                agent_with_empty_subaccount(),
+                sender,
+                journal,
+                Arc::default(),
+                5_000_000,
+            );
+            resupplier.in_flight.store(1, Ordering::SeqCst);
+
+            // when
+            resupplier.run_once().await;
+
+            // then
+            assert_eq!(resupplier.journal.get(&token_key()), None);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        fn token_key() -> String {
+            Principal::from_slice(b"ckUSDC").to_text()
+        }
+    }
+
+    #[test]
+    fn supply_mode_asks_for_collateral_in_cash() {
+        // given
+        let request = LiquidationRequest {
+            borrower: Principal::anonymous(),
+            debt_pool_id: Principal::anonymous(),
+            collateral_pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(5u8),
+            receiver_address: Principal::anonymous(),
+            buy_bad_debt: false,
+        };
+
+        // when
+        let wallet = LiquidationFunding::Wallet
+            .encode_liquidate_args(&request, &Nat::from(1u8))
+            .unwrap();
+        let supply = LiquidationFunding::Supply
+            .encode_liquidate_args(&request, &Nat::from(1u8))
+            .unwrap();
+
+        // then
+        let (_, min): (LiquidationRequest, Nat) = candid::decode_args(&wallet).unwrap();
+        assert_eq!(min, Nat::from(1u8));
+        let (_, _, payout): (LiquidationRequest, Nat, CollateralPayout) = candid::decode_args(&supply).unwrap();
+        assert_eq!(payout, CollateralPayout::Cash);
     }
 }

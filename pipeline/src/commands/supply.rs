@@ -10,7 +10,7 @@ use liquidium_pipeline_core::tokens::{
 use prettytable::{Cell, Row, Table, format};
 
 use crate::context::{PipelineContext, init_context};
-use crate::liquidation::supply_funding;
+use crate::liquidation::supply_funding::{self, DepositError};
 
 /// Registers a Liquidium profile for the liquidator principal, or shows the existing one.
 pub async fn register() -> Result<()> {
@@ -105,7 +105,12 @@ pub async fn deposit(asset: &str, amount: &str) -> Result<()> {
         amount.clone(),
     )
     .await
-    .map_err(|e| anyhow!(e))?;
+    .map_err(|error| match error {
+        DepositError::NotSent(_) => anyhow!("{error}; nothing was sent"),
+        DepositError::Ambiguous(_) | DepositError::NotCredited { .. } => anyhow!(
+            "{error}; do not send again. Run `liquidator supply status`: the running bot credits a landed deposit on its next pass"
+        ),
+    })?;
     println!(
         "Supplied {} {} (tx {tx})",
         ChainTokenAmount::from_raw(token.clone(), amount).formatted(),

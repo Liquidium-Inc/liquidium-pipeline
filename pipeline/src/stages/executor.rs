@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use candid::Encode;
 
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -102,8 +101,9 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
 
                 info!("[executor] ⚡ liquidation req | {summary}");
 
-                let args =
-                    Encode!(&liq_req, &executor_request.min_collateral_amount).map_err(|e| e.to_string())?;
+                let args = self
+                    .funding
+                    .encode_liquidate_args(&liq_req, &executor_request.min_collateral_amount)?;
                 // Every call gets a new intent, also for a borrower whose last call lost its answer
                 // (audit L02). A repeat is a valid liquidation, or the pool rejects it and refunds the debt.
                 let intent_id = uuid::Uuid::new_v4().to_string();
@@ -372,6 +372,7 @@ mod tests {
             debt_ref_price: Nat::from(0u8),
             ref_price_at: 0,
             debt_approval_needed: true,
+            supply_funded: false,
             min_collateral_amount: Nat::from(42u64),
         }
     }

@@ -8,7 +8,10 @@ use liquidium_pipeline_core::types::protocol_types::LiquidationResult;
 use log::warn;
 use num_traits::ToPrimitive;
 
-use crate::{executors::executor::ExecutorRequest, swappers::model::SwapExecution};
+use crate::{
+    executors::executor::ExecutorRequest, liquidation::supply_funding::supply_cycle_cost,
+    swappers::model::SwapExecution,
+};
 
 pub trait ProfitCalculator: Send + Sync {
     fn expected(&self, req: &ExecutorRequest, liq: Option<&LiquidationResult>) -> i128;
@@ -25,15 +28,21 @@ impl ProfitCalculator for SimpleProfitCalculator {
     }
 
     fn realized(&self, req: &ExecutorRequest, liq: &LiquidationResult, swap: Option<&SwapExecution>) -> i128 {
-        let mut fee_total = req.debt_asset.fee();
-        if req.debt_approval_needed {
-            fee_total += req.debt_asset.fee();
-        }
-        // The protocol returns the unspent debt in a second transfer, and its fee
-        // comes out of that change (liquidation 1614 was overstated by one fee).
-        if req.liquidation.debt_amount > liq.amounts.debt_repaid {
-            fee_total += req.debt_asset.fee();
-        }
+        let mut fee_total = if req.supply_funded {
+            // No transfer in and no change back: the cost is supplying the proceeds again.
+            supply_cycle_cost(&req.debt_asset)
+        } else {
+            let mut fee_total = req.debt_asset.fee();
+            if req.debt_approval_needed {
+                fee_total += req.debt_asset.fee();
+            }
+            // The protocol returns the unspent debt in a second transfer, and its fee
+            // comes out of that change (liquidation 1614 was overstated by one fee).
+            if req.liquidation.debt_amount > liq.amounts.debt_repaid {
+                fee_total += req.debt_asset.fee();
+            }
+            fee_total
+        };
 
         let receive_amount = match swap {
             Some(swap) => swap.receive_amount.clone(),
@@ -111,6 +120,7 @@ mod tests {
             debt_ref_price: Nat::from(0u8),
             ref_price_at: 0,
             debt_approval_needed: false,
+            supply_funded: false,
             min_collateral_amount: Nat::from(0u8),
         }
     }
@@ -135,6 +145,24 @@ mod tests {
                 status: TransferStatus::Success,
             },
         }
+    }
+
+    #[test]
+    fn realized_for_supply_funding_charges_the_resupply_fees_not_wallet_transfers() {
+        // given a partial fill, which in wallet mode would also pay a change-transfer fee
+        let ledger = Principal::anonymous();
+        let token = icp_token("ckUSDC", 6, 1_000, ledger);
+        let mut req = request(token.clone(), token);
+        req.supply_funded = true;
+        req.debt_approval_needed = true;
+        req.liquidation.debt_amount = Nat::from(50_000u64);
+        let liq = liquidation(60_000, 40_000);
+
+        // when
+        let profit = SimpleProfitCalculator.realized(&req, &liq, None);
+
+        // then: 60_000 received - 40_000 repaid - two ledger fees - the rounding reserve
+        assert_eq!(profit, 60_000 - 40_000 - 2_000 - 2);
     }
 
     #[test]

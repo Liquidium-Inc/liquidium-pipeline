@@ -249,7 +249,7 @@ async fn init(
         .map_err(|e| format!("executor token init failed: {e}"))?;
     let supply_profile = match config.liquidation_funding {
         LiquidationFunding::Wallet => None,
-        LiquidationFunding::Supply => Some(start_supply_funding(ctx.as_ref(), &executor).await?),
+        LiquidationFunding::Supply => Some(start_supply_funding(ctx.as_ref(), &executor, slack_watchdog.clone()).await?),
     };
     let executor = Arc::new(executor);
 
@@ -384,7 +384,10 @@ async fn init(
 async fn start_supply_funding(
     ctx: &PipelineContext,
     executor: &BasicExecutor<Agent, SqliteWalStore>,
+    watchdog: Arc<dyn crate::watchdog::Watchdog>,
 ) -> Result<Principal, String> {
+    use crate::liquidation::supply_resupply_journal::ResupplyJournal;
+
     let config = &ctx.config;
     let profile = supply_funding::lookup_profile(
         ctx.agent.as_ref(),
@@ -404,7 +407,9 @@ async fn start_supply_funding(
         profile,
         debt_tokens,
         ctx.main_service.clone(),
-        ctx.main_transfers.actions(),
+        ctx.main_outbound.clone(),
+        ResupplyJournal::open(ResupplyJournal::path_for_db(&config.db_path), crate::utils::now_ts())?,
+        watchdog,
         executor.in_flight_counter(),
     )
     .await?;
@@ -822,6 +827,7 @@ mod tests {
                 debt_ref_price: Nat::from(0u8),
                 ref_price_at: 0,
                 debt_approval_needed: false,
+                supply_funded: false,
                 min_collateral_amount: Nat::from(0u8),
             },
             liquidation_result: None,

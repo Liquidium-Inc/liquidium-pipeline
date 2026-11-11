@@ -75,6 +75,7 @@ pub(super) fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         debt_ref_price: Nat::from(0u8),
         ref_price_at: 0,
         debt_approval_needed: false,
+        supply_funded: false,
         min_collateral_amount: Nat::from(0u8),
     };
 
@@ -130,6 +131,7 @@ pub(super) fn make_execution_receipt_with_assets(
         debt_ref_price: Nat::from(0u8),
         ref_price_at: 0,
         debt_approval_needed: false,
+        supply_funded: false,
         min_collateral_amount: Nat::from(0u8),
     };
 

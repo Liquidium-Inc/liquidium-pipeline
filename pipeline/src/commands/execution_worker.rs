@@ -414,6 +414,7 @@ mod tests {
             debt_ref_price: Nat::from(1u8),
             ref_price_at: 1,
             debt_approval_needed: false,
+            supply_funded: false,
             min_collateral_amount: Nat::from(90_000u64),
         }
     }
