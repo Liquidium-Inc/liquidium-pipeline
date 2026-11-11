@@ -34,7 +34,7 @@ use crate::{
     },
     operator::OperatorDesk,
     liquidation::collateral_service::CollateralService,
-    liquidation::supply_funding::{self, LendingSupplyBalances, LiquidationFunding, Resupplier},
+    liquidation::supply_funding::{self, LendingSupplyBalances, LiquidationFunding, Resupplier, WalHeldCollateral},
     persistance::{
         FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,
         WalStore, sqlite::SqliteWalStore,
@@ -252,7 +252,9 @@ async fn init(
         .map_err(|e| format!("executor token init failed: {e}"))?;
     let supply_profile = match config.liquidation_funding {
         LiquidationFunding::Wallet => None,
-        LiquidationFunding::Supply => Some(start_supply_funding(ctx.as_ref(), &executor, slack_watchdog.clone()).await?),
+        LiquidationFunding::Supply => {
+            Some(start_supply_funding(ctx.as_ref(), &executor, slack_watchdog.clone()).await?)
+        }
     };
     let executor = Arc::new(executor);
 
@@ -373,6 +375,7 @@ async fn init(
             agent.clone(),
             config.lending_canister,
             profile,
+            Arc::new(WalHeldCollateral::new(db.clone())),
         )));
     }
 
@@ -561,6 +564,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
             SupplyRelease {
                 liquidator: config.liquidator_principal,
                 profile,
+                holding_sender: ctx.main_holding_sender.clone(),
             },
             slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN),
         );

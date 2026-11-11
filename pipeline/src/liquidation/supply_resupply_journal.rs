@@ -65,11 +65,25 @@ impl ResupplyJournal {
 
     /// Stores or clears the record for `key`. The change counts only once it is on disk: on an
     /// error the journal keeps its previous contents, in memory and in the file.
+    ///
+    /// The bot and the CLI both write this file. Each write holds a lock file, starts from
+    /// what is on disk and changes one key, so neither process replaces the other's records.
     pub fn set(&self, key: &str, record: Option<OutboundRecord>) -> Result<(), String> {
         let mut records = self.records.lock().expect("resupply journal lock");
-        let mut candidate = records.clone();
+        let _file_lock = self.lock_file()?;
+
+        let mut candidate = Self::read(&self.path)?;
         match record {
-            Some(record) => candidate.insert(key.to_string(), record),
+            Some(mut record) => {
+                // Keep an operator decision the other process recorded for this same send.
+                if record.decision.is_none()
+                    && let Some(on_disk) = candidate.get(key)
+                    && on_disk.prepared.identity == record.prepared.identity
+                {
+                    record.decision = on_disk.decision.clone();
+                }
+                candidate.insert(key.to_string(), record)
+            }
             None => candidate.remove(key),
         };
 
@@ -78,10 +92,19 @@ impl ResupplyJournal {
         Ok(())
     }
 
+    /// Takes the exclusive lock that orders writes between processes. Dropping it releases it.
+    fn lock_file(&self) -> Result<File, String> {
+        let path = self.path.with_extension("json.lock");
+        let file = File::create(&path).map_err(|e| format!("could not open {}: {e}", path.display()))?;
+        file.lock()
+            .map_err(|e| format!("could not lock {}: {e}", path.display()))?;
+        Ok(file)
+    }
+
     /// Replaces the file through a synced temporary file, then syncs the directory entry.
     fn write(&self, records: &BTreeMap<String, OutboundRecord>) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(records).map_err(|e| format!("resupply journal encode error: {e}"))?;
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = self.path.with_extension(format!("json.{}.tmp", std::process::id()));
         let describe = |step: &str, e: std::io::Error| format!("could not {step} {}: {e}", self.path.display());
 
         let mut file = File::create(&tmp).map_err(|e| describe("create the temporary file for", e))?;
@@ -188,6 +211,29 @@ mod tests {
 
         // then
         assert_eq!(bot.get("ledger-a"), Some(decided));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_write_keeps_what_another_process_wrote() {
+        // given a bot journal, and a CLI that decides one send and the bot does not know yet
+        let path = temp_path("two-writers");
+        let _ = std::fs::remove_file(&path);
+        let bot = ResupplyJournal::open(path.clone(), 0).unwrap();
+        bot.set("ledger-a", Some(record(true))).unwrap();
+        let cli = ResupplyJournal::open(path.clone(), 0).unwrap();
+        let mut decided = cli.get("ledger-a").unwrap();
+        decided.decide(crate::outbound::driver::OperatorDecision::Absent);
+        cli.set("ledger-a", Some(decided.clone())).unwrap();
+
+        // when the bot, still holding its older view, writes both keys
+        bot.set("ledger-b", Some(record(true))).unwrap();
+        bot.set("ledger-a", Some(record(true))).unwrap();
+
+        // then the decision for that same send survives
+        let reopened = ResupplyJournal::open(path.clone(), 0).unwrap();
+        assert_eq!(reopened.get("ledger-a").unwrap().decision, decided.decision);
+        assert_eq!(reopened.get("ledger-b"), Some(record(true)));
         let _ = std::fs::remove_file(&path);
     }
 

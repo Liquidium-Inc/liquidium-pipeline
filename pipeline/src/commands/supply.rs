@@ -10,10 +10,12 @@ use liquidium_pipeline_core::tokens::{
 use prettytable::{Cell, Row, Table, format};
 
 use crate::context::{PipelineContext, init_context};
-use crate::liquidation::supply_funding::{self, DepositError};
+use crate::liquidation::supply_funding::{self, CollateralRelease, DepositError};
 use crate::liquidation::supply_resupply_journal::ResupplyJournal;
 use crate::outbound::driver::OperatorDecision;
+use crate::persistance::{WalStore, sqlite::SqliteWalStore};
 use crate::utils::now_ts;
+use crate::wal::{decode_receipt_wrapper, wal_save_receipt};
 
 /// Registers a Liquidium profile for the liquidator principal, or shows the existing one.
 pub async fn register() -> Result<()> {
@@ -203,6 +205,35 @@ pub async fn resolve_top_up(asset: &str, landed: Option<String>, absent: bool) -
     println!(
         "Recorded. A running bot applies it on its next pass; run `liquidator supply top-ups` afterwards to confirm it cleared."
     );
+    Ok(())
+}
+
+/// Puts a collateral release whose withdrawal got no answer back to "held", so the bot
+/// withdraws it again. Only for a withdrawal that did not run: check first that the
+/// liquidator's supply in the collateral pool still includes the collateral.
+pub async fn retry_release(row_id: &str) -> Result<()> {
+    let ctx = init_context().await.map_err(|e| anyhow!(e))?;
+    let wal = SqliteWalStore::new(&ctx.config.db_path)?;
+    let row = wal
+        .get_result(row_id)
+        .await?
+        .ok_or_else(|| anyhow!("no liquidation row `{row_id}`"))?;
+    let mut receipt = decode_receipt_wrapper(&row)
+        .map_err(|e| anyhow!(e))?
+        .ok_or_else(|| anyhow!("row `{row_id}` has no receipt"))?
+        .receipt;
+    if !matches!(receipt.collateral_release, Some(CollateralRelease::Withdrawing { .. })) {
+        bail!(
+            "row `{row_id}` is not waiting on an unanswered collateral withdrawal (state: {:?})",
+            receipt.collateral_release
+        );
+    }
+
+    receipt.collateral_release = Some(CollateralRelease::Held);
+    wal_save_receipt(&wal, row, &receipt, true)
+        .await
+        .map_err(|e| anyhow!(e))?;
+    println!("Row {row_id} is held again; the bot withdraws it on a later pass once the pool has cash.");
     Ok(())
 }
 

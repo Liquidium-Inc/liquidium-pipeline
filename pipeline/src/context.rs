@@ -7,6 +7,8 @@ use alloy::signers::local::PrivateKeySigner;
 
 use ic_agent::{Agent, Identity};
 use icrc_ledger_types::icrc1::account::Account;
+
+use crate::liquidation::supply_funding::HoldingSender;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::solana_account::SolanaAccountInfoAdapter;
@@ -51,6 +53,8 @@ pub struct PipelineContext {
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
+    /// Builds saved ICP ledger sends from one subaccount of the liquidator account.
+    pub main_holding_sender: HoldingSender,
     /// ICP ledger sends from the liquidator account that are saved before they run.
     pub main_outbound: Arc<dyn OutboundSender>,
     /// Sends from the trader account that are saved before they run.
@@ -267,7 +271,16 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             solana_transfer_main,
         ));
         let main_transfers = TransferService::new(registry.clone(), transfer_router_main);
-        let main_outbound: Arc<dyn OutboundSender> = Arc::new(IcpSender::new(icp_backend_main.clone(), main_icp_account));
+        let main_outbound: Arc<dyn OutboundSender> =
+            Arc::new(IcpSender::new(icp_backend_main.clone(), main_icp_account));
+        let holding_backend = icp_backend_main.clone();
+        let main_holding_sender: HoldingSender = Arc::new(move |subaccount| {
+            let account = Account {
+                owner: main_icp_account.owner,
+                subaccount: Some(subaccount),
+            };
+            Arc::new(IcpSender::new(holding_backend.clone(), account))
+        });
 
         let icp_transfer_trader = Arc::new(IcpTransferAdapter::new(icp_backend_trader.clone(), trader_icp_account));
         let evm_transfer_trader = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
@@ -372,6 +385,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             main_transfers: Arc::new(main_transfers),
             trader_transfers: Arc::new(trader_transfers),
             main_outbound,
+            main_holding_sender,
             trader_outbound,
             recovery_transfers: Arc::new(recovery_transfers),
             bridge_transfers: Arc::new(bridge_transfers),

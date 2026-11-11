@@ -277,6 +277,13 @@ enum SupplyCommands {
         #[arg(long)]
         absent: bool,
     },
+
+    // Retries a collateral withdrawal that got no answer and did not run
+    RetryRelease {
+        /// Liquidation row id shown in the alert
+        #[arg(long)]
+        row: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -565,6 +572,7 @@ async fn main() -> ExitCode {
                 SupplyCommands::Deposit { asset, amount } => commands::supply::deposit(&asset, &amount).await,
                 SupplyCommands::Withdraw { asset, amount } => commands::supply::withdraw(&asset, &amount).await,
                 SupplyCommands::TopUps => commands::supply::top_ups().await,
+                SupplyCommands::RetryRelease { row } => commands::supply::retry_release(&row).await,
                 SupplyCommands::ResolveTopUp { asset, landed, absent } => {
                     commands::supply::resolve_top_up(&asset, landed, absent).await
                 }

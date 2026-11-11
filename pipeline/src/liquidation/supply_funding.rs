@@ -22,9 +22,12 @@ use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidationReque
 use serde::{Deserialize, Serialize};
 
 use crate::liquidation::supply_resupply_journal::ResupplyJournal;
-use crate::outbound::driver::{OutboundError, OutboundPhase, step_outbound};
+use crate::outbound::driver::{OutboundError, OutboundPhase, OutboundRecord, step_outbound};
+use crate::persistance::{ResultStatus, WalStore};
 use crate::utils::now_ts;
+use crate::wal::decode_receipt_wrapper;
 use crate::watchdog::{Watchdog, WatchdogEvent};
+use sha2::{Digest, Sha256};
 
 /// Lending endpoint used in wallet mode: the canister pulls the debt asset from the wallet.
 pub const WALLET_LIQUIDATE_METHOD: &str = "liquidate_with_slippage";
@@ -50,6 +53,8 @@ pub fn supply_cycle_cost(token: &ChainToken) -> Nat {
 pub const RESUPPLY_INTERVAL: Duration = Duration::from_secs(60);
 /// Wallet balances below this many ledger fees are left alone to avoid dust deposits.
 const RESUPPLY_MIN_FEE_MULTIPLE: u64 = 100;
+/// WAL rows read per page when adding up held collateral.
+const HELD_COLLATERAL_PAGE_SIZE: usize = 100;
 
 /// Where the debt asset for a liquidation comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -136,33 +141,47 @@ pub(crate) struct WithdrawOutflow {
     pub(crate) amount: Nat,
 }
 
-/// Where collateral that was credited as supply stands on its way to the swap account.
+/// Where collateral that was credited as supply stands on its way to the account that swaps it.
+///
+/// It leaves supply through a withdrawal into a holding subaccount that belongs to this one
+/// liquidation, so its arrival can be read from the ledger, and is then sent on from there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CollateralRelease {
     /// Still supplied in the collateral pool under the liquidator's profile.
     Held,
-    /// A withdrawal call was started. If this is read back after a restart, the call may or
-    /// may not have run, so only an operator can decide it.
-    Withdrawing,
-    /// The withdrawal was accepted at this unix time; the payout is on its way.
-    Requested { at: i64 },
+    /// A withdrawal call was started and its answer is not known. The holding subaccount
+    /// shows whether it ran. `alerted` records that an operator was told.
+    Withdrawing { alerted: bool },
+    /// The withdrawal was accepted at this unix time; `expected` should reach the holding
+    /// subaccount.
+    Requested { at: i64, expected: Nat },
+    /// The collateral is in the holding subaccount and `amount` is being sent to the receiver.
+    Forwarding {
+        amount: Nat,
+        send: Option<OutboundRecord>,
+        alerted: bool,
+    },
+    /// The collateral reached the receiver. The receipt's collateral amount is final.
+    Released,
 }
 
-/// Why collateral held as supply was not released on this attempt.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ReleaseError {
-    /// The collateral pool cannot pay the amount out yet. Nothing was called.
-    #[error("collateral pool has {available} free, {needed} needed")]
-    NotYetLiquid { available: Nat, needed: Nat },
-    /// The canister refused the withdrawal. Nothing moved; a later attempt is safe.
-    #[error("withdrawal rejected: {0}")]
-    Rejected(String),
-    /// The call got no decided answer, so the withdrawal may have run.
-    #[error("withdrawal has no decided answer: {0}")]
-    Ambiguous(String),
-    /// The liquidity read failed before any call was made.
-    #[error("{0}")]
-    NotAttempted(String),
+impl CollateralRelease {
+    /// True while the collateral may still be part of the liquidator's supply position.
+    pub fn still_supplied(&self) -> bool {
+        matches!(self, Self::Held | Self::Withdrawing { .. })
+    }
+}
+
+/// Builds the sender that moves funds out of one holding subaccount of the liquidator.
+pub type HoldingSender = Arc<dyn Fn([u8; 32]) -> Arc<dyn OutboundSender> + Send + Sync>;
+
+/// The ledger subaccount of the liquidator that holds one liquidation's collateral between
+/// its withdrawal from supply and its transfer to the receiver.
+pub fn release_holding_subaccount(liquidation_id: u128) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"liquidium-pipeline/collateral-release/");
+    hasher.update(liquidation_id.to_be_bytes());
+    hasher.finalize().into()
 }
 
 #[derive(Debug, Clone, CandidType)]
@@ -200,19 +219,75 @@ pub trait SupplyBalanceSource: Send + Sync {
     async fn supplied_native(&self, pool_id: Principal) -> Result<Nat, String>;
 }
 
-/// [`SupplyBalanceSource`] backed by the lending canister's `get_position`.
+/// Collateral that liquidations left in the liquidator's supply and that still has to be
+/// paid out to its receiver. It must not fund other liquidations.
+#[async_trait]
+pub trait HeldCollateral: Send + Sync {
+    async fn held_native(&self, pool_id: Principal) -> Result<Nat, String>;
+}
+
+/// [`HeldCollateral`] read from the WAL rows that wait for their collateral.
+pub struct WalHeldCollateral<D: WalStore> {
+    wal: Arc<D>,
+}
+
+impl<D: WalStore> WalHeldCollateral<D> {
+    pub fn new(wal: Arc<D>) -> Self {
+        Self { wal }
+    }
+}
+
+#[async_trait]
+impl<D: WalStore> HeldCollateral for WalHeldCollateral<D> {
+    async fn held_native(&self, pool_id: Principal) -> Result<Nat, String> {
+        let mut held = Nat::from(0u8);
+        let mut after_id = None;
+        loop {
+            let rows = self
+                .wal
+                .list_by_status_after(ResultStatus::WaitingCollateral, after_id, HELD_COLLATERAL_PAGE_SIZE)
+                .await
+                .map_err(|e| format!("held collateral read failed: {e}"))?;
+            for row in &rows {
+                let Some(meta) = decode_receipt_wrapper(row)? else {
+                    continue;
+                };
+                let receipt = meta.receipt;
+                let supplied = receipt
+                    .collateral_release
+                    .as_ref()
+                    .is_some_and(CollateralRelease::still_supplied);
+                if !supplied || receipt.request.liquidation.collateral_pool_id != pool_id {
+                    continue;
+                }
+                if let Some(liquidation) = &receipt.liquidation_result {
+                    held += liquidation.amounts.collateral_received.clone();
+                }
+            }
+            if rows.len() < HELD_COLLATERAL_PAGE_SIZE {
+                return Ok(held);
+            }
+            after_id = rows.last().map(|row| row.id.clone());
+        }
+    }
+}
+
+/// [`SupplyBalanceSource`] backed by the lending canister's `get_position`, less the collateral
+/// that is only parked in that position.
 pub struct LendingSupplyBalances<A: PipelineAgent> {
     agent: Arc<A>,
     lending_canister: Principal,
     profile: Principal,
+    held: Arc<dyn HeldCollateral>,
 }
 
 impl<A: PipelineAgent> LendingSupplyBalances<A> {
-    pub fn new(agent: Arc<A>, lending_canister: Principal, profile: Principal) -> Self {
+    pub fn new(agent: Arc<A>, lending_canister: Principal, profile: Principal, held: Arc<dyn HeldCollateral>) -> Self {
         Self {
             agent,
             lending_canister,
             profile,
+            held,
         }
     }
 }
@@ -220,7 +295,13 @@ impl<A: PipelineAgent> LendingSupplyBalances<A> {
 #[async_trait]
 impl<A: PipelineAgent> SupplyBalanceSource for LendingSupplyBalances<A> {
     async fn supplied_native(&self, pool_id: Principal) -> Result<Nat, String> {
-        supplied_native(self.agent.as_ref(), &self.lending_canister, self.profile, pool_id).await
+        let supplied = supplied_native(self.agent.as_ref(), &self.lending_canister, self.profile, pool_id).await?;
+        let held = self.held.held_native(pool_id).await?;
+        Ok(if supplied > held {
+            supplied - held
+        } else {
+            Nat::from(0u8)
+        })
     }
 }
 
@@ -257,8 +338,15 @@ pub async fn register_profile<A: PipelineAgent>(
 }
 
 #[derive(Debug, Clone, CandidType, Deserialize)]
-enum AccountType {
+pub(crate) enum AccountType {
     Native(Principal),
+    Icrc(IcrcAccount),
+}
+
+#[derive(Debug, Clone, CandidType, Deserialize)]
+pub(crate) struct IcrcAccount {
+    pub(crate) owner: Principal,
+    pub(crate) subaccount: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, CandidType, Deserialize)]
@@ -293,34 +381,28 @@ pub async fn withdraw_supply<A: PipelineAgent>(
     pool_id: Principal,
     amount: Nat,
 ) -> Result<(), String> {
-    withdraw_to(
-        agent,
-        lending_canister,
-        liquidator,
-        profile,
-        pool_id,
-        liquidator,
-        amount,
-    )
-    .await?
-    .map(|_| ())
-    .map_err(|e| format!("withdraw rejected: {e:?}"))
+    let receiver = AccountType::Native(liquidator);
+    withdraw_to(agent, lending_canister, liquidator, profile, pool_id, receiver, amount)
+        .await?
+        .map(|_| ())
+        .map_err(|e| format!("withdraw rejected: {e:?}"))
 }
 
 /// Calls the lending `withdraw` and pays `receiver`. The outer error is a call with no decided
-/// answer; the inner one is a refusal by the canister, which moved nothing.
-async fn withdraw_to<A: PipelineAgent>(
+/// answer; the inner one is a refusal by the canister, which moved nothing. On success it
+/// returns the amount withdrawn, before the ledger fee of the payout.
+pub(crate) async fn withdraw_to<A: PipelineAgent>(
     agent: &A,
     lending_canister: &Principal,
     liquidator: Principal,
     profile: Principal,
     pool_id: Principal,
-    receiver: Principal,
+    receiver: AccountType,
     amount: Nat,
 ) -> Result<Result<Nat, ProtocolError>, String> {
     let request = SignedRequest {
         data: WithdrawRequest {
-            account: AccountType::Native(receiver),
+            account: receiver,
             pool_id,
             amount,
             expiry_timestamp: request_expiry()?,
@@ -355,35 +437,13 @@ pub async fn pool_free_liquidity<A: PipelineAgent>(
     Ok(if supply > debt { supply - debt } else { Nat::from(0u8) })
 }
 
-/// Moves collateral that a liquidation credited as supply out to `receiver`.
-///
-/// The withdrawal is only called once the pool shows enough free cash, because the canister
-/// traps on an illiquid withdrawal and a trap cannot be told apart from a lost answer here.
-/// Returns the amount the canister withdrew, before the ledger fee of the payout.
-pub async fn release_collateral<A: PipelineAgent>(
-    agent: &A,
-    lending_canister: &Principal,
-    liquidator: Principal,
-    profile: Principal,
-    pool_id: Principal,
-    receiver: Principal,
-    amount: Nat,
-) -> Result<Nat, ReleaseError> {
-    let available = pool_free_liquidity(agent, lending_canister, pool_id)
+/// Balance of an ICRC-1 account on `ledger`.
+pub async fn ledger_balance<A: PipelineAgent>(agent: &A, ledger: Principal, account: Account) -> Result<Nat, String> {
+    let args = Encode!(&account).map_err(|e| format!("icrc1_balance_of encode error: {e}"))?;
+    agent
+        .call_query::<Nat>(&ledger, "icrc1_balance_of", args)
         .await
-        .map_err(ReleaseError::NotAttempted)?;
-    if available < amount {
-        return Err(ReleaseError::NotYetLiquid {
-            available,
-            needed: amount,
-        });
-    }
-
-    match withdraw_to(agent, lending_canister, liquidator, profile, pool_id, receiver, amount).await {
-        Ok(Ok(withdrawn)) => Ok(withdrawn),
-        Ok(Err(refusal)) => Err(ReleaseError::Rejected(format!("{refusal:?}"))),
-        Err(reason) => Err(ReleaseError::Ambiguous(reason)),
-    }
+        .map_err(|e| format!("icrc1_balance_of failed: {e}"))
 }
 
 /// Largest offer the canister accepts for `shares`: it burns `ceil(offer / index)` shares, so
@@ -462,11 +522,7 @@ pub async fn unswept_deposit<A: PipelineAgent>(
         owner: pool,
         subaccount: Some(subaccount),
     };
-    let args = Encode!(&account).map_err(|e| format!("icrc1_balance_of encode error: {e}"))?;
-    agent
-        .call_query::<Nat>(&ledger, "icrc1_balance_of", args)
-        .await
-        .map_err(|e| format!("icrc1_balance_of failed: {e}"))
+    ledger_balance(agent, ledger, account).await
 }
 
 /// Asks the pool to sweep the deposit subaccount and credit the profile's supply. The ICP pool
@@ -988,6 +1044,106 @@ mod tests {
         fn token_key() -> String {
             Principal::from_slice(b"ckUSDC").to_text()
         }
+    }
+
+    #[tokio::test]
+    async fn collateral_parked_in_supply_does_not_fund_other_liquidations() {
+        use crate::executors::executor::ExecutorRequest;
+        use crate::persistance::{LiqMetaWrapper, LiqResultRecord, MockWalStore};
+        use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+        use crate::wal::encode_meta;
+        use liquidium_pipeline_core::types::protocol_types::{
+            LiquidationAmounts, LiquidationResult, LiquidationStatus, TransferStatus, TxStatus,
+        };
+
+        // given three waiting rows: held in pool A, already withdrawn from pool A, held in pool B
+        let pool_a = Principal::from_slice(b"pool-a");
+        let pool_b = Principal::from_slice(b"pool-b");
+        let token = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ckBTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(10u8),
+        };
+        let row = |id: u128, pool: Principal, amount: u64, release: CollateralRelease| {
+            let receipt = ExecutionReceipt {
+                request: ExecutorRequest {
+                    liquidation: LiquidationRequest {
+                        borrower: Principal::anonymous(),
+                        debt_pool_id: Principal::anonymous(),
+                        collateral_pool_id: pool,
+                        debt_amount: Nat::from(0u8),
+                        receiver_address: Principal::anonymous(),
+                        buy_bad_debt: false,
+                    },
+                    swap_args: None,
+                    debt_asset: token.clone(),
+                    collateral_asset: token.clone(),
+                    expected_profit: 0,
+                    ref_price: Nat::from(0u8),
+                    debt_ref_price: Nat::from(0u8),
+                    ref_price_at: 0,
+                    debt_approval_needed: false,
+                    supply_funded: true,
+                    min_collateral_amount: Nat::from(0u8),
+                },
+                liquidation_result: Some(LiquidationResult {
+                    id,
+                    amounts: LiquidationAmounts {
+                        collateral_received: Nat::from(amount),
+                        debt_repaid: Nat::from(0u8),
+                    },
+                    collateral_asset: AssetType::Unknown,
+                    debt_asset: AssetType::Unknown,
+                    status: LiquidationStatus::Success,
+                    timestamp: 0,
+                    change_tx: TxStatus {
+                        tx_id: None,
+                        status: TransferStatus::Success,
+                    },
+                    collateral_tx: TxStatus {
+                        tx_id: None,
+                        status: TransferStatus::Success,
+                    },
+                }),
+                status: ExecutionStatus::Success,
+                change_received: true,
+                collateral_release: Some(release),
+            };
+            let mut record = LiqResultRecord {
+                id: id.to_string(),
+                status: ResultStatus::WaitingCollateral,
+                attempt: 0,
+                error_count: 0,
+                last_error: None,
+                created_at: 0,
+                updated_at: 0,
+                meta_json: "{}".to_string(),
+            };
+            encode_meta(&mut record, &LiqMetaWrapper::new(receipt)).unwrap();
+            record
+        };
+        let rows = vec![
+            row(1, pool_a, 500, CollateralRelease::Held),
+            row(
+                2,
+                pool_a,
+                300,
+                CollateralRelease::Requested {
+                    at: 0,
+                    expected: Nat::from(290u64),
+                },
+            ),
+            row(3, pool_b, 70, CollateralRelease::Withdrawing { alerted: false }),
+        ];
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status_after()
+            .returning(move |_, _, _| Ok(rows.clone()));
+        let held = WalHeldCollateral::new(Arc::new(wal));
+
+        // when / then only collateral that can still be in supply counts
+        assert_eq!(held.held_native(pool_a).await.unwrap(), Nat::from(500u64));
+        assert_eq!(held.held_native(pool_b).await.unwrap(), Nat::from(70u64));
     }
 
     #[test]

@@ -577,13 +577,26 @@ transfer and the pool's sweep) instead of the wallet-mode transfer fees.
 The bot asks for seized collateral in cash. When the canister refuses that because the
 collateral pool has no free cash (`NoLiquidity`, or a partial fill below the minimum collateral),
 it calls once more and takes the collateral as supply in its own profile. That liquidation still
-closes the position. The receipt then waits in `WaitingCollateral`: every settlement pass checks
-the pool's free cash and, once there is enough, withdraws the collateral to the account that
-swaps it. Until then the liquidator holds the collateral and its price risk.
+closes the position, and the liquidator holds the collateral and its price risk until it is
+released. The receipt waits in `WaitingCollateral` while every settlement pass moves it on:
 
-A withdrawal is marked in the WAL before it is called. If the call gets no answer, or the bot
-stops in the middle of it, the row moves to `OperatorRequired` and alerts the operator channel
-instead of withdrawing a second time.
+1. Wait until the collateral pool shows enough free cash.
+2. Withdraw the collateral into a holding subaccount of the liquidator that is used for this
+   one liquidation.
+3. Read that subaccount on the ledger. Its balance proves the payout arrived.
+4. Send it to the account that swaps it, through a saved transfer, and enqueue the receipt.
+
+Each step is written to the WAL before the next one starts. Collateral that may still be in
+supply is subtracted from the capital available for other liquidations.
+
+If a withdrawal call gets no answer, the bot does not call again. It keeps reading the holding
+subaccount: a balance there means the withdrawal ran and the release continues. If nothing
+arrives it alerts the operator channel once. When the liquidator's supply still includes the
+collateral, the withdrawal did not run and can be retried:
+
+```bash
+liquidator supply retry-release --row <liquidation row id>
+```
 
 Requirements: the lending canister must expose `liquidate_from_supply`, and the liquidator's
 Liquidium profile must not borrow.
