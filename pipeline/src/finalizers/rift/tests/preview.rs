@@ -129,7 +129,7 @@ async fn a_cketh_leg_quotes_ethereum_with_headroom_under_the_expected_arrival() 
         assert_eq!(request.to.as_str(), "ethereum.usdt");
         // 0.05 ckETH, less the ledger fee and the approve reserve, less the
         // 0.0005 ETH withdrawal fee, less the same again as headroom.
-        assert_eq!(request.amount_in, "0.048996");
+        assert_eq!(request.amount_in, "0.048496");
         Ok(quote(&request.amount_in, "100"))
     });
     let bridge = minter_bridge("ckETH", 0.000_002, 0.000_5, 0.03);
@@ -143,7 +143,7 @@ async fn a_cketh_leg_quotes_ethereum_with_headroom_under_the_expected_arrival() 
     assert_eq!(preview.quote.legs[0].route_id, "ethereum.eth>ethereum.usdt");
     let saved: RiftState = serde_json::from_value(preview.initial_execution_state.state["rift"].clone()).unwrap();
     assert_eq!(saved.pay_chain, "ethereum");
-    assert_eq!(saved.arrival_headroom.to_f64(), 0.000_5);
+    assert_eq!(saved.arrival_headroom.to_f64(), 0.001);
 }
 
 /// Only a minter that takes its fee out of the amount asks for headroom.
@@ -158,8 +158,8 @@ fn only_routes_whose_minter_deducts_its_fee_ask_for_headroom() {
     let ckbtc = resolve_route("ckBTC", "ICP", "BTC").unwrap();
     let cketh = resolve_route("ckETH", "ICP", "ETH").unwrap();
     let ckusdc = resolve_route("ckUSDC", "ICP", "USDC").unwrap();
-    assert_eq!(order_headroom(ckbtc, &budget), 0.000_015);
-    assert_eq!(order_headroom(cketh, &budget), 0.000_015);
+    assert_eq!(order_headroom(ckbtc, &budget), 0.000_03);
+    assert_eq!(order_headroom(cketh, &budget), 0.000_03);
     assert_eq!(order_headroom(ckusdc, &budget), 0.0);
 }
 
@@ -269,7 +269,7 @@ async fn a_ckbtc_leg_quotes_bitcoin_with_headroom_under_the_expected_arrival() {
         assert_eq!(request.to.as_str(), "ethereum.usdt");
         // 0.01 ckBTC, less the ledger fee and the approve fee (10 satoshi each),
         // less the 1,500 satoshi withdrawal fee, less the same again as headroom.
-        assert_eq!(request.amount_in, "0.0099698");
+        assert_eq!(request.amount_in, "0.0099548");
         Ok(quote(&request.amount_in, "600"))
     });
     let bridge = minter_bridge("ckBTC", 0.000_000_1, 0.000_015, 0.000_5);
@@ -284,8 +284,8 @@ async fn a_ckbtc_leg_quotes_bitcoin_with_headroom_under_the_expected_arrival() {
     let rift_state = preview.initial_execution_state.state.get("rift").unwrap();
     assert_eq!(rift_state.get("pay_chain").and_then(|v| v.as_str()), Some("bitcoin"));
     let saved: RiftState = serde_json::from_value(rift_state.clone()).unwrap();
-    assert_eq!(saved.arrival_headroom.to_f64(), 0.000_015);
-    assert_eq!(saved.amount_in.to_f64(), 0.009_969_8);
+    assert_eq!(saved.arrival_headroom.to_f64(), 0.000_03);
+    assert_eq!(saved.amount_in.to_f64(), 0.009_954_8);
     assert_eq!(preview.quote.receive_amount, Nat::from(600_000_000u64));
 }
 

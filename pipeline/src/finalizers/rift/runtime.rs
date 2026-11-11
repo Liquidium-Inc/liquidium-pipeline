@@ -5,13 +5,14 @@ use liquidium_pipeline_connectors::backend::rift_backend::RiftVenueLists;
 
 use crate::{
     bridge::runtime::BridgeRuntime,
+    config::ConfigTrait,
     context::PipelineContext,
     finalizers::rift::finalizer::{RiftRefundAddresses, RiftVenueFinalizer},
     swappers::rift::RiftClient,
 };
 
 /// Rift delivers to the bridge EVM wallet. A refund goes to the main EVM
-/// wallet, or to the bridge Bitcoin wallet for a ckBTC leg.
+/// wallet, or mints ckBTC to the recovery account for a ckBTC leg.
 pub fn build_rift_finalizer(
     ctx: &PipelineContext,
     bridge: Arc<BridgeRuntime>,
@@ -26,7 +27,7 @@ pub fn build_rift_finalizer(
             config.liquidator_principal,
             RiftRefundAddresses {
                 ethereum: ctx.evm_address.clone(),
-                bitcoin: config.bridge_btc_address.clone(),
+                bitcoin_mint_account: config.get_recovery_account().to_string(),
             },
         )
         .with_token_registry(ctx.registry.clone())

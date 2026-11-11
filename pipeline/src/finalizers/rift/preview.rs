@@ -21,12 +21,15 @@ use crate::{
     utils::now_ts,
 };
 
+/// Fee estimates the order leaves under the expected arrival. Two cover a
+/// fee that triples; Rift swaps the overfund whole, so the room costs nothing.
+const HEADROOM_FEE_ESTIMATES: f64 = 2.0;
+
 /// What the order asks below the expected arrival. A minter that takes its
-/// fee out of the amount at execution time can deliver less than the
-/// estimate; one more fee estimate covers a rise, and Rift swaps the overfund whole.
+/// fee out of the amount at execution time can deliver less than the estimate.
 pub(super) fn order_headroom(out: &BridgeRouteSpec, budget: &BridgeFeeBudget) -> f64 {
     if out.route_kind.fee_comes_out_of_amount() {
-        budget.destination_fee_budget.max(0.0)
+        HEADROOM_FEE_ESTIMATES * budget.destination_fee_budget.max(0.0)
     } else {
         0.0
     }
