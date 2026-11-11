@@ -62,6 +62,10 @@ pub struct RiftOrderRecord {
     /// Where Rift pays out, as the order was created.
     #[serde(default)]
     pub to_address: Option<String>,
+    /// Where Rift refunds, as the order was created. Rows saved before the
+    /// field existed have none.
+    #[serde(default)]
+    pub refund_address: Option<String>,
 }
 
 fn ethereum() -> String {

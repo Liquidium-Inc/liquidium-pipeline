@@ -53,7 +53,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             return Ok(());
         };
 
-        let refund_address = state.pay_chain()?.refund_address(&self.refund_addresses).to_string();
+        let refund_address = self.refund_address(state).await?;
         let to_address = self.delivery_address(state).await?;
         let order = match self
             .backend
@@ -106,6 +106,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             delivered_at_ts: None,
             refund_tx: None,
             to_address: Some(to_address),
+            refund_address: Some(refund_address),
         });
         state.step = RiftStep::BridgeOut;
         Ok(())

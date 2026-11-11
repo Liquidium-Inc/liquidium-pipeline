@@ -97,6 +97,27 @@ async fn a_delivery_without_an_amount_is_ambiguous() {
     assert_eq!(state.step, RiftStep::Swap);
 }
 
+/// Rift may leave the address out of its answer; the one saved with the order is shown.
+#[tokio::test]
+async fn a_refund_rift_does_not_locate_parks_with_the_saved_refund_address() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_order_state().times(1).returning(|_| {
+        let mut answer = order_state(RiftOrderStatus::Refunded, None);
+        answer.refund_address = None;
+        Ok(answer)
+    });
+    let finalizer = finalizer(rift, MockBridgeBackend::new(), MockOutboundSender::new());
+    let mut state = waiting_state(60);
+    state.order.as_mut().unwrap().refund_address = Some("bc1qsavedrefund".to_string());
+
+    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
+
+    assert!(
+        matches!(error, VenueStepError::Ambiguous(ref m) if m.contains("bc1qsavedrefund")),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn a_refund_parks_with_the_refund_address() {
     let mut state = waiting_state(60);

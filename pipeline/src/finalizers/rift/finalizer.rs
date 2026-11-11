@@ -182,14 +182,32 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
     pub(super) async fn delivery_address(&self, state: &RiftState) -> Result<String, VenueStepError> {
         match state.receive_chain()? {
             RiftChain::Ethereum => Ok(self.bridge.sources.evm.clone()),
+            RiftChain::Bitcoin => self.minter_bitcoin_address(&state.final_destination).await,
+        }
+    }
+
+    /// The ckBTC minter's Bitcoin address for an ICP account. Bitcoin paid to
+    /// it mints ckBTC into that account.
+    async fn minter_bitcoin_address(&self, account: &str) -> Result<String, VenueStepError> {
+        let chain = RiftChain::Bitcoin.catalog_chain();
+        let mint = in_route("BTC", chain, "ckBTC").ok_or("bridge route not found for BTC@BTC -> ckBTC")?;
+        let destination = bridge_destination(mint.destination_kind, account)?;
+        self.bridge
+            .backend
+            .deposit_address(mint.source_asset, mint.source_chain, &destination)
+            .await
+            .map_err(VenueStepError::Other)
+    }
+
+    /// Where a refunded order pays back, on the pay asset's chain. A Bitcoin
+    /// refund goes to the ckBTC minter's address for the refund account, so
+    /// it comes back as ckBTC.
+    pub(super) async fn refund_address(&self, state: &RiftState) -> Result<String, VenueStepError> {
+        match state.pay_chain()? {
+            RiftChain::Ethereum => Ok(self.refund_addresses.ethereum.clone()),
             RiftChain::Bitcoin => {
-                let back = leg_routes(&state.size_in.token, &state.final_asset)?.1;
-                let destination = bridge_destination(back.destination_kind, &state.final_destination)?;
-                self.bridge
-                    .backend
-                    .deposit_address(back.source_asset, back.source_chain, &destination)
+                self.minter_bitcoin_address(&self.refund_addresses.bitcoin_mint_account)
                     .await
-                    .map_err(VenueStepError::Other)
             }
         }
     }

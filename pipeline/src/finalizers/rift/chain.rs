@@ -8,8 +8,9 @@ use crate::finalizers::multi_venue::VenueStepError;
 pub struct RiftRefundAddresses {
     /// The main EVM wallet.
     pub ethereum: String,
-    /// The bridge Bitcoin wallet, derived from the mnemonic.
-    pub bitcoin: String,
+    /// The ICP account a Bitcoin refund mints to as ckBTC: the order names
+    /// the ckBTC minter's deposit address for it, so no Bitcoin key is needed.
+    pub bitcoin_mint_account: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,13 +34,6 @@ impl RiftChain {
             "ethereum" => Ok(Self::Ethereum),
             "bitcoin" => Ok(Self::Bitcoin),
             other => Err(VenueStepError::Other(format!("unknown Rift chain `{other}`"))),
-        }
-    }
-
-    pub(super) fn refund_address(self, addresses: &RiftRefundAddresses) -> &str {
-        match self {
-            Self::Ethereum => &addresses.ethereum,
-            Self::Bitcoin => &addresses.bitcoin,
         }
     }
 

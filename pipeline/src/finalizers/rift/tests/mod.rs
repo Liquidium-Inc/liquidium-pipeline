@@ -32,7 +32,9 @@ mod preview;
 mod wait;
 
 pub(super) const MAIN_WALLET: &str = "0x1111111111111111111111111111111111111111";
-pub(super) const BRIDGE_BTC_WALLET: &str = "bc1p57z9rf82tcpcgcr373ya43lj4x66x2xnumkk995usg6c5nuus6lqv63wcr";
+/// The ICP account a Bitcoin refund mints to; its minter address is `REFUND_BTC_ADDRESS`.
+pub(super) const REFUND_MINT_ACCOUNT: &str = "aaaaa-aa";
+pub(super) const REFUND_BTC_ADDRESS: &str = "bc1qrefundminter";
 pub(super) const DEPOSIT_ADDRESS: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
 
 pub(super) fn ckusdc() -> ChainToken {
@@ -235,7 +237,7 @@ pub(super) fn finalizer_with_runtime(
         Principal::anonymous(),
         RiftRefundAddresses {
             ethereum: MAIN_WALLET.to_string(),
-            bitcoin: BRIDGE_BTC_WALLET.to_string(),
+            bitcoin_mint_account: REFUND_MINT_ACCOUNT.to_string(),
         },
     )
     .with_token_registry(registry())
@@ -273,6 +275,7 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
             delivered_at_ts: None,
             refund_tx: None,
             to_address: None,
+            refund_address: None,
         }),
         funding: None,
         funding_txid: None,

@@ -15,7 +15,6 @@ const DELIVERY_TIMEOUT_SECS: i64 = 6 * 60 * 60;
 impl<R: RiftBackend> RiftVenueFinalizer<R> {
     pub(super) async fn wait(&self, state: &mut RiftState) -> Result<(), VenueStepError> {
         let chain = state.pay_chain()?;
-        let refund_address = chain.refund_address(&self.refund_addresses).to_string();
         let liq_id = state.liq_id.clone();
         let order = state.order.as_mut().ok_or("missing Rift order while waiting")?;
         let answer = self.backend.order_state(&order.id).await?;
@@ -85,7 +84,11 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             RiftOrderStatus::Refunded => Err(VenueStepError::Ambiguous(format!(
                 "Rift order {} was refunded; the funds are at the refund address {}; the refund transaction ends the leg",
                 order.id,
-                answer.refund_address.as_deref().unwrap_or(&refund_address)
+                answer
+                    .refund_address
+                    .as_deref()
+                    .or(order.refund_address.as_deref())
+                    .unwrap_or("the order names")
             ))),
             RiftOrderStatus::Underfunded | RiftOrderStatus::Frozen | RiftOrderStatus::Expired => {
                 Err(VenueStepError::Ambiguous(format!(

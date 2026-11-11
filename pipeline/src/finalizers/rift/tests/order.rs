@@ -125,15 +125,28 @@ async fn a_throttled_rift_is_unreachable_too() {
     assert!(matches!(error, VenueStepError::Unreachable(_)), "{error}");
 }
 
-/// Rift refunds on the pay asset's chain, so a ckBTC order names the Bitcoin wallet.
+/// Rift refunds on the pay asset's chain. A ckBTC order names the minter's
+/// address for the refund account, so a refund mints ckBTC and needs no Bitcoin key.
 #[tokio::test]
-async fn a_bitcoin_order_refunds_to_the_bitcoin_wallet() {
+async fn a_bitcoin_order_refunds_to_the_minter_address_of_the_refund_account() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::BridgeDestination;
     let mut rift = MockRiftBackend::new();
     rift.expect_create_order().times(1).returning(|_, _, refund_address| {
-        assert_eq!(refund_address.as_deref(), Some(BRIDGE_BTC_WALLET));
+        assert_eq!(refund_address.as_deref(), Some(REFUND_BTC_ADDRESS));
         Ok(order("0.0006"))
     });
-    let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
+    let mut bridge = free_bridge();
+    bridge
+        .expect_deposit_address()
+        .times(1)
+        .returning(|asset, chain, destination| {
+            assert_eq!((asset, chain), ("BTC", "BTC"));
+            assert!(
+                matches!(destination, BridgeDestination::IcpAccount(account) if account.owner == Principal::management_canister())
+            );
+            Ok(REFUND_BTC_ADDRESS.to_string())
+        });
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
     let mut state = state_at(RiftStep::Order);
     state.order = None;
     state.quote_id = Some("quote-1".to_string());
@@ -145,6 +158,11 @@ async fn a_bitcoin_order_refunds_to_the_bitcoin_wallet() {
     finalizer.advance_current_step(&mut state).await.unwrap();
 
     assert_eq!(state.step, RiftStep::BridgeOut);
+    assert_eq!(
+        state.order.unwrap().refund_address.as_deref(),
+        Some(REFUND_BTC_ADDRESS),
+        "the order record keeps where a refund goes"
+    );
 }
 
 /// A Bitcoin payout goes to the ckBTC minter's address for the final account,
