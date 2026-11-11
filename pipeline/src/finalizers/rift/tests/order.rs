@@ -28,6 +28,11 @@ async fn the_first_cycle_saves_the_quote_and_the_second_creates_the_order() {
 
     finalizer.advance_current_step(&mut state).await.unwrap();
     assert_eq!(state.quote_id.as_deref(), Some("quote-1"));
+    assert_eq!(
+        state.quote_venues,
+        ["uniswap"],
+        "the route's venues are kept with the quote"
+    );
     assert!(state.send_saved, "the quote id is written before the order is created");
     assert!(state.order.is_none());
     assert_eq!(state.step, RiftStep::Order);

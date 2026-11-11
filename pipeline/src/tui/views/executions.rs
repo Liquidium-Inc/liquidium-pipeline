@@ -565,6 +565,14 @@ fn append_rift_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
         let id = text(order.get("id")).unwrap_or_default();
         let status = text(order.get("status")).unwrap_or_else(|| "created".to_string());
         lines.push(Line::from(format!("   Rift order: {id} ({status})")));
+        if let Some(venues) = rift
+            .get("quote_venues")
+            .and_then(Value::as_array)
+            .filter(|venues| !venues.is_empty())
+        {
+            let venues: Vec<&str> = venues.iter().filter_map(Value::as_str).collect();
+            lines.push(Line::from(format!("   Rift venues: {}", venues.join(" > "))));
+        }
         if let Some(to) = text(order.get("to_address")) {
             lines.push(Line::from(format!("   Rift pays to: {to}")));
         }
@@ -955,8 +963,8 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary, icpswap_account_principal,
-        profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
+        WalProfitSnapshot, append_meta_summary, append_rift_leg_transactions, append_venue_leg_summary,
+        icpswap_account_principal, profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
     };
     use crate::{
         persistance::{ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState, VenueLegStatus},
@@ -1310,5 +1318,25 @@ mod tests {
         assert!(text.iter().any(|line| line.starts_with("State preview: ")));
         assert!(!text.iter().any(|line| line.starts_with("Bridge deposit txid: ")));
         assert!(!text.iter().any(|line| line.starts_with("Bridge withdraw txid: ")));
+    }
+
+    /// A Rift leg shows the venues of the quote its order came from.
+    #[test]
+    fn a_rift_leg_shows_its_quote_venues() {
+        let execution = VenueExecutionState {
+            venue: "rift".into(),
+            state: serde_json::json!({
+                "rift": {
+                    "quote_venues": ["relay"],
+                    "order": { "id": "order-1", "status": "executing" }
+                }
+            }),
+        };
+        let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+
+        append_rift_leg_transactions(&mut lines, &execution);
+
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(text.iter().any(|line| line == "   Rift venues: relay"), "{text:?}");
     }
 }

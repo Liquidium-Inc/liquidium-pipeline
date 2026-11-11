@@ -98,11 +98,13 @@ pub(super) fn registry() -> Arc<TokenRegistry> {
 fn an_older_saved_leg_receives_on_ethereum() {
     let mut saved = serde_json::to_value(state_at(RiftStep::Order)).unwrap();
     saved.as_object_mut().unwrap().remove("receive_chain");
+    saved.as_object_mut().unwrap().remove("quote_venues");
     saved["order"].as_object_mut().unwrap().remove("to_address");
 
     let state: RiftState = serde_json::from_value(saved).unwrap();
 
     assert_eq!(state.receive_chain(), Ok(RiftChain::Ethereum));
+    assert!(state.quote_venues.is_empty());
     assert_eq!(state.order.unwrap().to_address, None);
 }
 
@@ -261,6 +263,7 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
         arrival_headroom: ChainTokenAmount::from_raw(ckusdc(), Nat::from(0u8)),
         min_amount_out: ChainTokenAmount::from_formatted(ckusdt(), 99.0),
         quote_id: None,
+        quote_venues: Vec::new(),
         order: Some(RiftOrderRecord {
             id: "order-1".to_string(),
             quote_id: "quote-1".to_string(),
