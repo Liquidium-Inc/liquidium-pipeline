@@ -5,6 +5,7 @@ use std::{collections::HashSet, sync::Mutex};
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::rift_backend::RiftBackend;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use super::{
     finalizer::{RiftVenueFinalizer, leg_routes},
@@ -164,11 +165,16 @@ impl<R: RiftBackend + 'static> VenueLeg for RiftVenueFinalizer<R> {
 
     async fn preview_leg(
         &self,
-        _context: &VenuePlanningContext,
+        context: &VenuePlanningContext,
         request: &SwapRequest,
     ) -> Result<LegPreview<RiftState>, String> {
         let execution_id = crate::utils::new_venue_execution_id(RIFT_VENUE_ID);
-        let preview = self.preview_swap_request(&execution_id, request).await?;
+        // The preview's log lines name only the draft leg id; the span adds the row.
+        let span = tracing::info_span!("preview", row = %context.liquidation_id);
+        let preview = self
+            .preview_swap_request(&execution_id, request)
+            .instrument(span)
+            .await?;
         Ok(LegPreview {
             state: preview.state,
             quote: preview.quote,
