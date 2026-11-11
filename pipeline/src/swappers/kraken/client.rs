@@ -21,6 +21,17 @@ use super::api::{
 use super::cache::{MetadataCache, PairsByMarket};
 use super::rest::KrakenRestApi;
 
+/// What Kraken lists for one market: below these an order is refused.
+#[derive(Debug, Clone)]
+pub struct KrakenPairLimits {
+    pub api_name: String,
+    /// In base units.
+    pub order_min: Decimal,
+    /// In quote units.
+    pub cost_min: Decimal,
+    pub online: bool,
+}
+
 pub struct KrakenClient {
     pub(super) api: Arc<dyn KrakenApi>,
     cache: MetadataCache,
@@ -55,6 +66,28 @@ impl KrakenClient {
     /// The allowed markets as `BASE_QUOTE`, with Kraken's own spellings resolved.
     pub fn allowed_pairs(&self) -> &[String] {
         &self.allowed_pairs
+    }
+
+    /// Each allowed market with the limits Kraken lists for it, or `None` when
+    /// Kraken lists no such pair.
+    pub async fn pair_limits(&self) -> Result<Vec<(String, Option<KrakenPairLimits>)>, String> {
+        let by_market = self.pairs_by_market().await?;
+        Ok(self
+            .allowed_pairs
+            .iter()
+            .map(|market| {
+                let limits = by_market
+                    .get(market)
+                    .and_then(|pairs| pairs.first())
+                    .map(|pair| KrakenPairLimits {
+                        api_name: pair.api_name.clone(),
+                        order_min: pair.order_min,
+                        cost_min: pair.cost_min,
+                        online: pair.online,
+                    });
+                (market.clone(), limits)
+            })
+            .collect())
     }
 
     /// Kraken's pairs for the allowed markets only, so a lookup copies no

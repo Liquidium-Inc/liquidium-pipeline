@@ -2,6 +2,7 @@ pub mod account;
 pub mod bridge_sol;
 pub(crate) mod execution_worker;
 pub mod funds;
+pub mod kraken_check;
 pub mod liquidation_loop;
 pub mod mexc_order_check;
 pub mod mexc_withdraw_check;

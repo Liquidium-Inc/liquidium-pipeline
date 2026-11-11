@@ -199,6 +199,10 @@ enum Commands {
         confirm: bool,
     },
 
+    // Reads the Kraken account: balances, markets, deposit addresses and
+    // verified withdrawal addresses for each route. It moves nothing.
+    KrakenCheck,
+
     // Runs one Rift leg from the trader account without a liquidation: the
     // preview, then every step until it completes or parks. Without --confirm
     // it only prints the preview. The leg is saved to a file for --resume.
@@ -485,6 +489,13 @@ async fn main() -> ExitCode {
         } => {
             if let Err(e) = commands::mexc_withdraw_check::check(&asset, &network, &address, amount, confirm).await {
                 eprintln!("MEXC withdraw check failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::KrakenCheck => {
+            if let Err(e) = commands::kraken_check::check().await {
+                eprintln!("Kraken check failed: {}", e);
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS

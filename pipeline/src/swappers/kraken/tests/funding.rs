@@ -132,12 +132,34 @@ fn deposit_methods_resolve_without_a_reported_network() {
         "USDC - Ethereum (Unified)"
     );
 
-    // A chain this pipeline does not translate matches by name.
     let icp = vec![method("Internet Computer Protocol (ICP)", None)];
     assert_eq!(
         unique_method(icp, "ICP", "ICP", "deposit").unwrap().method,
         "Internet Computer Protocol (ICP)"
     );
+
+    let sol = vec![method("Solana", None)];
+    assert_eq!(unique_method(sol, "SOL", "SOL", "deposit").unwrap().method, "Solana");
+}
+
+/// Kraken spells these networks out (live, 2026-11-11): "ICP" is only in the
+/// method name, so a search for it in the network once found no ICP withdrawal.
+#[test]
+fn icp_and_solana_withdrawals_resolve_by_their_spelled_out_networks() {
+    let icp = vec![method(
+        "Internet Computer Protocol (ICP)",
+        Some("Internet Computer Protocol"),
+    )];
+    assert_eq!(
+        unique_method(icp, "ICP", "ICP", "withdrawal").unwrap().method,
+        "Internet Computer Protocol (ICP)"
+    );
+
+    let sol = vec![
+        method("Solana", Some("Solana")),
+        method("SOL - Ethereum", Some("Ethereum")),
+    ];
+    assert_eq!(unique_method(sol, "SOL", "SOL", "withdrawal").unwrap().method, "Solana");
 }
 
 /// Lightning and wrapped BTC on Ethereum live under BTC too, and neither is
