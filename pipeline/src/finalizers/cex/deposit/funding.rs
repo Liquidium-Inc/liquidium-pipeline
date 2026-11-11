@@ -1,6 +1,9 @@
 //! The deposit funding transfer: measuring the exchange balance, sizing the
 //! transfer with its fee reserve, the saved send, and the approval bumps.
 use super::*;
+use liquidium_pipeline_connectors::backend::cex_backend::FundingRouteError;
+
+use crate::finalizers::bridge_legs::BridgeLegError;
 use crate::finalizers::bridge_legs::fee_adjusted_transfer;
 
 impl<C> CexVenueFinalizer<C>
@@ -121,12 +124,27 @@ where
             planned_network,
             &addr.address,
         )?;
+        self.ensure_deposit_credited(state, transfer_amount.to_f64()).await?;
         state.trade.trade_next_amount_in = Some(transfer_amount.to_f64());
         Ok(OutboundIntent {
             token: state.deposit.deposit_asset.clone(),
             to: destination,
             amount_native: transfer_value,
         })
+    }
+
+    /// Asks the exchange again, just before the first send, whether it credits
+    /// the deposit at its fresh size. A deposit under its minimum is never credited.
+    pub(in crate::finalizers::cex) async fn ensure_deposit_credited(
+        &self,
+        state: &CexState,
+        arrival: f64,
+    ) -> Result<(), CexBackendError> {
+        let route = self.funding_route(state, arrival)?;
+        self.backend
+            .check_funding_route(&route)
+            .await
+            .map_err(|error| credit_refusal(error).into())
     }
 
     /// Whether a direct deposit of this asset sends approval bumps: only a
@@ -217,5 +235,16 @@ where
             approve_bumps.insert(liq_id.to_string(), APPROVE_BUMP_MAX_COUNT);
         }
         approved_count
+    }
+}
+
+/// Why the exchange will not credit a deposit. Under the minimum, the leg ends
+/// with its funds unsent; any other refusal retries.
+pub(in crate::finalizers::cex) fn credit_refusal(error: FundingRouteError) -> BridgeLegError {
+    match error {
+        FundingRouteError::BelowMinimum(reason) => BridgeLegError::BelowMinimum(reason),
+        FundingRouteError::Unavailable(reason) | FundingRouteError::Unsupported(reason) => {
+            BridgeLegError::Other(reason)
+        }
     }
 }

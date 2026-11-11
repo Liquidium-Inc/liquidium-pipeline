@@ -39,6 +39,12 @@ use crate::{
 #[async_trait]
 pub trait BridgeDestinationProvider: Send + Sync {
     async fn destination(&self) -> Result<String, String>;
+
+    /// Refuses, before the funding transfer, an arrival the destination would
+    /// not credit. Rift takes any amount its order names.
+    async fn accepts_arrival(&self, _expected_amount: f64) -> Result<(), BridgeLegError> {
+        Ok(())
+    }
 }
 
 /// The caller's record of the transfer that funds the bridge wallet. An
@@ -129,6 +135,7 @@ async fn prepare_funding(
         submit_amount,
         expected_amount,
     } = bridged_deposit_arrival(bridge, route, inputs.asset, inputs.size_in).await?;
+    inputs.destination.accepts_arrival(expected_amount).await?;
 
     if let Some(source_fee_reserve) = source_fee_reserve {
         let source_transfer_amount = ChainTokenAmount::from_raw(inputs.asset.clone(), transfer_value.clone());

@@ -1,8 +1,12 @@
 //! A bridged deposit on the exchange side: the exchange balance baseline and the
 //! deposit address around the shared leg out, and its outcome mapped onto the steps.
 use super::*;
+use super::funding::credit_refusal;
+use liquidium_pipeline_connectors::backend::cex_backend::FundingRoute;
+
 use crate::finalizers::bridge_legs::{
-    BridgeDestinationProvider, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out, out_route,
+    BridgeDestinationProvider, BridgeLegError, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out,
+    out_route,
 };
 
 /// The exchange deposit address, looked up when the provider call is saved.
@@ -10,6 +14,8 @@ struct ExchangeDepositAddress<'a, C: CexBackend> {
     backend: &'a C,
     asset: &'a str,
     network: &'a str,
+    /// The route the exchange checks; its deposit amount is set per arrival.
+    route: FundingRoute,
 }
 
 #[async_trait::async_trait]
@@ -20,6 +26,16 @@ impl<C: CexBackend> BridgeDestinationProvider for ExchangeDepositAddress<'_, C> 
             .get_deposit_address(self.asset, self.network)
             .await?
             .address)
+    }
+
+    /// The exchange's word, at the fresh size, before any funds move. A deposit
+    /// under its minimum is never credited.
+    async fn accepts_arrival(&self, expected_amount: f64) -> Result<(), BridgeLegError> {
+        let route = FundingRoute {
+            deposit_amount: expected_amount,
+            ..self.route.clone()
+        };
+        self.backend.check_funding_route(&route).await.map_err(credit_refusal)
     }
 }
 
@@ -53,6 +69,7 @@ where
             backend: self.backend.as_ref(),
             asset: planned_asset,
             network: planned_network,
+            route: self.funding_route(state, 0.0)?,
         };
         // While the funding transfer is saved or in flight the step stays at
         // `Deposit`: the funds are still in the trader account, and a restart

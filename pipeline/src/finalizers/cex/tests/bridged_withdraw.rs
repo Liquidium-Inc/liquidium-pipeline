@@ -293,6 +293,7 @@ async fn every_wait_before_the_return_bridge_ends_at_the_delivery_bound() {
 #[tokio::test]
 async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
 

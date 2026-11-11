@@ -40,6 +40,7 @@ async fn mexc_prepare_maps_cketh_debt_to_eth_withdraw_bridge_plan() {
 #[tokio::test]
 async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     let mut backend = MockCexBackend::new();
+    backend.expect_check_funding_route().returning(|_| Ok(()));
     let mut transfers = MockTransferActions::new();
 
     backend.expect_get_balance().returning(|_symbol| Ok(10.0));
@@ -163,6 +164,7 @@ fn mexc_bridge_planner_translates_ckusdc_symbol_both_directions() {
 #[tokio::test]
 async fn mexc_deposit_bridge_submit_resume_and_complete() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
 
