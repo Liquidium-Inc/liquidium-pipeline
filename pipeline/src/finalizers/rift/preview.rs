@@ -189,6 +189,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             arrival_headroom,
             min_amount_out: conservative_receive.clone(),
             quote_id: None,
+            quote_venues: Vec::new(),
             order: None,
             funding: None,
             funding_txid: None,

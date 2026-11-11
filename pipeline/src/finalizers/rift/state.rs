@@ -104,6 +104,10 @@ pub struct RiftState {
     /// returns the same order for the same quote id, so a repeat is safe.
     #[serde(default)]
     pub quote_id: Option<String>,
+    /// The Rift venues on that quote's route, in order. The order does not
+    /// report them, and a venue sets how long the leg takes.
+    #[serde(default)]
+    pub quote_venues: Vec<String>,
     #[serde(default)]
     pub order: Option<RiftOrderRecord>,
     /// The transfer that funds the bridge wallet, saved before it is sent.
@@ -205,8 +209,14 @@ impl RiftState {
     /// Nothing funded it, so it expires at Rift on its own.
     pub fn reorder(&mut self) {
         self.order = None;
-        self.quote_id = None;
+        self.drop_quote();
         self.funding = None;
         self.step = RiftStep::Order;
+    }
+
+    /// Forgets the saved quote, so the next cycle takes a fresh one.
+    pub fn drop_quote(&mut self) {
+        self.quote_id = None;
+        self.quote_venues.clear();
     }
 }

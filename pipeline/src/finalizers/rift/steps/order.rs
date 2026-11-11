@@ -49,6 +49,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 quote.venues
             );
             state.quote_id = Some(quote.id);
+            state.quote_venues = quote.venues;
             state.send_saved = true;
             return Ok(());
         };
@@ -63,7 +64,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             Ok(order) => order,
             // Nothing was created. The next cycle takes a new quote.
             Err(RiftError::QuoteExpired(reason)) => {
-                state.quote_id = None;
+                state.drop_quote();
                 return Err(VenueStepError::Other(format!(
                     "Rift quote {quote_id} expired before the order; a new quote follows: {reason}"
                 )));
