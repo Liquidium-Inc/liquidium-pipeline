@@ -60,6 +60,7 @@ struct PlannerAdapter {
     responder: Box<PreviewResponder>,
     validation_error: Option<String>,
     preview_forbidden: bool,
+    minimum_pay: Option<u64>,
 }
 
 #[async_trait]
@@ -70,6 +71,17 @@ impl MultiVenueAdapter for PlannerAdapter {
 
     fn validate_configuration(&self) -> Result<(), String> {
         self.validation_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn check_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
+        let pay = request.pay_amount.value.0.to_u64().expect("test pay amount fits u64");
+        match self.minimum_pay {
+            Some(minimum) if pay < minimum => {
+                self.calls.lock().expect("calls lock").push(pay);
+                Err(VenueAmountError::BelowMinimum(format!("{pay} is below {minimum}")))
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn preview(
@@ -363,6 +375,7 @@ where
         responder: Box::new(responder),
         validation_error: None,
         preview_forbidden: false,
+        minimum_pay: None,
     }
 }
 
@@ -513,6 +526,7 @@ fn registry_rejects_an_adapter_with_missing_runtime_configuration() {
         responder: Box::new(|_| Err("not used".to_string())),
         validation_error: Some("token registry is required".to_string()),
         preview_forbidden: true,
+        minimum_pay: None,
     };
 
     let error = VenueRegistry::new(vec![Arc::new(adapter)])
@@ -1705,6 +1719,7 @@ async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
         responder: Box::new(|_| Err("not used".to_string())),
         validation_error: None,
         preview_forbidden: true,
+        minimum_pay: None,
     };
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();
@@ -1734,6 +1749,7 @@ async fn tiny_non_native_collateral_is_rejected_before_mexc_preview() {
         responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
         validation_error: None,
         preview_forbidden: true,
+        minimum_pay: None,
     };
     let planner = IcpswapFirstPlanner::new(vec![Arc::new(mexc)], config(8.0)).expect("MEXC-only planner");
     let mut input = input_with_pay_token(non_native_icp_token());
@@ -1762,6 +1778,7 @@ async fn tiny_collateral_does_not_preview_mexc_when_icpswap_is_unavailable() {
         responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
         validation_error: None,
         preview_forbidden: true,
+        minimum_pay: None,
     };
     let planner = planner(icpswap, mexc, config(8.0));
     let mut input = input_with_pay_token(native_icp());
@@ -1791,6 +1808,7 @@ async fn native_icp_to_ckusdt_is_mexc_only_and_never_previews_icpswap() {
         responder: Box::new(|_| Err("not used".to_string())),
         validation_error: None,
         preview_forbidden: true,
+        minimum_pay: None,
     };
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();
@@ -2685,6 +2703,78 @@ async fn below_minimum_kraken_remainder_discards_partial_mexc_and_uses_full_krak
     assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
     assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
     assert_eq!(kraken_calls.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
+}
+
+/// MEXC with a thin book above 60% of the amount, and Rift with a minimum.
+fn thin_mexc_then_rift(rift_minimum: u64, rift_calls: Arc<Mutex<Vec<u64>>>) -> IcpswapFirstPlanner {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay <= 60_000_000 { 200.0 } else { 392.0 };
+        Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+    });
+    let rift = PlannerAdapter {
+        minimum_pay: Some(rift_minimum),
+        ..mock_adapter(RIFT_VENUE_ID, rift_calls, |request| {
+            Ok(proportional_preview(request, RIFT_VENUE_ID, 0.0, 2))
+        })
+    };
+    IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(rift)], config(0.0))
+        .expect("valid planner")
+}
+
+/// Live on 2026-11-11 (row 1758): MEXC's partial left Rift under the ckBTC
+/// minter's minimum, so no plan fit. Rift now takes the whole amount.
+#[tokio::test]
+async fn a_remainder_below_the_next_venue_minimum_gives_that_venue_the_whole_amount() {
+    let rift_calls = Arc::new(Mutex::new(Vec::new()));
+    let state = thin_mexc_then_rift(50_000_000, rift_calls.clone())
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect("Rift takes the whole amount");
+
+    let legs: Vec<(&str, u64)> = state
+        .legs
+        .iter()
+        .map(|leg| {
+            (
+                leg.venue_id.as_str(),
+                leg.request.pay_amount.value.0.to_u64().expect("fits"),
+            )
+        })
+        .collect();
+    assert_eq!(legs, vec![(RIFT_VENUE_ID, TOTAL_PAY)]);
+    let rift_calls = rift_calls.lock().expect("calls lock");
+    assert_eq!(
+        rift_calls.len(),
+        2,
+        "the remainder, then the whole amount: {rift_calls:?}"
+    );
+    assert!(rift_calls[0] < 50_000_000, "{rift_calls:?}");
+    assert_eq!(rift_calls[1], TOTAL_PAY);
+}
+
+/// When the venue is under its minimum for the whole amount too, the partial
+/// stays and the plan fails as before, retryable.
+#[tokio::test]
+async fn a_venue_below_its_minimum_for_the_whole_amount_keeps_the_refusal() {
+    let rift_calls = Arc::new(Mutex::new(Vec::new()));
+    let error = thin_mexc_then_rift(TOTAL_PAY + 1, rift_calls.clone())
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect_err("no venue takes the remainder");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)), "{error}");
+    assert!(error.to_string().contains("RIFT amount below minimum"), "{error}");
+    let rift_calls = rift_calls.lock().expect("calls lock");
+    assert_eq!(
+        rift_calls.len(),
+        2,
+        "the remainder, then the whole amount: {rift_calls:?}"
+    );
+    assert_eq!(rift_calls[1], TOTAL_PAY);
 }
 
 #[tokio::test]

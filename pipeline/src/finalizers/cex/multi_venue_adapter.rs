@@ -7,6 +7,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::resolve_route;
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use super::finalizer::CexVenueFinalizer;
 use crate::finalizers::bridge_legs::check_bridged_minimum;
@@ -271,11 +272,16 @@ where
     /// The amount-scoped CEX preview; route preparation stays in the CEX machine.
     async fn preview_leg(
         &self,
-        _context: &VenuePlanningContext,
+        context: &VenuePlanningContext,
         request: &SwapRequest,
     ) -> Result<LegPreview<CexState>, String> {
         let execution_id = crate::utils::new_venue_execution_id(self.profile.venue_id());
-        let preview = self.preview_swap_request(&execution_id, request).await?;
+        // The preview's log lines name only the draft leg id; the span adds the row.
+        let span = tracing::info_span!("preview", row = %context.liquidation_id);
+        let preview = self
+            .preview_swap_request(&execution_id, request)
+            .instrument(span)
+            .await?;
         Ok(LegPreview {
             state: preview.state,
             quote: preview.quote,

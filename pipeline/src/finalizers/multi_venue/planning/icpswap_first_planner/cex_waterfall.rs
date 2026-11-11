@@ -5,7 +5,7 @@ use std::cmp::max;
 
 use candid::Nat;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{
     BPS_DENOMINATOR, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError, KRAKEN_VENUE_ID,
@@ -65,31 +65,17 @@ impl IcpswapFirstPlanner {
         let mut legs = Vec::new();
         let mut remainder = pay_value;
         let mut refusals = Vec::new();
+        // The pay amount of a thin-book partial that is still the last leg. The
+        // $ floor that kept it ignores each later venue's own minimum.
+        let mut open_partial: Option<Nat> = None;
         for (index, venue_id) in self.overflow_venue_ids.iter().enumerate() {
             let is_last = index + 1 == self.overflow_venue_ids.len();
-            let slice = match self.venue_order_cap(input, venue_id) {
-                Some(cap) if cap < remainder => {
-                    if is_last {
-                        refusals.push(Refusal {
-                            reason: format!(
-                                "{} amount exceeds its order cap of ${:.0}",
-                                venue_id.to_uppercase(),
-                                self.config.rift_max_order_usd
-                            ),
-                            permanent: false,
-                        });
-                        continue;
-                    }
-                    let left = remainder.clone() - cap.clone();
-                    let left_amount = ChainTokenAmount::from_raw(input.total_pay.token.clone(), left);
-                    // A dust leftover is never a leg, so the cap gives way by that much.
-                    if input.meets_cex_minimum(&left_amount, self.config.cex_min_exec_usd) {
-                        cap
-                    } else {
-                        remainder.clone()
-                    }
+            let slice = match self.venue_slice(input, venue_id, is_last, &remainder) {
+                Ok(slice) => slice,
+                Err(refusal) => {
+                    refusals.push(refusal);
+                    continue;
                 }
-                _ => remainder.clone(),
             };
             let capped = slice != remainder;
             let refusal = match self.preview_cex(input, venue_id, slice.clone()).await? {
@@ -99,6 +85,7 @@ impl IcpswapFirstPlanner {
                         return Ok(legs);
                     }
                     remainder -= slice;
+                    open_partial = None;
                     continue;
                 }
                 VenuePreviewOutcome::Quoted(preview) => {
@@ -116,6 +103,7 @@ impl IcpswapFirstPlanner {
                         // A dust remainder is never a leg, so the next exchange takes it all.
                         if input.meets_cex_minimum(&left_amount, self.config.cex_min_exec_usd) {
                             remainder = left;
+                            open_partial = Some(partial.request.pay_amount.value.clone());
                             legs.push(partial);
                         }
                     }
@@ -124,10 +112,42 @@ impl IcpswapFirstPlanner {
                         permanent: false,
                     }
                 }
-                VenuePreviewOutcome::BelowMinimum(reason) => Refusal {
-                    reason: format!("{} amount below minimum ({reason})", venue_id.to_uppercase()),
-                    permanent: true,
-                },
+                VenuePreviewOutcome::BelowMinimum(reason) => {
+                    // The partial gives way when this venue can take the whole
+                    // amount; otherwise it stays for a later venue.
+                    if let Some(partial_value) = open_partial.clone() {
+                        let whole = remainder.clone() + partial_value.clone();
+                        if let Ok(whole_slice) = self.venue_slice(input, venue_id, is_last, &whole)
+                            && let VenuePreviewOutcome::Quoted(preview) =
+                                self.preview_cex(input, venue_id, whole_slice.clone()).await?
+                            && (!ceiling_applies || self.is_safe_cex(&preview))
+                        {
+                            let given_back = legs.pop();
+                            debug_assert!(
+                                given_back
+                                    .as_ref()
+                                    .is_some_and(|leg| leg.request.pay_amount.value == partial_value),
+                                "the open partial is the last leg"
+                            );
+                            info!(
+                                "[multi-venue] liq_id={} {venue_id} takes the whole amount and the {} partial is dropped: the remainder was below the {venue_id} minimum ({reason})",
+                                input.liquidation_id,
+                                given_back.map_or_else(|| "-".to_string(), |leg| leg.venue_id),
+                            );
+                            legs.push(preview);
+                            open_partial = None;
+                            if whole_slice == whole {
+                                return Ok(legs);
+                            }
+                            remainder = whole - whole_slice;
+                            continue;
+                        }
+                    }
+                    Refusal {
+                        reason: format!("{} amount below minimum ({reason})", venue_id.to_uppercase()),
+                        permanent: true,
+                    }
+                }
                 VenuePreviewOutcome::Unavailable(error) => Refusal {
                     reason: format!("{} unavailable ({error})", venue_id.to_uppercase()),
                     permanent: false,
@@ -164,6 +184,40 @@ impl IcpswapFirstPlanner {
             return None;
         }
         Some(ChainTokenAmount::from_formatted(input.total_pay.token.clone(), cap_usd / price).value)
+    }
+
+    /// The amount one venue is asked for: all of `remainder`, or its order cap.
+    /// The last venue cannot pass an excess on, so it refuses instead.
+    fn venue_slice(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        venue_id: &str,
+        is_last: bool,
+        remainder: &Nat,
+    ) -> Result<Nat, Refusal> {
+        match self.venue_order_cap(input, venue_id) {
+            Some(cap) if cap < *remainder => {
+                if is_last {
+                    return Err(Refusal {
+                        reason: format!(
+                            "{} amount exceeds its order cap of ${:.0}",
+                            venue_id.to_uppercase(),
+                            self.config.rift_max_order_usd
+                        ),
+                        permanent: false,
+                    });
+                }
+                let left = remainder.clone() - cap.clone();
+                let left_amount = ChainTokenAmount::from_raw(input.total_pay.token.clone(), left);
+                // A dust leftover is never a leg, so the cap gives way by that much.
+                if input.meets_cex_minimum(&left_amount, self.config.cex_min_exec_usd) {
+                    Ok(cap)
+                } else {
+                    Ok(remainder.clone())
+                }
+            }
+            _ => Ok(remainder.clone()),
+        }
     }
 
     /// One exchange's answer for an exact amount, after its amount check and
