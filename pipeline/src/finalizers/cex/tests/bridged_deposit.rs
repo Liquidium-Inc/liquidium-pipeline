@@ -4,6 +4,7 @@ use super::*;
 #[tokio::test]
 async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amount() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
 
@@ -99,6 +100,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
 #[tokio::test]
 async fn a_bridged_deposit_stays_in_the_deposit_step_until_its_funding_lands() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
     cex.expect_get_balance().times(1).returning(|_| Ok(0.0));
@@ -192,6 +194,7 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
 #[tokio::test]
 async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
 
@@ -427,6 +430,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
 #[tokio::test]
 async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
 
@@ -508,6 +512,7 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
 #[tokio::test]
 async fn a_deposit_bridge_that_never_starts_ends_at_its_bound() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
     cex.expect_get_balance().returning(|_| Ok(10.0));
@@ -552,6 +557,7 @@ async fn a_deposit_bridge_that_never_starts_ends_at_its_bound() {
 #[tokio::test]
 async fn mexc_deposit_bridge_waits_when_the_cketh_fee_balance_drops_after_funding() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
 
@@ -679,6 +685,52 @@ async fn a_bridge_account_short_of_cketh_gas_refuses_the_deposit_before_funding(
     let error = finalizer.deposit(&mut state).await.unwrap_err();
 
     assert!(error.to_string().contains("ckUSDC withdrawal needs for gas"), "{error}");
+    assert!(state.deposit.deposit_funding.is_none(), "no transfer is saved");
+    assert!(state.deposit.deposit_txid.is_none());
+}
+
+/// The exchange is asked again at the fresh size before the funding transfer.
+/// An arrival under its deposit minimum is never credited, so nothing is sent.
+#[tokio::test]
+async fn an_arrival_under_the_exchange_minimum_refuses_the_bridged_deposit_before_funding() {
+    use liquidium_pipeline_connectors::backend::cex_backend::FundingRouteError;
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    cex.expect_get_balance().returning(|_| Ok(10.0));
+    cex.expect_check_funding_route().times(1).returning(|route| {
+        assert_eq!(
+            (route.deposit_asset.as_str(), route.deposit_network.as_str()),
+            ("USDC", "ETH")
+        );
+        assert!(route.deposit_amount > 0.0, "the arrival, not zero: {route:?}");
+        Err(FundingRouteError::BelowMinimum(format!(
+            "deposit amount {} is below the minimum 2.5",
+            route.deposit_amount
+        )))
+    });
+    transfers.expect_transfer().times(0);
+    bridge.expect_get_source_balance().returning(|_, _, _| Ok(0.001));
+    bridge.expect_get_fee_budget().returning(|_, _, _| {
+        Ok(BridgeFeeBudget {
+            source_fee_budget: 0.01,
+            destination_fee_budget: 0.0,
+            provider_fee_budget_native_units: Some(Nat::from(138_541_176_852_000u64)),
+            ..BridgeFeeBudget::default()
+        })
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    bridge.expect_submit_bridge().times(0);
+
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let receipt = make_execution_receipt_with_assets(84, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");
+
+    let error = finalizer.deposit(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, CexBackendError::BelowMinimum(_)), "{error}");
     assert!(state.deposit.deposit_funding.is_none(), "no transfer is saved");
     assert!(state.deposit.deposit_txid.is_none());
 }

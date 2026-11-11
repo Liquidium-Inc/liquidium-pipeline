@@ -49,6 +49,7 @@ async fn mexc_deposit_phase_a_rejects_fee_consumed_deposit_with_permanent_prefix
 #[tokio::test]
 async fn mexc_deposit_phase_a_uses_evm_destination_for_evm_assets() {
     let mut backend = MockCexBackend::new();
+    backend.expect_check_funding_route().returning(|_| Ok(()));
     let mut transfers = MockTransferActions::new();
 
     backend.expect_get_balance().times(1).returning(|asset| {
@@ -143,6 +144,8 @@ async fn mexc_native_icp_deposit_uses_ledger_account_id_destination() {
     AccountIdentifier::from_hex(MEXC_ICP_DEPOSIT_ACCOUNT_ID_HEX).expect("test MEXC ICP account id should be valid");
 
     let mut backend = MockCexBackend::new();
+
+    backend.expect_check_funding_route().returning(|_| Ok(()));
     let mut transfers = MockTransferActions::new();
 
     backend.expect_get_balance().times(1).returning(|asset| {

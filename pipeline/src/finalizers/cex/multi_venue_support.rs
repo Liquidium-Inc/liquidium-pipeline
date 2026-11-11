@@ -1,7 +1,7 @@
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::BridgeRouteKind,
-    cex_backend::{CexBackend, CexBackendError, FundingRoute, FundingRouteError},
+    cex_backend::{CexBackend, CexBackendError, FundingRouteError},
 };
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
@@ -457,16 +457,10 @@ where
         }
         // The exchange confirms, before any funds move, that it credits this
         // deposit and pays out to this address.
-        self.backend
-            .check_funding_route(&FundingRoute {
-                deposit_asset: <Self as BridgePlanner>::planned_deposit_asset(&state),
-                deposit_network: <Self as BridgePlanner>::planned_deposit_network(&state),
-                deposit_amount: initial_amount,
-                withdraw_asset: <Self as BridgePlanner>::planned_withdraw_asset(&state),
-                withdraw_network: <Self as BridgePlanner>::planned_withdraw_network(&state),
-                withdraw_address: self.planned_withdraw_address(&state).map_err(PreviewFailure::Venue)?,
-            })
-            .await?;
+        let route = self
+            .funding_route(&state, initial_amount)
+            .map_err(PreviewFailure::Venue)?;
+        self.backend.check_funding_route(&route).await?;
         // Order book reads are untyped, so a failed read counts as a market that
         // cannot carry the amount. A typed read error is a follow-up.
         let legs = self
