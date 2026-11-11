@@ -1,7 +1,7 @@
 //! The deposit funding transfer: measuring the exchange balance, sizing the
 //! transfer with its fee reserve, the saved send, and the approval bumps.
 use super::*;
-use liquidium_pipeline_connectors::backend::cex_backend::FundingRouteError;
+use liquidium_pipeline_connectors::backend::cex_backend::{FundingRoute, FundingRouteError};
 
 use crate::finalizers::bridge_legs::BridgeLegError;
 use crate::finalizers::bridge_legs::fee_adjusted_transfer;
@@ -141,10 +141,7 @@ where
         arrival: f64,
     ) -> Result<(), CexBackendError> {
         let route = self.funding_route(state, arrival)?;
-        self.backend
-            .check_funding_route(&route)
-            .await
-            .map_err(|error| credit_refusal(error).into())
+        Ok(check_credit(self.backend.as_ref(), &route).await?)
     }
 
     /// Whether a direct deposit of this asset sends approval bumps: only a
@@ -238,13 +235,16 @@ where
     }
 }
 
-/// Why the exchange will not credit a deposit. Under the minimum, the leg ends
-/// with its funds unsent; any other refusal retries.
-pub(in crate::finalizers::cex) fn credit_refusal(error: FundingRouteError) -> BridgeLegError {
-    match error {
+/// The exchange's word that it credits `route`'s deposit. Under its minimum,
+/// the leg ends with its funds unsent; any other refusal retries.
+pub(in crate::finalizers::cex) async fn check_credit<C: CexBackend>(
+    backend: &C,
+    route: &FundingRoute,
+) -> Result<(), BridgeLegError> {
+    backend.check_funding_route(route).await.map_err(|error| match error {
         FundingRouteError::BelowMinimum(reason) => BridgeLegError::BelowMinimum(reason),
         FundingRouteError::Unavailable(reason) | FundingRouteError::Unsupported(reason) => {
             BridgeLegError::Other(reason)
         }
-    }
+    })
 }

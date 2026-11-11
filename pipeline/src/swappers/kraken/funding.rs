@@ -51,9 +51,8 @@ pub struct KrakenWithdrawalCheck {
     pub method: String,
     pub network: Option<String>,
     pub minimum: Decimal,
-    /// Every verified address saved for this method.
-    pub verified: Vec<String>,
-    /// Whether `destination` is one of them; a leg can only withdraw there.
+    /// Whether `destination` is a verified address for this method; a leg can
+    /// only withdraw there.
     pub destination_verified: bool,
     /// Kraken's fee for a withdrawal of the minimum, once the address is verified.
     pub fee_at_minimum: Option<Result<Decimal, String>>,
@@ -232,7 +231,6 @@ impl KrakenClient {
                     method: method.method,
                     network: method.network,
                     minimum: method.minimum,
-                    verified: verified.into_iter().map(|(address, _)| address).collect(),
                     destination_verified: key.is_some(),
                     fee_at_minimum,
                 })
