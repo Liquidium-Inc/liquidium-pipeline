@@ -114,7 +114,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 if let Some(order) = state.order.as_mut() {
                     order.wait_since_ts = Some(now_ts());
                 }
-                state.step = RiftStep::Wait;
+                state.step = RiftStep::Swap;
             }
         }
         Ok(())

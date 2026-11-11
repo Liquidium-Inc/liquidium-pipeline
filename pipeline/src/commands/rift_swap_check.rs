@@ -315,11 +315,11 @@ mod tests {
         let timeline = vec![
             ("Order".to_string(), 100),
             ("BridgeOut".to_string(), 110),
-            ("Wait".to_string(), 1_310),
+            ("Swap".to_string(), 1_310),
         ];
         assert_eq!(
             super::step_durations(&timeline, 2_000),
-            "Order 10s, BridgeOut 1200s, Wait 690s"
+            "Order 10s, BridgeOut 1200s, Swap 690s"
         );
     }
 

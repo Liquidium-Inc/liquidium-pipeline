@@ -131,7 +131,7 @@ impl<R: RiftBackend + 'static> VenueLeg for RiftVenueFinalizer<R> {
 
     /// A release while waiting for Rift starts the wait bounds again.
     fn after_release(&self, state: &mut RiftState) {
-        if state.step == RiftStep::Wait
+        if state.step == RiftStep::Swap
             && let Some(order) = state.order.as_mut()
         {
             order.wait_since_ts = Some(now_ts());

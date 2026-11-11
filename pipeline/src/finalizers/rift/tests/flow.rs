@@ -136,7 +136,7 @@ async fn a_leg_pays_the_order_through_the_bridge_and_mints_what_rift_delivered()
             (RiftStep::BridgeOut, false),  // it lands
             (RiftStep::BridgeOut, true),   // the bridge call is saved
             (RiftStep::BridgeOut, false),  // it is submitted
-            (RiftStep::Wait, false),       // the bridge completed
+            (RiftStep::Swap, false),       // the bridge completed
             (RiftStep::BridgeBack, false), // Rift delivered
             (RiftStep::BridgeBack, true),  // the helper call is saved
             (RiftStep::BridgeBack, false), // it lands
@@ -208,7 +208,7 @@ async fn a_refunded_order_parks_the_leg_for_an_operator() {
     rift.expect_order_state()
         .returning(|_| Ok(order_state(RiftOrderStatus::Refunded, None)));
     let finalizer = finalizer(rift, MockBridgeBackend::new(), MockOutboundSender::new());
-    let state = state_at(RiftStep::Wait);
+    let state = state_at(RiftStep::Swap);
     let execution = serde_json::json!({ "rift": state, "ready_to_advance": true, "intent_id": "rift-intent-x" });
     let request = request(100_010_000);
     let leg = VenueLegState {

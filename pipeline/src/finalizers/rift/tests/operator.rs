@@ -103,7 +103,7 @@ async fn a_refunded_order_takes_its_refund_transaction_and_ends_the_leg() {
         MockBridgeBackend::new(),
         MockOutboundSender::new(),
     );
-    let mut state = state_at(RiftStep::Wait);
+    let mut state = state_at(RiftStep::Swap);
     state.order.as_mut().unwrap().status = Some("refunded".to_string());
     let leg = leg_with(&state, true);
 
@@ -156,7 +156,7 @@ fn a_release_while_waiting_for_rift_starts_the_wait_again() {
         MockBridgeBackend::new(),
         MockOutboundSender::new(),
     );
-    let mut state = state_at(RiftStep::Wait);
+    let mut state = state_at(RiftStep::Swap);
     state.order.as_mut().unwrap().wait_since_ts = Some(now_ts() - 7 * 60 * 60);
     let leg = leg_with(&state, true);
 

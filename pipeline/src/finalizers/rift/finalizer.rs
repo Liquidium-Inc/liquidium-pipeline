@@ -198,7 +198,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         match state.step {
             RiftStep::Order => self.order(state).await,
             RiftStep::BridgeOut => self.bridge_out(state).await,
-            RiftStep::Wait => self.wait(state).await,
+            RiftStep::Swap => self.wait(state).await,
             RiftStep::BridgeBack => self.bridge_back(state).await,
             RiftStep::Completed | RiftStep::Failed => Ok(()),
         }

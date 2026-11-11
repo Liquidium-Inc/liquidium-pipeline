@@ -4,7 +4,7 @@ use crate::finalizers::multi_venue::VenueStepError;
 use crate::utils::now_ts;
 
 fn waiting_state(bridge_completed_secs_ago: i64) -> RiftState {
-    let mut state = state_at(RiftStep::Wait);
+    let mut state = state_at(RiftStep::Swap);
     state.order.as_mut().unwrap().wait_since_ts = Some(now_ts() - bridge_completed_secs_ago);
     state
 }
@@ -29,7 +29,7 @@ async fn an_order_that_awaits_its_deposit_waits_within_the_bound() {
     wait_with(RiftOrderStatus::AwaitingDeposit, None, &mut state)
         .await
         .unwrap();
-    assert_eq!(state.step, RiftStep::Wait);
+    assert_eq!(state.step, RiftStep::Swap);
     assert_eq!(
         state.order.as_ref().unwrap().status.as_deref(),
         Some("awaiting_deposit")
@@ -57,7 +57,7 @@ async fn a_bitcoin_deposit_may_take_longer_to_be_seen() {
     wait_with(RiftOrderStatus::AwaitingDeposit, None, &mut state)
         .await
         .unwrap();
-    assert_eq!(state.step, RiftStep::Wait);
+    assert_eq!(state.step, RiftStep::Swap);
 
     let mut state = waiting_state(5 * 60 * 60);
     state.pay_chain = "bitcoin".to_string();
@@ -71,7 +71,7 @@ async fn a_bitcoin_deposit_may_take_longer_to_be_seen() {
 async fn a_funded_order_waits_for_delivery() {
     let mut state = waiting_state(60);
     wait_with(RiftOrderStatus::Executing, None, &mut state).await.unwrap();
-    assert_eq!(state.step, RiftStep::Wait);
+    assert_eq!(state.step, RiftStep::Swap);
 }
 
 #[tokio::test]
@@ -94,7 +94,7 @@ async fn a_delivery_without_an_amount_is_ambiguous() {
         .await
         .unwrap_err();
     assert!(matches!(error, VenueStepError::Ambiguous(_)), "{error}");
-    assert_eq!(state.step, RiftStep::Wait);
+    assert_eq!(state.step, RiftStep::Swap);
 }
 
 #[tokio::test]
@@ -133,7 +133,7 @@ async fn a_delivery_of_nothing_is_ambiguous() {
         matches!(error, VenueStepError::Ambiguous(ref m) if m.contains("delivery of 0")),
         "{error}"
     );
-    assert_eq!(state.step, RiftStep::Wait);
+    assert_eq!(state.step, RiftStep::Swap);
 }
 
 #[tokio::test]
