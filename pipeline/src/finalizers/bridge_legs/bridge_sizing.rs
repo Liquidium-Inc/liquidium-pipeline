@@ -9,7 +9,9 @@ use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
 };
 
-use super::BridgeLegError;
+use super::{
+    BRIDGE_FEE_TOKEN_CHAIN, BRIDGE_FEE_TOKEN_SYMBOL, BridgeLegError, CKETH_DECIMALS, SOURCE_BALANCE_TOLERANCE,
+};
 use crate::{
     bridge::runtime::BridgeRuntime,
     finalizers::{bridge_planner::parse_icp_account_like, multi_venue::VenueAmountError},
@@ -52,6 +54,45 @@ pub async fn ensure_return_gas(
         ));
     }
     Ok(())
+}
+
+/// Checks that the bridge account holds the ckETH a ckERC20 withdrawal pays
+/// as gas, with a margin, before the funding transfer commits to the route.
+/// Without it the funds reach the bridge account and wait there for ckETH.
+pub async fn ensure_withdrawal_gas(
+    bridge: &BridgeRuntime,
+    route: &BridgeRouteSpec,
+    budget: &BridgeFeeBudget,
+) -> Result<(), String> {
+    let account = bridge.sources.for_chain(route.source_chain)?;
+    let fee = budget.provider_fee_budget_native_units.as_ref();
+    match withdrawal_gas_shortfall(bridge, route, fee, &account, GAS_MARGIN).await? {
+        Some((held, needed)) => Err(format!(
+            "bridge account {account} holds {held} {BRIDGE_FEE_TOKEN_SYMBOL}, below the {needed} the {} withdrawal needs for gas",
+            route.source_asset
+        )),
+        None => Ok(()),
+    }
+}
+
+/// `(held, needed)` when `account` holds less ckETH than `margin` times the
+/// gas fee a ckERC20 withdrawal pays. Other routes pay no such fee.
+pub(super) async fn withdrawal_gas_shortfall(
+    bridge: &BridgeRuntime,
+    route: &BridgeRouteSpec,
+    fee: Option<&Nat>,
+    account: &str,
+    margin: f64,
+) -> Result<Option<(f64, f64)>, String> {
+    let Some(fee) = fee.filter(|_| route.route_kind == BridgeRouteKind::CkEthErc20Reverse) else {
+        return Ok(None);
+    };
+    let needed = nat_units_to_amount_via_core(fee, CKETH_DECIMALS)? * margin;
+    let held = bridge
+        .backend
+        .get_source_balance(BRIDGE_FEE_TOKEN_SYMBOL, BRIDGE_FEE_TOKEN_CHAIN, account)
+        .await?;
+    Ok((held + SOURCE_BALANCE_TOLERANCE < needed).then_some((held, needed)))
 }
 
 /// What a bridged deposit sends and what the bridge receives from it.
@@ -220,6 +261,7 @@ pub async fn bridged_deposit_arrival(
 ) -> Result<BridgedDepositArrival, BridgeLegError> {
     let sizing = size_bridged_deposit(bridge, route, asset, size_in).await?;
     ensure_minimum_bridge_amount(bridge, route, &sizing.bridge_amount).await?;
+    ensure_withdrawal_gas(bridge, route, &sizing.fee_budget).await?;
     let submit_amount = spend_f64(&sizing.bridge_amount)?;
     let expected_amount =
         expected_bridge_deposit_amount(route, submit_amount, sizing.fee_budget.destination_fee_budget)?;
