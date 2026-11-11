@@ -567,8 +567,8 @@ Check the ledger, then record what you found; a running bot applies it on its ne
 
 ```bash
 liquidator supply top-ups                                        # open top-ups and their state
-liquidator supply resolve-top-up --asset ckUSDC --landed 123456  # the transfer is in this block
-liquidator supply resolve-top-up --asset ckUSDC --absent         # the transfer never happened
+liquidator supply resolve-top-up --asset ckUSDC --send <id> --landed 123456  # it is in this block
+liquidator supply resolve-top-up --asset ckUSDC --send <id> --absent         # it never happened
 ```
 
 Profit figures in this mode charge two ledger fees per liquidation for the top-up (the wallet
@@ -583,19 +583,25 @@ released. The receipt waits in `WaitingCollateral` while every settlement pass m
 1. Wait until the collateral pool shows enough free cash.
 2. Withdraw the collateral into a holding subaccount of the liquidator that is used for this
    one liquidation.
-3. Read that subaccount on the ledger. Its balance proves the payout arrived.
+3. Read that subaccount on the ledger. The payout counts as arrived only once the full
+   expected amount is there, so dust sent by someone else proves nothing.
 4. Send it to the account that swaps it, through a saved transfer, and enqueue the receipt.
 
 Each step is written to the WAL before the next one starts. Collateral that may still be in
 supply is subtracted from the capital available for other liquidations.
 
 If a withdrawal call gets no answer, the bot does not call again. It keeps reading the holding
-subaccount: a balance there means the withdrawal ran and the release continues. If nothing
-arrives it alerts the operator channel once. When the liquidator's supply still includes the
-collateral, the withdrawal did not run and can be retried:
+subaccount: the full payout there means the withdrawal ran and the release continues. If
+nothing arrives it alerts the operator channel once. A transfer out that the ledger cannot
+decide is settled the same way: only this release moves funds out of the holding subaccount,
+so its balance shows whether the transfer landed.
+
+A withdrawal that never ran can be retried. The command refuses when the payout is in the
+holding subaccount or the supply position is already smaller than the collateral parked in
+it, and it never overwrites a row the bot changed meanwhile:
 
 ```bash
-liquidator supply retry-release --row <liquidation row id>
+liquidator supply retry-release --row <liquidation row id> --confirmed-not-withdrawn
 ```
 
 Requirements: the lending canister must expose `liquidate_from_supply`, and the liquidator's

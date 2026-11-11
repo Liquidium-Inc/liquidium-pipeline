@@ -149,18 +149,14 @@ pub(crate) struct WithdrawOutflow {
 pub enum CollateralRelease {
     /// Still supplied in the collateral pool under the liquidator's profile.
     Held,
-    /// A withdrawal call was started and its answer is not known. The holding subaccount
-    /// shows whether it ran. `alerted` records that an operator was told.
-    Withdrawing { alerted: bool },
+    /// A withdrawal call was started and its answer is not known. It ran if `expected` shows
+    /// up in the holding subaccount. `alerted` records that an operator was told.
+    Withdrawing { expected: Nat, alerted: bool },
     /// The withdrawal was accepted at this unix time; `expected` should reach the holding
     /// subaccount.
     Requested { at: i64, expected: Nat },
     /// The collateral is in the holding subaccount and `amount` is being sent to the receiver.
-    Forwarding {
-        amount: Nat,
-        send: Option<OutboundRecord>,
-        alerted: bool,
-    },
+    Forwarding { amount: Nat, send: Option<OutboundRecord> },
     /// The collateral reached the receiver. The receipt's collateral amount is final.
     Released,
 }
@@ -295,8 +291,10 @@ impl<A: PipelineAgent> LendingSupplyBalances<A> {
 #[async_trait]
 impl<A: PipelineAgent> SupplyBalanceSource for LendingSupplyBalances<A> {
     async fn supplied_native(&self, pool_id: Principal) -> Result<Nat, String> {
-        let supplied = supplied_native(self.agent.as_ref(), &self.lending_canister, self.profile, pool_id).await?;
+        // Held collateral is read first. A release that withdraws between the two reads then
+        // lowers the supply but not the reservation, which only understates what can be spent.
         let held = self.held.held_native(pool_id).await?;
+        let supplied = supplied_native(self.agent.as_ref(), &self.lending_canister, self.profile, pool_id).await?;
         Ok(if supplied > held {
             supplied - held
         } else {
@@ -1134,7 +1132,15 @@ mod tests {
                     expected: Nat::from(290u64),
                 },
             ),
-            row(3, pool_b, 70, CollateralRelease::Withdrawing { alerted: false }),
+            row(
+                3,
+                pool_b,
+                70,
+                CollateralRelease::Withdrawing {
+                    expected: Nat::from(60u64),
+                    alerted: false,
+                },
+            ),
         ];
         let mut wal = MockWalStore::new();
         wal.expect_list_by_status_after()

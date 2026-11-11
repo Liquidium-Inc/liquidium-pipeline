@@ -270,6 +270,9 @@ enum SupplyCommands {
         /// Asset symbol (e.g., "ckUSDC")
         #[arg(long)]
         asset: String,
+        /// Send id shown by `supply top-ups`
+        #[arg(long)]
+        send: String,
         /// Block index of the transfer, when the ledger shows it landed
         #[arg(long)]
         landed: Option<String>,
@@ -283,6 +286,9 @@ enum SupplyCommands {
         /// Liquidation row id shown in the alert
         #[arg(long)]
         row: String,
+        /// The lending canister's events show no withdrawal of this collateral
+        #[arg(long)]
+        confirmed_not_withdrawn: bool,
     },
 }
 
@@ -572,10 +578,16 @@ async fn main() -> ExitCode {
                 SupplyCommands::Deposit { asset, amount } => commands::supply::deposit(&asset, &amount).await,
                 SupplyCommands::Withdraw { asset, amount } => commands::supply::withdraw(&asset, &amount).await,
                 SupplyCommands::TopUps => commands::supply::top_ups().await,
-                SupplyCommands::RetryRelease { row } => commands::supply::retry_release(&row).await,
-                SupplyCommands::ResolveTopUp { asset, landed, absent } => {
-                    commands::supply::resolve_top_up(&asset, landed, absent).await
-                }
+                SupplyCommands::RetryRelease {
+                    row,
+                    confirmed_not_withdrawn,
+                } => commands::supply::retry_release(&row, confirmed_not_withdrawn).await,
+                SupplyCommands::ResolveTopUp {
+                    asset,
+                    send,
+                    landed,
+                    absent,
+                } => commands::supply::resolve_top_up(&asset, &send, landed, absent).await,
             };
             if let Err(e) = outcome {
                 eprintln!("Supply command failed: {:#}", e);

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::outbound::driver::OutboundRecord;
+use crate::outbound::driver::{OperatorDecision, OutboundRecord};
 
 /// One saved top-up send per ledger, kept in a small JSON file next to the WAL database.
 pub struct ResupplyJournal {
@@ -86,6 +86,24 @@ impl ResupplyJournal {
             }
             None => candidate.remove(key),
         };
+
+        self.write(&candidate)?;
+        *records = candidate;
+        Ok(())
+    }
+
+    /// Records an operator decision on the send `identity` saved for `key`. Refused when the
+    /// journal no longer holds that send, so a decision never lands on a newer one.
+    pub fn decide(&self, key: &str, identity: &str, decision: OperatorDecision) -> Result<(), String> {
+        let mut records = self.records.lock().expect("resupply journal lock");
+        let _file_lock = self.lock_file()?;
+
+        let mut candidate = Self::read(&self.path)?;
+        let record = candidate
+            .get_mut(key)
+            .filter(|record| record.prepared.identity == identity)
+            .ok_or_else(|| format!("send {identity} is no longer open; list the open top-ups again"))?;
+        record.decide(decision);
 
         self.write(&candidate)?;
         *records = candidate;
@@ -202,15 +220,13 @@ mod tests {
         let bot = ResupplyJournal::open(path.clone(), 0).unwrap();
         bot.set("ledger-a", Some(record(true))).unwrap();
         let cli = ResupplyJournal::open(path.clone(), 0).unwrap();
-        let mut decided = cli.get("ledger-a").unwrap();
-        decided.decide(crate::outbound::driver::OperatorDecision::Absent);
-        cli.set("ledger-a", Some(decided.clone())).unwrap();
+        cli.decide("ledger-a", "id-1", OperatorDecision::Absent).unwrap();
 
         // when
         bot.reload().unwrap();
 
         // then
-        assert_eq!(bot.get("ledger-a"), Some(decided));
+        assert_eq!(bot.get("ledger-a").unwrap().decision, Some(OperatorDecision::Absent));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -222,9 +238,7 @@ mod tests {
         let bot = ResupplyJournal::open(path.clone(), 0).unwrap();
         bot.set("ledger-a", Some(record(true))).unwrap();
         let cli = ResupplyJournal::open(path.clone(), 0).unwrap();
-        let mut decided = cli.get("ledger-a").unwrap();
-        decided.decide(crate::outbound::driver::OperatorDecision::Absent);
-        cli.set("ledger-a", Some(decided.clone())).unwrap();
+        cli.decide("ledger-a", "id-1", OperatorDecision::Absent).unwrap();
 
         // when the bot, still holding its older view, writes both keys
         bot.set("ledger-b", Some(record(true))).unwrap();
@@ -232,8 +246,34 @@ mod tests {
 
         // then the decision for that same send survives
         let reopened = ResupplyJournal::open(path.clone(), 0).unwrap();
-        assert_eq!(reopened.get("ledger-a").unwrap().decision, decided.decision);
+        assert_eq!(
+            reopened.get("ledger-a").unwrap().decision,
+            Some(OperatorDecision::Absent)
+        );
         assert_eq!(reopened.get("ledger-b"), Some(record(true)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_decision_for_a_send_that_was_replaced_is_refused() {
+        // given the bot finished send id-1 and started another one for the same ledger
+        let path = temp_path("stale-decision");
+        let _ = std::fs::remove_file(&path);
+        let bot = ResupplyJournal::open(path.clone(), 0).unwrap();
+        let mut newer = record(true);
+        newer.prepared.identity = "id-2".into();
+        bot.set("ledger-a", Some(newer.clone())).unwrap();
+        let cli = ResupplyJournal::open(path.clone(), 0).unwrap();
+
+        // when the CLI decides the send it listed earlier
+        let result = cli.decide("ledger-a", "id-1", OperatorDecision::Absent);
+
+        // then the newer send is untouched
+        assert!(result.is_err());
+        assert_eq!(
+            ResupplyJournal::open(path.clone(), 0).unwrap().get("ledger-a"),
+            Some(newer)
+        );
         let _ = std::fs::remove_file(&path);
     }
 

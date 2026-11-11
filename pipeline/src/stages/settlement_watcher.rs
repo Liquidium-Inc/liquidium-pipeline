@@ -31,6 +31,15 @@ pub struct SupplyRelease {
     pub holding_sender: HoldingSender,
 }
 
+/// What reaches the receiver of a transfer of `amount`.
+fn net_of_fee(amount: &Nat, fee: &Nat) -> Nat {
+    if amount > fee {
+        amount.clone() - fee.clone()
+    } else {
+        Nat::from(0u8)
+    }
+}
+
 /// Rows checked per status in one tick. The watcher walks all rows in pages,
 /// so rows that never settle cannot hide newer ones (audit L09).
 const SETTLEMENT_PAGE_SIZE: usize = 100;
@@ -230,12 +239,12 @@ where
                     return Ok(());
                 }
 
-                self.save_release(
-                    &mut row,
-                    &mut receipt,
-                    CollateralRelease::Withdrawing { alerted: false },
-                )
-                .await?;
+                let fee = token.fee();
+                let marked = CollateralRelease::Withdrawing {
+                    expected: net_of_fee(&needed, &fee),
+                    alerted: false,
+                };
+                self.save_release(&mut row, &mut receipt, marked).await?;
                 let receiver = AccountType::Icrc(IcrcAccount {
                     owner: supply.liquidator,
                     subaccount: Some(subaccount.to_vec()),
@@ -258,13 +267,10 @@ where
                                 liq.id
                             );
                         }
-                        let fee = token.fee();
-                        let expected = if withdrawn > fee {
-                            withdrawn - fee
-                        } else {
-                            Nat::from(0u8)
+                        let next = CollateralRelease::Requested {
+                            at: now_ts(),
+                            expected: net_of_fee(&withdrawn, &fee),
                         };
-                        let next = CollateralRelease::Requested { at: now_ts(), expected };
                         self.save_release(&mut row, &mut receipt, next).await?;
                         info!("[settlement] liq_id={} collateral withdrawal accepted", liq.id);
                     }
@@ -286,14 +292,11 @@ where
                 }
                 Ok(())
             }
-            CollateralRelease::Withdrawing { alerted } => {
+            CollateralRelease::Withdrawing { expected, alerted } => {
                 let balance = ledger_balance(self.agent.as_ref(), *ledger, holding).await?;
-                if balance > 0u8 {
-                    // The payout is there, so the withdrawal ran.
-                    let next = CollateralRelease::Requested {
-                        at: now_ts(),
-                        expected: balance,
-                    };
+                // Only the full payout proves the withdrawal ran: anyone can send dust here.
+                if expected > 0u8 && balance >= expected {
+                    let next = CollateralRelease::Requested { at: now_ts(), expected };
                     return self.save_release(&mut row, &mut receipt, next).await;
                 }
                 if !alerted {
@@ -301,18 +304,22 @@ where
                         &row,
                         &supply,
                         "collateral-withdrawal",
-                        "the withdrawal of collateral held as supply got no answer and nothing has reached its holding subaccount. If the liquidator's supply in the collateral pool still includes it, run `liquidator supply retry-release`",
+                        "the withdrawal of collateral held as supply got no answer and its payout has not reached the holding subaccount. If it did not run, `liquidator supply retry-release` withdraws it again",
                     )
                     .await;
-                    self.save_release(&mut row, &mut receipt, CollateralRelease::Withdrawing { alerted: true })
-                        .await?;
+                    let next = CollateralRelease::Withdrawing {
+                        expected,
+                        alerted: true,
+                    };
+                    self.save_release(&mut row, &mut receipt, next).await?;
                 }
                 Ok(())
             }
             CollateralRelease::Requested { at, expected } => {
                 let balance = ledger_balance(self.agent.as_ref(), *ledger, holding).await?;
                 let fee = token.fee();
-                if balance <= fee {
+                // The payout counts as arrived only in full: anyone can send dust here.
+                if balance < expected {
                     info!(
                         "[settlement] liq_id={} waiting for {expected} collateral payout, accepted {}s ago",
                         liq.id,
@@ -320,19 +327,22 @@ where
                     );
                     return Ok(());
                 }
+                if balance <= fee {
+                    // Too little to pay for a transfer. It stays in the holding subaccount.
+                    warn!(
+                        "[settlement] liq_id={} collateral payout {balance} does not cover a transfer fee; finishing with none",
+                        liq.id
+                    );
+                    return self.finish_release(row, receipt, Nat::from(0u8)).await;
+                }
                 // Everything that arrived moves on, less the fee of the transfer out.
                 let next = CollateralRelease::Forwarding {
                     amount: balance - fee,
                     send: None,
-                    alerted: false,
                 };
                 self.save_release(&mut row, &mut receipt, next).await
             }
-            CollateralRelease::Forwarding {
-                amount,
-                mut send,
-                alerted,
-            } => {
+            CollateralRelease::Forwarding { amount, mut send } => {
                 let sender = (supply.holding_sender)(subaccount);
                 if send.is_none() {
                     let intent = OutboundIntent {
@@ -350,7 +360,6 @@ where
                     let saved = CollateralRelease::Forwarding {
                         amount: amount.clone(),
                         send: send.clone(),
-                        alerted,
                     };
                     self.save_release(&mut row, &mut receipt, saved).await?;
                 }
@@ -358,30 +367,39 @@ where
                 let outcome = step_outbound(&mut send, sender.as_ref(), None, now_ts()).await;
                 match outcome {
                     Ok(Some(tx)) => {
-                        if let Some(result) = receipt.liquidation_result.as_mut() {
-                            result.amounts.collateral_received = amount;
-                        }
-                        receipt.status = ExecutionStatus::Success;
-                        receipt.collateral_release = Some(CollateralRelease::Released);
                         info!(
                             "[settlement] liq_id={} collateral released to the receiver (tx {tx})",
                             liq.id
                         );
-                        self.enqueue_released(row, receipt).await
+                        self.finish_release(row, receipt, amount).await
                     }
                     Ok(None) => {
-                        let next = CollateralRelease::Forwarding { amount, send, alerted };
+                        let next = CollateralRelease::Forwarding { amount, send };
                         self.save_release(&mut row, &mut receipt, next).await
                     }
+                    // The ledger could not decide the send. Only this release moves funds out
+                    // of the holding subaccount, so its balance decides it.
                     Err(OutboundError::Park(reason)) => {
-                        if !alerted {
-                            self.alert_release(&row, &supply, "collateral-transfer", &reason).await;
-                        }
-                        let next = CollateralRelease::Forwarding {
-                            amount,
+                        let parked = CollateralRelease::Forwarding {
+                            amount: amount.clone(),
                             send,
-                            alerted: true,
                         };
+                        self.save_release(&mut row, &mut receipt, parked).await?;
+                        let balance = ledger_balance(self.agent.as_ref(), *ledger, holding).await?;
+                        if balance < amount {
+                            info!(
+                                "[settlement] liq_id={} collateral left the holding subaccount, so the transfer landed",
+                                liq.id
+                            );
+                            return self.finish_release(row, receipt, amount).await;
+                        }
+                        // Still there: the send did not run. A second send of the same amount
+                        // cannot also succeed, because the subaccount holds it only once.
+                        warn!(
+                            "[settlement] liq_id={} collateral transfer undecided ({reason}); sending it again",
+                            liq.id
+                        );
+                        let next = CollateralRelease::Forwarding { amount, send: None };
                         self.save_release(&mut row, &mut receipt, next).await
                     }
                     // The transfer did not happen; the next pass prepares a new one.
@@ -390,16 +408,27 @@ where
                             "[settlement] liq_id={} collateral transfer did not happen: {err}",
                             liq.id
                         );
-                        let next = CollateralRelease::Forwarding {
-                            amount,
-                            send: None,
-                            alerted,
-                        };
+                        let next = CollateralRelease::Forwarding { amount, send: None };
                         self.save_release(&mut row, &mut receipt, next).await
                     }
                 }
             }
         }
+    }
+
+    /// Records the amount that reached the receiver and enqueues the row.
+    async fn finish_release(
+        &self,
+        row: LiqResultRecord,
+        mut receipt: ExecutionReceipt,
+        arrived: Nat,
+    ) -> Result<(), String> {
+        if let Some(result) = receipt.liquidation_result.as_mut() {
+            result.amounts.collateral_received = arrived;
+        }
+        receipt.status = ExecutionStatus::Success;
+        receipt.collateral_release = Some(CollateralRelease::Released);
+        self.enqueue_released(row, receipt).await
     }
 
     /// Writes the receipt and the `Enqueued` status in one row update, so a released row can
@@ -985,6 +1014,13 @@ mod tests {
             )
         }
 
+        fn withdrawing(alerted: bool) -> CollateralRelease {
+            CollateralRelease::Withdrawing {
+                expected: Nat::from(SEIZED - FEE),
+                alerted,
+            }
+        }
+
         fn no_sender() -> MockOutboundSender {
             MockOutboundSender::new()
         }
@@ -1009,10 +1045,7 @@ mod tests {
 
             // then the call is marked first, and the accepted withdrawal is recorded after it
             let saved = saved.lock().unwrap();
-            assert_eq!(
-                release_of(&saved[0]),
-                Some(CollateralRelease::Withdrawing { alerted: false })
-            );
+            assert_eq!(release_of(&saved[0]), Some(withdrawing(false)));
             assert!(matches!(
                 release_of(saved.last().unwrap()),
                 Some(CollateralRelease::Requested { expected, .. }) if expected == Nat::from(SEIZED - FEE)
@@ -1051,17 +1084,14 @@ mod tests {
             // then the row stays marked as mid-withdrawal, which a later pass never calls again
             let saved = saved.lock().unwrap();
             assert_eq!(saved.len(), 1);
-            assert_eq!(
-                release_of(&saved[0]),
-                Some(CollateralRelease::Withdrawing { alerted: false })
-            );
+            assert_eq!(release_of(&saved[0]), Some(withdrawing(false)));
         }
 
         #[tokio::test]
         async fn an_unanswered_withdrawal_with_an_empty_holding_subaccount_alerts_once() {
             // given
             let watchdog = Arc::new(CountingWatchdog::default());
-            let (wal, saved) = wal_with(CollateralRelease::Withdrawing { alerted: false });
+            let (wal, saved) = wal_with(withdrawing(false));
 
             // when
             watcher(wal, agent_with_holding_balance(0), no_sender(), watchdog.clone())
@@ -1073,7 +1103,7 @@ mod tests {
             assert_eq!(watchdog.0.load(Ordering::SeqCst), 1);
             assert_eq!(
                 release_of(saved.lock().unwrap().last().unwrap()),
-                Some(CollateralRelease::Withdrawing { alerted: true })
+                Some(withdrawing(true))
             );
         }
 
@@ -1081,7 +1111,7 @@ mod tests {
         async fn an_unanswered_withdrawal_that_paid_out_continues_without_an_operator() {
             // given the payout sits in the holding subaccount
             let watchdog = Arc::new(CountingWatchdog::default());
-            let (wal, saved) = wal_with(CollateralRelease::Withdrawing { alerted: true });
+            let (wal, saved) = wal_with(withdrawing(true));
 
             // when
             watcher(
@@ -1103,6 +1133,60 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn dust_in_the_holding_subaccount_does_not_count_as_the_payout() {
+            // given an unanswered withdrawal, and one unit that anyone could have sent
+            let watchdog = Arc::new(CountingWatchdog::default());
+            let (wal, saved) = wal_with(withdrawing(true));
+
+            // when
+            watcher(wal, agent_with_holding_balance(1), no_sender(), watchdog.clone())
+                .tick()
+                .await
+                .unwrap();
+
+            // then the withdrawal is still undecided
+            assert!(saved.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_forward_the_ledger_cannot_decide_is_settled_by_the_holding_balance() {
+            // given a parked send, and a holding subaccount the collateral has left
+            let amount = Nat::from(SEIZED - 2 * FEE);
+            let mut parked = OutboundRecord::prepared(PreparedSend {
+                sender: "icp".into(),
+                identity: "id-1".into(),
+                payload: "{}".into(),
+                replay_safe: true,
+            });
+            parked.phase = crate::outbound::driver::OutboundPhase::Parked {
+                reason: "too old".into(),
+            };
+            let (wal, saved) = wal_with(CollateralRelease::Forwarding {
+                amount: amount.clone(),
+                send: Some(parked),
+            });
+            let mut sender = MockOutboundSender::new();
+            sender.expect_prepare().times(0);
+            sender.expect_settle().returning(|_| SendOutcome::Open {
+                reason: "too old".into(),
+            });
+
+            // when
+            watcher(wal, agent_with_holding_balance(0), sender, Arc::default())
+                .tick()
+                .await
+                .unwrap();
+
+            // then the transfer counts as landed and the row is enqueued
+            let saved = saved.lock().unwrap();
+            let last = saved.last().unwrap();
+            assert_eq!(last.status, ResultStatus::Enqueued);
+            let receipt = decode_receipt_wrapper(last).unwrap().unwrap().receipt;
+            assert_eq!(receipt.collateral_release, Some(CollateralRelease::Released));
+            assert_eq!(receipt.liquidation_result.unwrap().amounts.collateral_received, amount);
+        }
+
+        #[tokio::test]
         async fn an_accepted_withdrawal_waits_until_the_payout_has_arrived() {
             // given nothing in the holding subaccount yet
             let (wal, saved) = wal_with(CollateralRelease::Requested {
@@ -1110,8 +1194,8 @@ mod tests {
                 expected: Nat::from(SEIZED - FEE),
             });
 
-            // when
-            watcher(wal, agent_with_holding_balance(0), no_sender(), Arc::default())
+            // when only part of it is there
+            watcher(wal, agent_with_holding_balance(SEIZED / 2), no_sender(), Arc::default())
                 .tick()
                 .await
                 .unwrap();
@@ -1145,7 +1229,6 @@ mod tests {
                 Some(CollateralRelease::Forwarding {
                     amount: Nat::from(SEIZED - 2 * FEE),
                     send: None,
-                    alerted: false,
                 })
             );
         }
@@ -1157,7 +1240,6 @@ mod tests {
             let (wal, saved) = wal_with(CollateralRelease::Forwarding {
                 amount: amount.clone(),
                 send: None,
-                alerted: false,
             });
             let mut sender = MockOutboundSender::new();
             let expected = amount.clone();
