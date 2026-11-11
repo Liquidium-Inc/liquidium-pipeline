@@ -23,6 +23,42 @@ fn unavailable(error: KrakenApiError) -> FundingRouteError {
     FundingRouteError::Unavailable(error.to_string())
 }
 
+/// What Kraken offers for one route, read without moving funds. The texts are
+/// for an operator; no code decides on them.
+#[derive(Debug, Clone)]
+pub struct KrakenRouteCheck {
+    pub deposit: Result<KrakenDepositCheck, String>,
+    pub withdrawal: Result<KrakenWithdrawalCheck, String>,
+    /// Every method Kraken lists for the asset, as `method (network)`, so an
+    /// operator can see why a route found none.
+    pub listed_deposit_methods: Vec<String>,
+    pub listed_withdrawal_methods: Vec<String>,
+    /// Every withdrawal address saved for the asset, verified or not, as
+    /// `address (method, verified)`.
+    pub saved_withdrawal_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KrakenDepositCheck {
+    pub method: String,
+    pub minimum: Decimal,
+    pub address: String,
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KrakenWithdrawalCheck {
+    pub method: String,
+    pub network: Option<String>,
+    pub minimum: Decimal,
+    /// Every verified address saved for this method.
+    pub verified: Vec<String>,
+    /// Whether `destination` is one of them; a leg can only withdraw there.
+    pub destination_verified: bool,
+    /// Kraken's fee for a withdrawal of the minimum, once the address is verified.
+    pub fee_at_minimum: Option<Result<Decimal, String>>,
+}
+
 impl KrakenClient {
     /// The deposit method, address and memo for an asset on a network.
     async fn resolve_deposit(
@@ -164,6 +200,71 @@ impl KrakenClient {
         })
     }
 
+    /// The deposit and withdrawal side of one route, as the leg would resolve
+    /// them. Only reads: no address is created and nothing is sent.
+    pub async fn route_check(&self, asset: &str, network: &str, destination: &str) -> KrakenRouteCheck {
+        let deposit = self
+            .resolve_deposit(asset, network)
+            .await
+            .map(|(method, address, tag)| KrakenDepositCheck {
+                method: method.method,
+                minimum: method.minimum,
+                address,
+                tag,
+            })
+            .map_err(|error| error.to_string());
+        let withdrawal = match self.withdrawal_method_and_addresses(asset, network).await {
+            Ok((method, verified)) => {
+                let key = verified
+                    .iter()
+                    .find(|(address, _)| addresses_match(address, destination))
+                    .map(|(_, key)| key.clone());
+                let fee_at_minimum = match &key {
+                    Some(key) => Some(
+                        self.api
+                            .withdrawal_fee(&api_asset(asset), key, method.minimum)
+                            .await
+                            .map_err(|error| error.to_string()),
+                    ),
+                    None => None,
+                };
+                Ok(KrakenWithdrawalCheck {
+                    method: method.method,
+                    network: method.network,
+                    minimum: method.minimum,
+                    verified: verified.into_iter().map(|(address, _)| address).collect(),
+                    destination_verified: key.is_some(),
+                    fee_at_minimum,
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        let api_asset = api_asset(asset);
+        let listed = |methods: Result<Vec<KrakenFundingMethod>, KrakenApiError>| match methods {
+            Ok(methods) => methods
+                .into_iter()
+                .map(|method| format!("{} ({})", method.method, method.network.as_deref().unwrap_or("-")))
+                .collect(),
+            Err(error) => vec![format!("read failed: {error}")],
+        };
+        KrakenRouteCheck {
+            deposit,
+            withdrawal,
+            listed_deposit_methods: listed(self.deposit_methods(&api_asset).await),
+            listed_withdrawal_methods: listed(self.withdrawal_methods(&api_asset).await),
+            saved_withdrawal_addresses: match self.withdrawal_addresses(&api_asset).await {
+                Ok(addresses) => addresses
+                    .into_iter()
+                    .map(|entry| {
+                        let state = if entry.verified { "verified" } else { "NOT verified" };
+                        format!("{} ({}, {state})", entry.address, entry.method)
+                    })
+                    .collect(),
+                Err(error) => vec![format!("read failed: {error}")],
+            },
+        }
+    }
+
     pub(super) async fn submit_withdrawal(
         &self,
         asset: &str,
@@ -267,6 +368,8 @@ pub(super) fn addresses_match(stored: &str, destination: &str) -> bool {
 enum KnownChain {
     Ethereum,
     Bitcoin,
+    InternetComputer,
+    Solana,
 }
 
 impl KnownChain {
@@ -274,6 +377,8 @@ impl KnownChain {
         match requested.trim().to_ascii_uppercase().as_str() {
             "ETH" | "ETHEREUM" | "ERC20" => Some(Self::Ethereum),
             "BTC" | "BITCOIN" => Some(Self::Bitcoin),
+            "ICP" | "INTERNET COMPUTER" | "INTERNET COMPUTER PROTOCOL" => Some(Self::InternetComputer),
+            "SOL" | "SOLANA" => Some(Self::Solana),
             _ => None,
         }
     }
@@ -283,6 +388,9 @@ impl KnownChain {
         match self {
             Self::Ethereum => "ethereum",
             Self::Bitcoin => "bitcoin",
+            // Kraken spells the network out; "ICP" appears only in the method name.
+            Self::InternetComputer => "internet computer protocol",
+            Self::Solana => "solana",
         }
     }
 }
@@ -315,6 +423,8 @@ fn method_name_names_chain(requested: &str, method_name: &str) -> bool {
             ethereum_spelling && !OTHER_CHAIN_QUALIFIERS.iter().any(|other| name.contains(other))
         }
         Some(KnownChain::Bitcoin) => name.contains("bitcoin") && !name.contains("lightning") && !name.contains("kbtc"),
+        Some(KnownChain::InternetComputer) => name.contains("internet computer"),
+        Some(KnownChain::Solana) => name.contains("solana"),
     }
 }
 

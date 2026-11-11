@@ -7,4 +7,5 @@ mod rest;
 mod tests;
 mod trading;
 
-pub use client::KrakenClient;
+pub use client::{KrakenClient, KrakenPairLimits};
+pub use funding::{KrakenDepositCheck, KrakenRouteCheck, KrakenWithdrawalCheck};
