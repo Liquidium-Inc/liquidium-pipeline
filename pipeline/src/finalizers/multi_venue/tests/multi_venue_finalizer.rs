@@ -32,12 +32,12 @@ use crate::{
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, LiqResultRecord,
         MultiVenueExecutionOutcome, MultiVenueExecutionState, RecoverySweepState, RecoverySweepStatus, ResultStatus,
-        VenueExecutionState, VenueLegState, VenueLegStatus, WalStore,
+        VenueExecutionState, VenueLegFailure, VenueLegState, VenueLegStatus, WalStore,
     },
     stage::PipelineStage,
     stages::{
         executor::{ExecutionReceipt, ExecutionStatus},
-        finalize::{FinalizeStage, MAX_FINALIZER_ERRORS},
+        finalize::{FinalizeStage, MAX_FINALIZER_ATTEMPTS, MAX_FINALIZER_ERRORS},
     },
     swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
     utils::{CKUSDC_LEDGER_PRINCIPAL, CKUSDT_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
@@ -78,14 +78,7 @@ struct TestWal {
 
 impl TestWal {
     fn with_receipt(receipt: &ExecutionReceipt) -> Self {
-        let wrapper = LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        };
+        let wrapper = LiqMetaWrapper::new(receipt.clone());
         Self::with_wrapper(wrapper)
     }
 
@@ -232,24 +225,23 @@ impl BatchWal {
             .status
     }
 
-    fn set_status(&self, liquidation_id: u128, status: ResultStatus) {
+    fn row(&self, liquidation_id: u128) -> LiqResultRecord {
         self.rows
             .lock()
             .expect("batch WAL lock")
-            .iter_mut()
+            .iter()
             .find(|row| row.id == liquidation_id.to_string())
             .expect("batch WAL row")
-            .status = status;
+            .clone()
     }
 
-    fn set_error_count(&self, liquidation_id: u128, error_count: i32) {
-        self.rows
-            .lock()
-            .expect("batch WAL lock")
-            .iter_mut()
-            .find(|row| row.id == liquidation_id.to_string())
-            .expect("batch WAL row")
-            .error_count = error_count;
+    fn update_row(&self, liquidation_id: u128, update: impl FnOnce(&mut LiqResultRecord)) {
+        let mut rows = self.rows.lock().expect("batch WAL lock");
+        update(
+            rows.iter_mut()
+                .find(|row| row.id == liquidation_id.to_string())
+                .expect("batch WAL row"),
+        );
     }
 
     fn make_retry_due(&self, liquidation_id: u128) {
@@ -336,6 +328,11 @@ impl WalStore for BatchWal {
         if bump_attempt {
             row.attempt += 1;
         }
+        // As the store: an error-free release restarts the strikes.
+        if matches!(next, ResultStatus::Enqueued | ResultStatus::Succeeded) {
+            row.error_count = 0;
+            row.last_error = None;
+        }
         Ok(())
     }
 
@@ -380,6 +377,13 @@ struct ScriptedAdapter {
     /// Makes `preview` fail the way a venue outage does, so the planner sees
     /// the venue as unavailable rather than as quoted.
     preview_failure: Option<String>,
+    /// The open question a parked leg asks an operator.
+    operator_question: Option<String>,
+    /// Makes `advance` checkpoint progress tagged for another venue, which
+    /// the parent refuses permanently, and return only the refusal text.
+    checkpoint_foreign_venue: bool,
+    /// Why a scripted `FailedPermanent` leg failed.
+    failure: Option<VenueLegFailure>,
 }
 
 impl ScriptedAdapter {
@@ -397,7 +401,25 @@ impl ScriptedAdapter {
             observed_statuses: Mutex::new(Vec::new()),
             advance_failure: None,
             preview_failure: None,
+            operator_question: None,
+            checkpoint_foreign_venue: false,
+            failure: None,
         }
+    }
+
+    fn with_failure(mut self, failure: VenueLegFailure) -> Self {
+        self.failure = Some(failure);
+        self
+    }
+
+    fn with_foreign_checkpoint(mut self) -> Self {
+        self.checkpoint_foreign_venue = true;
+        self
+    }
+
+    fn with_operator_question(mut self, question: &str) -> Self {
+        self.operator_question = Some(question.to_string());
+        self
     }
 
     fn with_advance_failure(mut self, error: &str) -> Self {
@@ -463,10 +485,10 @@ impl MultiVenueAdapter for ScriptedAdapter {
             _ => 50.0,
         };
         let receive = Nat::from(pay * 2);
-        Ok(VenueRoutePreview {
-            venue_id: self.venue_id.to_string(),
-            request: request.clone(),
-            quote: SwapQuote {
+        Ok(VenueRoutePreview::new(
+            self.venue_id.to_string(),
+            request.clone(),
+            SwapQuote {
                 pay_asset: request.pay_asset.clone(),
                 pay_amount: request.pay_amount.value.clone(),
                 receive_asset: request.receive_asset.clone(),
@@ -476,22 +498,37 @@ impl MultiVenueAdapter for ScriptedAdapter {
                 estimated_price_impact_bps: impact,
                 legs: Vec::new(),
             },
-            conservative_receive: ChainTokenAmount::from_raw(debt_token(), receive),
-            initial_execution_state: VenueExecutionState {
+            ChainTokenAmount::from_raw(debt_token(), receive),
+            VenueExecutionState {
                 venue: self.venue_id.to_string(),
                 state: serde_json::json!({ "step": "planned" }),
             },
-        })
+        ))
     }
 
     async fn advance(
         &self,
         leg: &VenueLegState,
-        _checkpoint: &dyn VenueLegCheckpoint,
+        checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
         self.advance_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = &self.advance_failure {
             return Err(error.clone());
+        }
+        if self.checkpoint_foreign_venue {
+            checkpoint
+                .checkpoint(VenueLegProgress {
+                    execution: VenueExecutionState {
+                        venue: "elsewhere".to_string(),
+                        state: serde_json::json!({}),
+                    },
+                    status: VenueLegStatus::Running,
+                    result: None,
+                    last_error: None,
+                    retryable_error: None,
+                    failure: None,
+                })
+                .await?;
         }
         if let Some(wal) = self.wal.lock().expect("observer lock").upgrade() {
             self.observed_statuses
@@ -521,7 +558,34 @@ impl MultiVenueAdapter for ScriptedAdapter {
             result,
             last_error: retryable_error.clone(),
             retryable_error,
+            failure: self.failure.filter(|_| status == VenueLegStatus::FailedPermanent),
         })
+    }
+
+    fn operator_questions(
+        &self,
+        _leg: &VenueLegState,
+    ) -> Result<Vec<crate::finalizers::multi_venue::OperatorQuestion>, String> {
+        Ok(self
+            .operator_question
+            .iter()
+            .map(|detail| crate::finalizers::multi_venue::OperatorQuestion { detail: detail.clone() })
+            .collect())
+    }
+
+    fn operator_release(
+        &self,
+        _leg: &VenueLegState,
+        answer: Option<&crate::outbound::driver::OperatorDecision>,
+    ) -> Result<VenueExecutionState, String> {
+        match (&self.operator_question, answer) {
+            (Some(question), None) => Err(format!("leg waits for an answer: {question}")),
+            (None, Some(_)) => Err("leg has no open question".to_string()),
+            _ => Ok(VenueExecutionState {
+                venue: self.venue_id.to_string(),
+                state: serde_json::json!({ "released_with": format!("{answer:?}") }),
+            }),
+        }
     }
 
     async fn recover(
@@ -542,6 +606,7 @@ impl MultiVenueAdapter for ScriptedAdapter {
             result: (status == VenueLegStatus::Completed).then(|| execution_for(leg)),
             last_error: leg.last_error.clone(),
             retryable_error: None,
+            failure: None,
         })
     }
 }
@@ -642,18 +707,7 @@ fn row_for_receipt(receipt: ExecutionReceipt) -> LiqResultRecord {
         updated_at: 0,
         meta_json: String::new(),
     };
-    encode_meta(
-        &mut row,
-        &LiqMetaWrapper {
-            receipt,
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        },
-    )
-    .expect("encode batch WAL row");
+    encode_meta(&mut row, &LiqMetaWrapper::new(receipt)).expect("encode batch WAL row");
     row
 }
 
@@ -684,6 +738,8 @@ fn execution_for(leg: &VenueLegState) -> SwapExecution {
         }],
         approval_count: None,
         ts: 0,
+        side_costs: Vec::new(),
+        side_cost_receive: None,
     }
 }
 
@@ -692,6 +748,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
         max_search_iterations: 16,
         dust_fallback_max_price_impact_bps: 150.0,
+        max_cex_price_impact_bps: 200.0,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
         settlement_min_net_edge_bps: None,
@@ -700,6 +757,8 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+        mexc_test_allocation_usd: None,
+        cycles_usd_per_trillion: 1.35,
     }
 }
 
@@ -804,7 +863,7 @@ async fn recovery_transfer_is_persisted_as_ready_before_it_is_submitted() {
 
 mod cketh_bridge_minimum {
     use super::*;
-    use crate::finalizers::{bridge_runtime::BridgeRuntime, mexc::mexc_finalizer::MexcFinalizer};
+    use crate::{bridge::runtime::BridgeRuntime, finalizers::cex::finalizer::CexVenueFinalizer};
     use liquidium_pipeline_connectors::backend::{
         bridge_backend::{BridgeFeeBudget, MockBridgeBackend},
         cex_backend::MockCexBackend,
@@ -814,7 +873,7 @@ mod cketh_bridge_minimum {
     const COLLATERAL: u64 = 4_000_000_000_000_000;
     const LEDGER_FEE: u64 = 2_000_000_000_000;
 
-    fn setup(debt: ChainToken, bridge_unavailable: bool) -> (ExecutionReceipt, Arc<MexcFinalizer<MockCexBackend>>) {
+    fn setup(debt: ChainToken, bridge_unavailable: bool) -> (ExecutionReceipt, Arc<CexVenueFinalizer<MockCexBackend>>) {
         let collateral = ChainToken::Icp {
             ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
             symbol: "ckETH".into(),
@@ -850,7 +909,7 @@ mod cketh_bridge_minimum {
         let mut venue_transfers = MockTransferActions::new();
         venue_transfers.expect_transfer().times(0);
         // No exchange calls are allowed: the bridge minimum rejects the route before its quote.
-        let mexc = MexcFinalizer::new(
+        let mexc = CexVenueFinalizer::new(
             Arc::new(MockCexBackend::new()),
             Arc::new(venue_transfers),
             Principal::anonymous(),
@@ -948,7 +1007,10 @@ mod cketh_bridge_minimum {
                 .expect_err("outages remain retryable");
 
             assert!(error.to_string().contains("unavailable"));
-            assert!(matches!(error, FinalizerError::Retryable(_)));
+            assert!(
+                matches!(error, FinalizerError::NoRoute(_)),
+                "an outage is a route that may return"
+            );
             assert!(wal.wrapper().meta_v2.is_none());
         }
     }
@@ -1175,7 +1237,10 @@ async fn transient_icpswap_outage_below_minimum_is_retried_instead_of_swept() {
         error.message().contains("canister is out of cycles"),
         "expected the outage to be reported: {error}"
     );
-    assert!(matches!(error, FinalizerError::Retryable(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::NoRoute(_)),
+        "unexpected kind: {error:?}"
+    );
     assert!(
         wal.wrapper().meta_v2.is_none(),
         "an outage must not commit a recovery sweep"
@@ -1322,7 +1387,8 @@ async fn bad_debt_below_minimum_edge_never_advances_a_venue_leg() {
 
     assert!(error.message().contains("below required 150 bps"));
     assert_eq!(icpswap.previews(), 1);
-    assert_eq!(mexc.previews(), 0);
+    // MEXC is tried under the same floor before the planner gives up (audit L11).
+    assert_eq!(mexc.previews(), 1);
     assert_eq!(icpswap.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none(), "a rejected plan must not be committed");
@@ -1624,6 +1690,33 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
 }
 
 #[tokio::test]
+async fn a_leg_that_met_only_a_route_minimum_is_a_bad_debt_floor() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(
+        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::FailedPermanent])
+            .with_failure(VenueLegFailure::BelowMinimum),
+    );
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap, mexc]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("nothing was swapped");
+
+    // The stage accepts this for a bad-debt row and fails it otherwise.
+    assert!(
+        matches!(error, FinalizerError::BadDebtAmountFloor(_)),
+        "unexpected kind: {error:?}"
+    );
+    assert_eq!(
+        committed_state(&wal).legs[0].failure,
+        Some(VenueLegFailure::BelowMinimum)
+    );
+}
+
+#[tokio::test]
 async fn partial_recovery_still_reports_the_completed_leg_proceeds() {
     let receipt = receipt();
     let wal = TestWal::with_receipt(&receipt);
@@ -1736,6 +1829,31 @@ async fn committed_legacy_state_is_rejected_without_being_upgraded() {
     assert_eq!(adapter.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none());
+}
+
+#[tokio::test]
+async fn a_checkpoint_the_parent_refuses_fails_the_row_permanently() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap =
+        Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::Running]).with_foreign_checkpoint());
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap, mexc]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("a foreign checkpoint can never be applied");
+
+    // The adapter hands back only text; the decision comes from the checkpoint.
+    assert!(
+        matches!(error, FinalizerError::Permanent(_)),
+        "unexpected kind: {error:?}"
+    );
+    assert!(
+        error.message().contains("adapter returned venue `elsewhere`"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1967,12 +2085,129 @@ async fn reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
     assert_eq!(mexc.calls(), 1);
 
-    wal.set_status(LIQUIDATION_ID, ResultStatus::Enqueued);
+    wal.update_row(LIQUIDATION_ID, |row| row.status = ResultStatus::Enqueued);
     assert!(stage.process(&()).await.expect("polling cycle").is_empty());
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
     assert_eq!(mexc.recovery_calls(), 0);
     assert_eq!(mexc.calls(), 1);
     assert_eq!(mexc.previews(), 1);
+}
+
+#[tokio::test]
+async fn reconcile_answers_a_parked_leg_and_queues_the_row_again() {
+    use crate::{operator::OperatorDesk, outbound::driver::OperatorDecision};
+    use crate::operator::{OperatorConsole, ReconcileAction, ReconcileRequest};
+    const LIQUIDATION_ID: u128 = 809;
+    let wal = Arc::new(BatchWal::new([receipt_with_id(LIQUIDATION_ID)]));
+    let mexc = Arc::new(
+        ScriptedAdapter::new(
+            MEXC_VENUE_ID,
+            None,
+            vec![VenueLegStatus::OperatorRequired, VenueLegStatus::Running],
+        )
+        .with_operator_question("did send x land?"),
+    );
+    let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
+    let stage = FinalizeStage::new(
+        wal.clone(),
+        finalizer.clone(),
+        Arc::new(SimpleProfitCalculator),
+        Arc::new(MockPipelineAgent::new()),
+        Principal::anonymous(),
+        1,
+        60,
+    );
+    let desk = OperatorDesk::new(wal.clone(), finalizer);
+    let request = |action| ReconcileRequest {
+        liq_id: LIQUIDATION_ID.to_string(),
+        leg_id: None,
+        action,
+    };
+
+    assert!(stage.process(&()).await.expect("parking cycle").is_empty());
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
+
+    let report = desk.reconcile(request(ReconcileAction::Show)).await.expect("show");
+    assert!(report.contains("question: did send x land?"), "{report}");
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired, "show changes nothing");
+
+    let error = desk.reconcile(request(ReconcileAction::Release)).await.unwrap_err();
+    assert!(error.contains("waits for an answer"), "{error}");
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
+
+    wal.update_row(LIQUIDATION_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
+    let report = desk
+        .reconcile(request(ReconcileAction::Answer(OperatorDecision::Absent)))
+        .await
+        .expect("answer");
+    assert!(report.contains("queued again"), "{report}");
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::Enqueued);
+    assert_eq!(
+        wal.row(LIQUIDATION_ID).error_count,
+        0,
+        "a release starts a new error budget"
+    );
+
+    // The next finalize cycle advances the released leg.
+    stage.process(&()).await.expect("released cycle");
+    assert_eq!(mexc.calls(), 2);
+    assert_ne!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
+    let error = desk.reconcile(request(ReconcileAction::Release)).await.unwrap_err();
+    assert!(error.contains("not parked"), "{error}");
+}
+
+/// A budget parks the row while its leg still runs. A release must give the row
+/// fresh error and attempt budgets, or the cap parks it again at once.
+#[tokio::test]
+async fn reconcile_releases_a_row_parked_by_a_budget() {
+    use crate::operator::{OperatorConsole, OperatorDesk, ReconcileAction, ReconcileRequest};
+    const LIQUIDATION_ID: u128 = 810;
+    let wal = Arc::new(BatchWal::new([receipt_with_id(LIQUIDATION_ID)]));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Running, VenueLegStatus::Running],
+    ));
+    let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
+    let stage = FinalizeStage::new(
+        wal.clone(),
+        finalizer.clone(),
+        Arc::new(SimpleProfitCalculator),
+        Arc::new(MockPipelineAgent::new()),
+        Principal::anonymous(),
+        1,
+        60,
+    );
+    let desk = OperatorDesk::new(wal.clone(), finalizer);
+    let request = |action| ReconcileRequest {
+        liq_id: LIQUIDATION_ID.to_string(),
+        leg_id: None,
+        action,
+    };
+
+    stage.process(&()).await.expect("first cycle");
+    wal.update_row(LIQUIDATION_ID, |row| {
+        row.status = ResultStatus::OperatorRequired;
+        row.attempt = MAX_FINALIZER_ATTEMPTS;
+        row.error_count = MAX_FINALIZER_ERRORS;
+    });
+
+    let report = desk.reconcile(request(ReconcileAction::Show)).await.expect("show");
+    assert!(report.contains("no leg is parked"), "{report}");
+
+    let report = desk
+        .reconcile(request(ReconcileAction::Release))
+        .await
+        .expect("release");
+    assert!(report.contains("queued again"), "{report}");
+    let row = wal.row(LIQUIDATION_ID);
+    assert_eq!(
+        (row.status, row.error_count, row.attempt),
+        (ResultStatus::Enqueued, 0, 0)
+    );
+
+    stage.process(&()).await.expect("released cycle");
+    assert_eq!(mexc.calls(), 2, "the released row is worked again");
 }
 
 #[tokio::test]
@@ -2026,14 +2261,21 @@ async fn mexc_custody_row_exhausting_retries_parks_without_blocking_the_next_bat
         receipt_with_id(EXHAUSTED_ID),
         receipt_with_id(SUCCEEDING_ID),
     ]));
-    wal.set_error_count(EXHAUSTED_ID, MAX_FINALIZER_ERRORS - 1);
     let mexc = Arc::new(
         ScriptedAdapter::new(
             MEXC_VENUE_ID,
             None,
-            vec![VenueLegStatus::Running, VenueLegStatus::Completed],
+            vec![
+                VenueLegStatus::Running,
+                VenueLegStatus::Completed,
+                VenueLegStatus::Running,
+            ],
         )
-        .with_retryable_errors(vec![Some("last retryable MEXC failure".to_string()), None]),
+        .with_retryable_errors(vec![
+            Some("first retryable MEXC failure".to_string()),
+            None,
+            Some("last retryable MEXC failure".to_string()),
+        ]),
     );
     let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
     let stage = FinalizeStage::new(
@@ -2046,10 +2288,46 @@ async fn mexc_custody_row_exhausting_retries_parks_without_blocking_the_next_bat
         60,
     );
 
+    // The first pass commits both plans; the second spends the last strike
+    // on the committed custody row.
+    let outcomes = stage.process(&()).await.expect("the first pass should continue");
+    assert_eq!(wal.status(SUCCEEDING_ID), ResultStatus::Succeeded);
+    assert_eq!(outcomes.len(), 1);
+    wal.update_row(EXHAUSTED_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
+    wal.make_retry_due(EXHAUSTED_ID);
     let outcomes = stage.process(&()).await.expect("failure-limit batch should continue");
 
     assert_eq!(wal.status(EXHAUSTED_ID), ResultStatus::OperatorRequired);
-    assert_eq!(wal.status(SUCCEEDING_ID), ResultStatus::Succeeded);
-    assert_eq!(mexc.calls(), 2);
-    assert_eq!(outcomes.len(), 1);
+    assert_eq!(mexc.calls(), 3);
+    assert!(outcomes.is_empty());
+}
+
+/// Review finding 7: strikes from route searches that found nothing must not
+/// make the first real error of a newly committed plan park the row.
+#[tokio::test]
+async fn a_committed_plan_drops_the_route_search_strikes() {
+    const ROW_ID: u128 = 811;
+    let wal = Arc::new(BatchWal::new([receipt_with_id(ROW_ID)]));
+    wal.update_row(ROW_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
+    let mexc = Arc::new(
+        ScriptedAdapter::new(MEXC_VENUE_ID, None, vec![VenueLegStatus::Running])
+            .with_retryable_errors(vec![Some("one transient read failure".to_string())]),
+    );
+    let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
+    let stage = FinalizeStage::new(
+        wal.clone(),
+        finalizer,
+        Arc::new(SimpleProfitCalculator),
+        Arc::new(MockPipelineAgent::new()),
+        Principal::anonymous(),
+        1,
+        60,
+    );
+
+    stage.process(&()).await.expect("the batch should continue");
+
+    assert_eq!(wal.status(ROW_ID), ResultStatus::FailedRetryable);
+    let mut strikes = 0;
+    wal.update_row(ROW_ID, |row| strikes = row.error_count);
+    assert_eq!(strikes, 1, "only the error after the commit counts");
 }

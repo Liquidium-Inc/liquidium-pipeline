@@ -18,8 +18,11 @@ use tokio::time::timeout;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 use crate::{
-    approval_state::ApprovalState, liquidation::supply_funding::LiquidationFunding,
-    persistance::LiquidationIntentStore, utils::max_for_ledger,
+    approval_state::ApprovalState,
+    liquidation::supply_funding::LiquidationFunding,
+    persistance::LiquidationIntentStore,
+    utils::{approval_threshold, max_for_ledger},
+    watchdog::{Watchdog, noop_watchdog},
 };
 
 const ALLOWANCE_LEDGER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -47,6 +50,8 @@ pub struct BasicExecutor<A: PipelineAgent, D: LiquidationIntentStore + Sync + Se
     pub approval_state: Arc<ApprovalState>,
     pub funding: LiquidationFunding,
     in_flight: Arc<AtomicUsize>,
+    /// Where a liquidation that may have run without a WAL row is reported.
+    pub(crate) watchdog: Arc<dyn Watchdog>,
     low_balance_allowance_warned_ledgers: Mutex<HashSet<Principal>>,
 }
 
@@ -75,6 +80,7 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
             approval_state,
             funding: LiquidationFunding::Wallet,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            watchdog: noop_watchdog(),
             low_balance_allowance_warned_ledgers: Mutex::new(HashSet::new()),
         }
     }
@@ -98,6 +104,11 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
     /// Supply-funded liquidations never pull from the wallet, so they need no allowances.
     fn needs_allowances(&self) -> bool {
         self.funding == LiquidationFunding::Wallet
+    }
+
+    pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
+        self.watchdog = watchdog;
+        self
     }
 
     pub async fn init(&mut self, tokens: &[Principal]) -> Result<(), String> {
@@ -128,7 +139,7 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
     async fn ensure_lending_allowance_for_ledger(&self, ledger: Principal) -> Result<EnsureAllowanceResult, String> {
         let spender = self.lending_spender();
         let spender_account = self.lending_spender_account();
-        let threshold = self.allowance_threshold(&ledger);
+        let threshold = approval_threshold(&ledger);
         let allowance_before = self.allowance(&ledger, spender_account).await?;
 
         let mut allowance_after = allowance_before.clone();
@@ -250,10 +261,6 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
             account.owner.to_text(),
             account.subaccount.is_some()
         )
-    }
-
-    fn allowance_threshold(&self, ledger: &Principal) -> Nat {
-        max_for_ledger(ledger) / Nat::from(2u8)
     }
 
     fn handle_startup_allowance_result(

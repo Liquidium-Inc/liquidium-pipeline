@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate};
+use super::{
+    BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeRequest, BridgeSend, BridgeStatus,
+    BridgeSubmission, BridgeSubmissionCandidate, DepositNotice,
+};
 
 /// Keeps provider-specific submission handles with the backend that issued them.
 pub struct RoutedBridgeBackend {
@@ -67,8 +70,27 @@ impl BridgeBackend for RoutedBridgeBackend {
         self.source(asset, chain).get_minimum_bridge_amount(asset, chain, target).await
     }
 
-    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
+    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, BridgeError> {
         self.source(&request.asset, &request.source_chain).submit_bridge(request).await
+    }
+
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, BridgeError> {
+        self.source(&request.asset, &request.source_chain)
+            .prepare_bridge_send(request)
+            .await
+    }
+
+    async fn track_deposit(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+        handle: &str,
+        receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        self.source(asset, chain)
+            .track_deposit(asset, chain, destination, handle, receipt)
+            .await
     }
 
     async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
@@ -88,7 +110,7 @@ impl BridgeBackend for RoutedBridgeBackend {
             .await
     }
 
-    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
         // Existing WAL handles must survive the addition of another provider.
         // ckSOL owns these prefixes; all pre-existing ckETH handles stay with EVM.
         if bridge_id.starts_with("cksol-") {

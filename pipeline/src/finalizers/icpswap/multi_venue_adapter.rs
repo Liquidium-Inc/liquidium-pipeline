@@ -1,8 +1,14 @@
 use std::sync::Mutex;
 
-use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step};
+use super::{
+    finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step},
+    operator,
+};
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview},
+    finalizers::multi_venue::{
+        MultiVenueAdapter, OperatorQuestion, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview,
+    },
+    outbound::driver::OperatorDecision,
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::{
         icpswap::{
@@ -95,6 +101,7 @@ impl IcpswapExecutionStateStore for CheckpointedLegStateStore<'_> {
                 result: None,
                 last_error: state.last_error.clone(),
                 retryable_error: None,
+                failure: None,
             })
             .await
     }
@@ -146,6 +153,7 @@ impl IcpswapFinalizer {
             result,
             last_error,
             retryable_error: advance_error,
+            failure: None,
         })
     }
 
@@ -223,13 +231,13 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         // ID becomes the durable idempotency key used for every later advance.
         let execution_id = crate::utils::new_venue_execution_id(VENUE_ID);
         let state = self.prepare_execution_state(&execution_id, &context.liquidation_id, request, preview.route)?;
-        Ok(VenueRoutePreview {
-            venue_id: VENUE_ID.to_string(),
-            request: request.clone(),
-            quote: preview.quote,
+        Ok(VenueRoutePreview::new(
+            VENUE_ID,
+            request.clone(),
+            preview.quote,
             conservative_receive,
-            initial_execution_state: VenueExecutionState::new(VENUE_ID, &state)?,
-        })
+            VenueExecutionState::new(VENUE_ID, &state)?,
+        ))
     }
 
     async fn advance(
@@ -238,6 +246,20 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
         self.advance_leg(leg, checkpoint).await
+    }
+
+    fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
+        operator::operator_questions(&self.decode_leg_state(leg)?)
+    }
+
+    fn operator_release(
+        &self,
+        leg: &VenueLegState,
+        answer: Option<&OperatorDecision>,
+    ) -> Result<VenueExecutionState, String> {
+        let mut state = self.decode_leg_state(leg)?;
+        operator::release(&mut state, answer)?;
+        VenueExecutionState::new(VENUE_ID, &state)
     }
 
     async fn recover(

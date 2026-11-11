@@ -17,6 +17,18 @@ pub enum ChainAccount {
     Solana(String), // Solana address (base58 pubkey)
 }
 
+/// The address text an operator would paste.
+impl std::fmt::Display for ChainAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChainAccount::Icp(account) => write!(f, "{account}"),
+            ChainAccount::IcpLedger(address) | ChainAccount::Evm(address) | ChainAccount::Solana(address) => {
+                f.write_str(address)
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for Chain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

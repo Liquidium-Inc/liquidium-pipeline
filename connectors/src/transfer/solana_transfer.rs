@@ -26,19 +26,15 @@ impl<B: SolanaBackend + Send + Sync> TransferActions for SolanaTransferAdapter<B
         to: &ChainAccount,
         amount_native: Nat,
     ) -> Result<String, TransferFailure> {
-        // The backend does not distinguish RPC confirmation failures from rejection;
-        // funds may have moved, so callers must reconcile before retrying.
+        // The backend settles an unconfirmed send against the cluster, so its
+        // failure already says whether funds may have moved.
         match (token, to) {
-            (ChainToken::SolanaNative { .. }, ChainAccount::Solana(to_address)) => self
-                .backend
-                .native_transfer(to_address, amount_native)
-                .await
-                .map_err(TransferFailure::Ambiguous),
-            (ChainToken::SolanaSpl { mint, .. }, ChainAccount::Solana(to_address)) => self
-                .backend
-                .spl_transfer(mint, to_address, amount_native)
-                .await
-                .map_err(TransferFailure::Ambiguous),
+            (ChainToken::SolanaNative { .. }, ChainAccount::Solana(to_address)) => {
+                self.backend.native_transfer(to_address, amount_native).await
+            }
+            (ChainToken::SolanaSpl { mint, .. }, ChainAccount::Solana(to_address)) => {
+                self.backend.spl_transfer(mint, to_address, amount_native).await
+            }
             (ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. }, _) => Err(TransferFailure::Rejected(
                 "SolanaTransferAdapter: destination chain must be Solana".to_string(),
             )),

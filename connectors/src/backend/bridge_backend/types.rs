@@ -2,6 +2,8 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_core::outbound::PreparedSend;
+use liquidium_pipeline_core::types::side_cost::SideCost;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,14 @@ pub enum BridgeRouteKind {
     CkBtcToBtc,
     SolanaToIcp,
     IcpToSolana,
+}
+
+impl BridgeRouteKind {
+    /// True when one send funds the route: the bridge signs it, and the
+    /// outbound driver saves, sends and settles it.
+    pub fn funded_by_signed_send(self) -> bool {
+        matches!(self, Self::SolanaToIcp | Self::CkEthErc20Forward | Self::EthToCkEth)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -93,12 +103,33 @@ pub struct BridgeFeeBudget {
     pub source_fee_budget: f64,
     pub destination_fee_budget: f64,
     pub provider_fee_budget_native_units: Option<Nat>,
+    /// Costs the route pays from other balances, for the planner to price.
+    pub side_costs: Vec<SideCost>,
 }
 
 /// Provider submission handle returned after a bridge transaction is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeSubmission {
     pub bridge_id: String,
+}
+
+/// A signed send that funds a bridge route, and the provider handle that
+/// turns its receipt into a bridge id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSend {
+    pub send: PreparedSend,
+    /// Opaque to the caller. It is saved with the send and given back to
+    /// `track_deposit`.
+    pub handle: String,
+}
+
+/// What the provider says about a deposit that already landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepositNotice {
+    /// The provider tracks the deposit under this handle.
+    Accepted(BridgeSubmission),
+    /// The provider does not track it yet. Asking again is safe.
+    NotYet { reason: String },
 }
 
 /// High-level bridge lifecycle state from the provider/backend.
@@ -121,6 +152,55 @@ pub struct BridgeMintReceipt {
     pub amount: Nat,
     pub recipient: Account,
     pub token_symbol: String,
+}
+
+/// Why a bridge did not take a request. The kind carries the caller's decision.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BridgeError {
+    /// The amount is under the route minimum, so the same request fails again.
+    #[error("{0}")]
+    BelowMinimum(String),
+    /// Refused before any provider call until the bridge wallet is ready. A
+    /// later request is safe, and the wait is not a failure.
+    #[error("{0}")]
+    Deferred(String),
+    /// A call may have moved funds, and no answer decides it. Only an operator
+    /// can say what happened, so no automatic retry is safe.
+    #[error("{0}")]
+    Ambiguous(String),
+    /// The provider could not be read, so the status is unknown. The caller
+    /// keeps waiting; the read says nothing about the funds.
+    #[error("{0}")]
+    Unreadable(String),
+    /// The provider, or a step before its call, refused the request, so
+    /// nothing moved. A new request is safe.
+    #[error("{0}")]
+    Refused(String),
+    /// Any other failure.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl BridgeError {
+    /// A failure before the provider call ran nothing, so an untyped one is a refusal.
+    pub(super) fn before_call(error: impl Into<Self>) -> Self {
+        match error.into() {
+            Self::Other(message) => Self::Refused(message),
+            typed => typed,
+        }
+    }
+}
+
+impl From<String> for BridgeError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for BridgeError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_string())
+    }
 }
 
 /// Backend contract for reading balances and executing bridge routes.
@@ -151,6 +231,7 @@ pub trait BridgeBackend: Send + Sync {
             source_fee_budget: self.get_source_fee_budget(asset, chain, target_asset).await?,
             destination_fee_budget: self.get_destination_fee_budget(asset, chain, target_asset).await?,
             provider_fee_budget_native_units: None,
+            side_costs: Vec::new(),
         })
     }
 
@@ -168,10 +249,31 @@ pub trait BridgeBackend: Send + Sync {
     ///
     /// `bridge_id` in the returned [`BridgeSubmission`] is backend-specific and is later
     /// consumed by [`BridgeBackend::get_bridge_status`] for polling.
-    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String>;
+    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, BridgeError>;
 
     /// Polls current status for a previously submitted bridge operation.
-    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError>;
+
+    /// Checks a request and signs the send that funds it, without sending it.
+    /// The outbound driver sends it, then the caller gives `track_deposit` its receipt.
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, BridgeError> {
+        let _ = request;
+        Err("signed bridge sends are not supported by this bridge backend".into())
+    }
+
+    /// The bridge handle for a send that landed with `receipt`. `handle` comes
+    /// from the send, or is a provider deposit id that an operator recorded.
+    async fn track_deposit(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+        handle: &str,
+        receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        let _ = (asset, chain, destination, handle, receipt);
+        Err("deposit tracking is not supported by this bridge backend".to_string())
+    }
 
     /// Reads the provider's history position before a submission, so a handle
     /// lost between the call and its persistence can be found again. `None`

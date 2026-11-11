@@ -417,6 +417,8 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
         }],
         approval_count: Some(0),
         ts: now_nanos / 1_000_000_000,
+        side_costs: Vec::new(),
+        side_cost_receive: None,
     })
 }
 

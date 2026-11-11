@@ -1,8 +1,11 @@
 use async_trait::async_trait;
+use candid::Nat;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+use liquidium_pipeline_core::types::side_cost::SideCost;
 
 use crate::{
-    persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
+    outbound::driver::OperatorDecision,
+    persistance::{PricedSideCost, VenueExecutionState, VenueLegFailure, VenueLegState, VenueLegStatus},
     swappers::model::{SwapExecution, SwapQuote, SwapRequest},
 };
 
@@ -28,6 +31,37 @@ pub struct VenueRoutePreview {
     pub quote: SwapQuote,
     pub conservative_receive: ChainTokenAmount,
     pub initial_execution_state: VenueExecutionState,
+    /// The output at the venue's own price before fixed transfer fees. The
+    /// oracle guard reads this, so a correctly counted fee does not look like
+    /// a bad price. `None` means the quote has no fixed fees to separate.
+    pub market_receive: Option<Nat>,
+    /// What the route pays from other balances, in their own assets.
+    pub side_costs: Vec<SideCost>,
+    /// The planner's pricing of `side_costs`. `None` until the planner prices it.
+    pub priced_side_costs: Option<Vec<PricedSideCost>>,
+}
+
+impl VenueRoutePreview {
+    /// A preview with no fixed fees to separate and no side costs. A venue
+    /// that has either sets those fields after.
+    pub fn new(
+        venue_id: impl Into<String>,
+        request: SwapRequest,
+        quote: SwapQuote,
+        conservative_receive: ChainTokenAmount,
+        initial_execution_state: VenueExecutionState,
+    ) -> Self {
+        Self {
+            venue_id: venue_id.into(),
+            request,
+            quote,
+            conservative_receive,
+            initial_execution_state,
+            market_receive: None,
+            side_costs: Vec::new(),
+            priced_side_costs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +74,15 @@ pub struct VenueLegProgress {
     /// updated leg first, then returns this error so normal finalizer backoff
     /// and retry accounting apply without losing the venue's latest state.
     pub retryable_error: Option<String>,
+    /// Why a failed leg failed, where the row's outcome depends on it.
+    pub failure: Option<VenueLegFailure>,
+}
+
+/// A fact that only an operator can supply before a parked leg moves on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorQuestion {
+    /// What is undecided, with the ids the operator needs to check it.
+    pub detail: String,
 }
 
 /// Parent-owned persistence boundary exposed to a venue while it drives its
@@ -85,6 +128,28 @@ pub trait MultiVenueAdapter: Send + Sync {
         leg: &VenueLegState,
         checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String>;
+
+    /// Questions that only an operator can answer before this parked leg
+    /// moves on. A park without a question needs a release only.
+    fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
+        let _ = leg;
+        Err(format!("venue `{}` has no operator release", self.venue_id()))
+    }
+
+    /// Writes an operator's answer (`None` releases only) into a parked leg and
+    /// clears the park. It makes no venue call; the leg acts on the next cycle.
+    fn operator_release(
+        &self,
+        leg: &VenueLegState,
+        answer: Option<&OperatorDecision>,
+    ) -> Result<VenueExecutionState, String> {
+        let _ = answer;
+        Err(format!(
+            "venue `{}` has no operator release for leg `{}`",
+            self.venue_id(),
+            leg.leg_id
+        ))
+    }
 
     /// Reconciles or recovers only the supplied leg after restart or failure.
     #[allow(dead_code)]

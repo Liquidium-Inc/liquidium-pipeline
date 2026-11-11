@@ -481,9 +481,10 @@ mod tests {
             wal.get_result("2").await.unwrap().unwrap().status,
             ResultStatus::WaitingCollateral
         );
+        // No swap, but the finalize stage still records the outcome (audit L03).
         assert_eq!(
             wal.get_result("3").await.unwrap().unwrap().status,
-            ResultStatus::Succeeded
+            ResultStatus::Enqueued
         );
     }
 

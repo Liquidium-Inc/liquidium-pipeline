@@ -20,15 +20,19 @@ use crate::{
     context::{PipelineContext, init_context},
     control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
+    bridge::{claims::WalBridgeClaims, runtime::BridgeRuntime},
     finalizers::{
-        bridge_claims::WalBridgeClaims,
-        bridge_runtime::BridgeRuntime,
-        mexc::runtime::build_mexc_finalizer,
+        cex::{
+            profile::CexVenueProfile,
+            runtime::{build_kraken_finalizer, build_mexc_finalizer},
+        },
         multi_venue::{
-            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
+            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, KRAKEN_VENUE_ID, MEXC_VENUE_ID, MultiVenueAdapter,
+            MultiVenueFinalizer,
         },
         profit_calculator::SimpleProfitCalculator,
     },
+    operator::OperatorDesk,
     liquidation::collateral_service::CollateralService,
     liquidation::supply_funding::{self, LendingSupplyBalances, LiquidationFunding, Resupplier},
     persistance::{
@@ -195,6 +199,7 @@ async fn init(
         Arc<ExportStage>,
         Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
         Arc<SqliteWalStore>,
+        Arc<dyn crate::operator::OperatorConsole>,
     ),
     String,
 > {
@@ -206,8 +211,21 @@ async fn init(
         .recover_submitting_as_ambiguous("process restarted during liquidation submission")
         .await
         .map_err(|e| format!("failed to recover interrupted liquidation intents: {e}"))?;
+    // One watchdog, so its alert cooldown covers every stage.
+    let slack_watchdog = slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN);
     if recovered != 0 {
         warn!(recovered, "Parked interrupted liquidation submissions as ambiguous");
+        slack_watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: "restart".to_string(),
+                venue: "protocol".to_string(),
+                pending_step: "liquidation-call-interrupted".to_string(),
+                owner: config.liquidator_principal.to_text(),
+                details: format!(
+                    "a restart interrupted {recovered} liquidation calls; each may have run on chain with no WAL row, so its intent is ambiguous"
+                ),
+            })
+            .await;
     }
 
     let tokens = debt_asset_principals(&registry);
@@ -222,7 +240,8 @@ async fn init(
         db.clone(),
         ctx.approval_state.clone(),
     )
-    .with_funding(config.liquidation_funding);
+    .with_funding(config.liquidation_funding)
+    .with_watchdog(slack_watchdog.clone());
 
     executor
         .init(&tokens)
@@ -235,12 +254,10 @@ async fn init(
     let executor = Arc::new(executor);
 
     // One bridge for every exchange venue: they share its accounts, so they
-    // must share the registry of handles held on them.
-    let bridge = if config.enabled_swap_venues.iter().any(|venue| venue == MEXC_VENUE_ID) {
-        Some(BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))).await?)
-    } else {
-        None
-    };
+    // must share the registry of handles held on them. The first exchange builds it.
+    let bridge = tokio::sync::OnceCell::new();
+    let shared_bridge =
+        || bridge.get_or_try_init(|| BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))));
 
     let mut venue_adapters: Vec<Arc<dyn MultiVenueAdapter>> = Vec::new();
     for venue_id in &config.enabled_swap_venues {
@@ -250,13 +267,17 @@ async fn init(
                     .clone()
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
-            MEXC_VENUE_ID => venue_adapters.push(
-                build_mexc_finalizer(
-                    ctx.as_ref(),
-                    bridge.clone().ok_or_else(|| "MEXC is enabled but the bridge was not built".to_string())?,
-                )
-                .await?,
-            ),
+            MEXC_VENUE_ID => {
+                let bridge = if crate::simulator::mexc_uses_bridge() {
+                    Some(shared_bridge().await?.clone())
+                } else {
+                    None
+                };
+                venue_adapters.push(build_mexc_finalizer(ctx.as_ref(), bridge)?)
+            }
+            KRAKEN_VENUE_ID => {
+                venue_adapters.push(build_kraken_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?)
+            }
             _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
         }
     }
@@ -271,6 +292,7 @@ async fn init(
                 max_price_impact_bps: config.icpswap_max_price_impact_bps,
                 max_search_iterations: config.icpswap_max_search_iterations,
                 dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
+                max_cex_price_impact_bps: config.cex_max_price_impact_bps,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.multi_venue_min_net_edge_bps,
                 settlement_min_net_edge_bps: config.multi_venue_settlement_min_net_edge_bps,
@@ -278,13 +300,21 @@ async fn init(
                 bad_debt_min_net_edge_bps: config.multi_venue_bad_debt_min_net_edge_bps,
                 max_oracle_discount_bps: config.multi_venue_max_oracle_discount_bps,
                 oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,
+                cycles_usd_per_trillion: config.cycles_usd_per_trillion,
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
+                mexc_test_allocation_usd: config.mexc_test_allocation_usd,
             },
         )?
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
+        .with_watchdog(slack_watchdog.clone())
         .with_price_oracle(price_oracle.clone())
         .with_recovery_sweep(ctx.trader_transfers.actions(), config.get_recovery_account()),
     );
+
+    // Operator actions on parked rows reach the WAL through the control socket.
+    let operator: Arc<dyn crate::operator::OperatorConsole> = Arc::new(OperatorDesk::new(
+        db.clone() as Arc<dyn WalStore>,
+        multi_venue_finalizer.clone(),
+    ));
 
     // Profit calculator for expected/realized PnL
     let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator
@@ -300,7 +330,9 @@ async fn init(
             config.cex_retry_base_secs,
             config.cex_retry_max_secs,
         )
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
+        .with_watchdog(slack_watchdog.clone())
+        // A simulator build with no venue keeps the collateral; a default build always has a venue.
+        .with_retained_collateral(crate::simulator::ENABLED && config.enabled_swap_venues.is_empty()),
     );
 
     info!("Initializing searcher stage ...");
@@ -316,6 +348,14 @@ async fn init(
     let wd = webhook_watchdog_from_env(Duration::from_secs(300));
     wd.notify(WatchdogEvent::Heartbeat { stage: "Init" }).await;
 
+    // Ranking prefers collateral that an enabled exchange takes on ICP without a bridge.
+    // The list comes from the profiles the bridge planner reads, so the two cannot disagree.
+    let venue_native_symbols = config
+        .enabled_swap_venues
+        .iter()
+        .filter_map(|venue_id| CexVenueProfile::for_venue(venue_id))
+        .flat_map(|profile| profile.direct_assets().iter().map(|symbol| symbol.to_string()))
+        .collect();
     let mut strategy = SimpleLiquidationStrategy::new(
         config.clone(),
         registry.clone(),
@@ -323,7 +363,8 @@ async fn init(
         ctx.main_service.clone(),
         ctx.approval_state.clone(),
     )
-    .with_watchdog(wd);
+    .with_watchdog(wd)
+    .with_venue_native_symbols(venue_native_symbols);
     if let Some(profile) = supply_profile {
         strategy = strategy.with_supply_balances(Arc::new(LendingSupplyBalances::new(
             agent.clone(),
@@ -336,7 +377,7 @@ async fn init(
         path: config.export_path.clone(),
     });
 
-    Ok((finder, strategy, executor, exporter, finalizer, db))
+    Ok((finder, strategy, executor, exporter, finalizer, db, operator))
 }
 
 /// Resolves the liquidator's Liquidium profile and starts supplying idle wallet balances.
@@ -484,7 +525,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     );
 
     // Initialize components using shared pipeline context
-    let (finder, strategy, executor, exporter, finalizer, wal) = match init(ctx.clone()).await {
+    let (finder, strategy, executor, exporter, finalizer, wal, operator) = match init(ctx.clone()).await {
         Ok(stages) => stages,
         Err(err) => {
             tracing::error!("Failed to initialize pipeline stages: {}", err);
@@ -530,6 +571,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         &config.db_path,
         paused.clone(),
         slack_watchdog.clone(),
+        operator,
     ) {
         tracing::error!("{}", err);
         return ExitCode::FAILURE;
@@ -731,11 +773,13 @@ mod tests {
                 conservative_receive: receive.clone(),
                 estimated_price_impact_bps: 50.0,
                 route_id: "icpswap-route".to_string(),
+                side_costs: Vec::new(),
             },
             execution: VenueExecutionState::new("icpswap", &execution).expect("tag execution"),
             status: VenueLegStatus::Running,
             result: None,
             last_error: None,
+            failure: None,
         };
         let meta_v2 = FinalizerMetaV2 {
             version: FINALIZER_META_V2_VERSION,
@@ -754,6 +798,7 @@ mod tests {
                     conservative_receive: receive,
                     combined_net_edge_bps: 175.0,
                     quoted_at: 123,
+                    side_cost_receive: None,
                 },
                 legs: vec![leg],
                 outcome: MultiVenueExecutionOutcome::Running,
@@ -784,12 +829,8 @@ mod tests {
             change_received: true,
         };
         let wrapper = LiqMetaWrapper {
-            receipt,
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
             meta_v2: Some(meta_v2),
+            ..LiqMetaWrapper::new(receipt)
         };
 
         LiqResultRecord {

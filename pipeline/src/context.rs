@@ -5,7 +5,7 @@ use alloy::network::AnyNetwork;
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider};
 use alloy::signers::local::PrivateKeySigner;
 
-use ic_agent::Agent;
+use ic_agent::{Agent, Identity};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
@@ -38,6 +38,8 @@ use crate::swappers::icpswap::{
     client::IcpswapClient, session::IcpswapAgentSessionFactory, types::IcpswapTokenMetadata, venue::IcpswapVenue,
 };
 use crate::watchdog::{balance_monitor::DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, slack_watchdog_from_env};
+use liquidium_pipeline_connectors::outbound::{IcpSender, OutboundRouter, SolanaSender, UnsettledSender};
+use liquidium_pipeline_core::outbound::OutboundSender;
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
@@ -49,21 +51,13 @@ pub struct PipelineContext {
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
+    /// Sends from the trader account that are saved before they run.
+    pub trader_outbound: Arc<dyn OutboundSender>,
     pub icpswap_finalizer: Option<Arc<IcpswapFinalizer>>,
     pub recovery_transfers: Arc<TransferService>,
     pub bridge_transfers: Arc<TransferService>,
     pub evm_address: String,
     pub approval_state: Arc<ApprovalState>,
-}
-
-impl PipelineContext {
-    pub fn bridge_balance_service_for_symbol(&self, _symbol: &str) -> Arc<BalanceService> {
-        self.bridge_service.clone()
-    }
-
-    pub fn bridge_transfer_service_for_symbol(&self, _symbol: &str) -> Arc<TransferService> {
-        self.bridge_transfers.clone()
-    }
 }
 
 pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
@@ -145,11 +139,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 PipelineContextError::Other("missing IC Trader".to_string())
             })?));
         let bridge_agent = Arc::new(
-            Agent::builder()
-                .with_url(config.ic_url.clone())
-                .with_identity(config.bridge_ic_identity.clone())
-                .with_max_tcp_error_retries(3)
-                .build()
+            build_ic_agent(&config.ic_url, config.bridge_ic_identity.clone())
                 .map_err(|e| PipelineContextError::Other(format!("ic agent(bridge) build: {e}")))?,
         );
         let icp_backend_bridge = Arc::new(IcpBackendImpl::new(bridge_agent));
@@ -284,6 +274,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             evm_transfer_trader,
             solana_transfer_trader,
         ));
+        let trader_outbound: Arc<dyn OutboundSender> = Arc::new(OutboundRouter {
+            icp: Arc::new(IcpSender::new(icp_backend_trader.clone(), trader_icp_account)),
+            solana: Arc::new(SolanaSender::new(solana_backend_trader.clone())),
+            fallback: Arc::new(UnsettledSender::new(transfer_router_trader.clone())),
+        });
         let trader_transfers = TransferService::new(registry.clone(), transfer_router_trader);
 
         let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(
@@ -373,6 +368,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             bridge_service: Arc::new(bridge_service),
             main_transfers: Arc::new(main_transfers),
             trader_transfers: Arc::new(trader_transfers),
+            trader_outbound,
             recovery_transfers: Arc::new(recovery_transfers),
             bridge_transfers: Arc::new(bridge_transfers),
             evm_address,
@@ -380,6 +376,22 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             agent: main_agent.clone(),
         })
     }
+}
+
+/// Builds an IC agent for `identity`. A simulator build trusts the PocketIC root key,
+/// and PocketIC does not sign query replies.
+pub fn build_ic_agent(url: &str, identity: Arc<dyn Identity>) -> Result<Agent, String> {
+    let agent = Agent::builder()
+        .with_url(url)
+        .with_arc_identity(identity)
+        .with_max_tcp_error_retries(3)
+        .with_verify_query_signatures(!crate::simulator::ENABLED)
+        .build()
+        .map_err(|error| error.to_string())?;
+    if crate::simulator::ENABLED {
+        agent.set_root_key(crate::simulator::ic_root_key()?);
+    }
+    Ok(agent)
 }
 
 fn setup_agents_and_provider(
@@ -393,20 +405,12 @@ fn setup_agents_and_provider(
     String,
 > {
     let agent_main = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.liquidator_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
+        build_ic_agent(&config.ic_url, config.liquidator_identity.clone())
             .map_err(|e| format!("ic agent(main) build: {e}"))?,
     );
 
     let agent_trader = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.trader_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
+        build_ic_agent(&config.ic_url, config.trader_identity.clone())
             .map_err(|e| format!("ic agent(trader) build: {e}"))?,
     );
 
@@ -523,6 +527,7 @@ mod tests {
             db_path: "wal.db".to_string(),
             max_allowed_dex_slippage: 125,
             max_allowed_cex_slippage_bps: 200,
+            max_widened_cex_slippage_bps: 400,
             bad_debt_collateral_slippage_bps: 500,
             cex_min_exec_usd: 5.0,
             cex_slice_target_ratio: 0.85,
@@ -537,17 +542,23 @@ mod tests {
             multi_venue_bad_debt_min_net_edge_bps: 25,
             multi_venue_max_oracle_discount_bps: 250,
             multi_venue_oracle_snapshot_max_age_secs: 300,
+            cycles_usd_per_trillion: 1.35,
             cex_delay_buffer_bps: 15,
             cex_route_fee_bps: 12,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
+            cex_mexc_best_output_routing: false,
+            cex_kraken_available_pairs: vec![],
+            cex_kraken_max_hops: 2,
             icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
                 .expect("principal"),
             icpswap_fee_tiers: vec![candid::Nat::from(500u32), candid::Nat::from(3000u32)],
             icpswap_max_price_impact_bps: 100.0,
             icpswap_max_search_iterations: 16,
             icpswap_dust_fallback_max_price_impact_bps: 150.0,
+            cex_max_price_impact_bps: 200.0,
             icpswap_test_allocation_usd: None,
+            mexc_test_allocation_usd: None,
             enabled_swap_venues: vec!["icpswap".to_string(), "mexc".to_string()],
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

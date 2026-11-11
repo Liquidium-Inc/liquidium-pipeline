@@ -44,8 +44,7 @@ mockall::mock! {
             &self,
             ledger: Principal,
             to_account_id_hex: &str,
-            amount_e8s: Nat,
-        ) -> Result<u64, TransferFailure>;
+            amount_e8s: Nat, _created_at_time_nanos: Option<u64>) -> Result<u64, TransferFailure>;
         async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
         async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String>;
         async fn icrc2_allowance(

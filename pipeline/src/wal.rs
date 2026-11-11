@@ -14,20 +14,29 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
     match serde_json::from_str::<LiqMetaWrapper>(&row.meta_json) {
         Ok(wrapper) => Ok(Some(wrapper)),
         Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(&row.meta_json) {
-            Ok(receipt) => Ok(Some(LiqMetaWrapper {
-                receipt,
-                meta: Vec::new(),
-                finalizer_decision: None,
-                profit_snapshot: None,
-                venue_execution: None,
-                meta_v2: None,
-            })),
+            Ok(receipt) => Ok(Some(LiqMetaWrapper::new(receipt))),
             Err(receipt_err) => Err(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
                 row.id, wrapper_err, receipt_err
             )),
         },
     }
+}
+
+/// Saves a new receipt into a row's meta and keeps every other part of it.
+pub async fn wal_save_receipt(
+    wal: &dyn WalStore,
+    mut row: LiqResultRecord,
+    receipt: &ExecutionReceipt,
+    touch: bool,
+) -> Result<(), String> {
+    let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or_else(|| LiqMetaWrapper::new(receipt.clone()));
+    wrapper.receipt = receipt.clone();
+    encode_meta(&mut row, &wrapper)?;
+    if touch {
+        row.updated_at = crate::utils::now_ts();
+    }
+    wal.upsert_result(row).await.map_err(|e| e.to_string())
 }
 
 pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> Result<(), String> {
@@ -56,8 +65,10 @@ pub async fn wal_load(wal: &dyn WalStore, liq_id: &str) -> Result<Option<LiqResu
     wal.get_result(liq_id).await.map_err(|e| e.to_string())
 }
 
+/// Claims a row for this cycle. A claim is not an attempt: a leg that waits on
+/// a bridge passes here every cycle, and `attempt` counts work only.
 pub async fn wal_mark_inflight(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
-    wal.update_status(liq_id, ResultStatus::InFlight, true)
+    wal.update_status(liq_id, ResultStatus::InFlight, false)
         .await
         .map_err(|e| e.to_string())
 }
@@ -70,6 +81,14 @@ pub async fn wal_mark_succeeded(wal: &dyn WalStore, liq_id: &str) -> Result<(), 
 
 pub async fn wal_mark_retryable_failed(wal: &dyn WalStore, liq_id: &str, last_error: String) -> Result<(), String> {
     wal.update_failure(liq_id, ResultStatus::FailedRetryable, last_error, true)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Records a route search that found no acceptable swap. It did no work, so it
+/// is a strike but not an attempt.
+pub async fn wal_mark_no_route(wal: &dyn WalStore, liq_id: &str, last_error: String) -> Result<(), String> {
+    wal.update_failure(liq_id, ResultStatus::FailedRetryable, last_error, false)
         .await
         .map_err(|e| e.to_string())
 }
@@ -91,8 +110,10 @@ pub async fn wal_mark_unresumable(wal: &dyn WalStore, liq_id: &str, last_error: 
         .map_err(|e| e.to_string())
 }
 
+/// Releases the claim on a row that has not finished. Like the claim, it is
+/// not an attempt.
 pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
-    wal.update_status(liq_id, ResultStatus::Enqueued, true)
+    wal.update_status(liq_id, ResultStatus::Enqueued, false)
         .await
         .map_err(|e| e.to_string())
 }

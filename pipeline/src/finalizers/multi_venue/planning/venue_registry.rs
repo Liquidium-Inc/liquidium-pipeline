@@ -16,7 +16,8 @@ impl VenueRegistry {
     // Registration order is retained because it gives quote collection and
     // later execution planning a deterministic venue order.
     pub(in crate::finalizers::multi_venue) fn new(adapters: Vec<Arc<dyn MultiVenueAdapter>>) -> Result<Self, String> {
-        if adapters.is_empty() {
+        // A simulator build with no venue keeps the collateral, so it registers none.
+        if adapters.is_empty() && !crate::simulator::ENABLED {
             return Err("venue registry must contain at least one adapter".to_string());
         }
 
@@ -146,12 +147,17 @@ pub(in crate::finalizers::multi_venue) struct VenueQuoteBook {
 
 impl VenueQuoteBook {
     // Iteration follows deterministic registry/configuration order.
+    #[cfg(test)]
     pub(in crate::finalizers::multi_venue) fn iter(&self) -> impl Iterator<Item = &VenuePreview> {
         self.previews.iter()
     }
 
     pub(in crate::finalizers::multi_venue) fn get(&self, venue_id: &str) -> Option<&VenuePreview> {
         self.previews.iter().find(|preview| preview.venue_id == venue_id)
+    }
+
+    pub(in crate::finalizers::multi_venue) fn into_previews(self) -> Vec<VenuePreview> {
+        self.previews
     }
 
     pub(in crate::finalizers::multi_venue) fn iter_mut(&mut self) -> impl Iterator<Item = &mut VenuePreview> {

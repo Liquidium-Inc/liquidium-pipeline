@@ -4,10 +4,14 @@ mod constants;
 mod context;
 mod executors;
 mod finalizers;
+mod bridge;
 mod liquidation;
+mod operator;
+mod outbound;
 mod output;
 mod persistance;
 mod price_oracle;
+mod simulator;
 mod stage;
 mod stages;
 pub mod swappers;
@@ -29,6 +33,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
+use crate::outbound::driver::OperatorDecision;
+use crate::operator::{ReconcileAction, ReconcileRequest};
 
 #[derive(Parser)]
 #[command(name = "liquidator")]
@@ -80,6 +86,7 @@ enum Commands {
         source: Option<String>,
         /// Destination:
         /// - ICP assets: "main", "trader", "recovery", "bridge", or full Account string
+        /// - native ICP: also a 64-hex ledger account id (exchange deposit addresses)
         /// - EVM assets: "main", "bridge", or 0x... address
         #[arg(long)]
         destination: Option<String>,
@@ -155,6 +162,65 @@ enum Commands {
         proxy_canister: Option<String>,
     },
 
+    // Places two small IOC limit sells on MEXC: one above the market, which
+    // must not fill, and one at the best bid. Without --confirm it sends nothing.
+    MexcOrderCheck {
+        /// Market as the pipeline names it (e.g. "ICP_USDT")
+        #[arg(long)]
+        market: String,
+        /// Base quantity of each order, above the MEXC minimum order value
+        #[arg(long)]
+        quantity: f64,
+        /// Price decimals of the market (MEXC "quotePrecision")
+        #[arg(long)]
+        price_decimals: u32,
+        /// Place the orders. Without it the command only prints the plan.
+        #[arg(long)]
+        confirm: bool,
+    },
+
+    // Sends one small MEXC withdrawal with an order id, then checks that the
+    // withdraw history returns that id. Without --confirm it sends nothing.
+    MexcWithdrawCheck {
+        /// Asset as the pipeline plans it (e.g. "SOL")
+        #[arg(long)]
+        asset: String,
+        /// Network as the pipeline plans it (e.g. "SOL")
+        #[arg(long)]
+        network: String,
+        /// Destination address. Use an address we control.
+        #[arg(long)]
+        address: String,
+        /// Amount in asset units, above the MEXC minimum for the network
+        #[arg(long)]
+        amount: f64,
+        /// Send the withdrawal. Without it the command only reads the history.
+        #[arg(long)]
+        confirm: bool,
+    },
+
+    // Shows a parked liquidation row, or answers its open question and
+    // releases the parked leg. It talks to the running daemon.
+    Reconcile {
+        /// Liquidation row id
+        liq_id: String,
+        /// Leg id, needed when more than one leg of the row is parked
+        #[arg(long)]
+        leg: Option<String>,
+        /// The undecided action happened: give its receipt or provider id
+        #[arg(long, conflicts_with_all = ["absent", "release"])]
+        landed: Option<String>,
+        /// The undecided action did not happen: the leg checks once more, then acts again
+        #[arg(long, conflicts_with = "release")]
+        absent: bool,
+        /// Release a parked leg that has no open question
+        #[arg(long)]
+        release: bool,
+        /// Control socket path of the running daemon
+        #[arg(long)]
+        sock_path: Option<PathBuf>,
+    },
+
     // Account management commands
     Account {
         #[command(subcommand)]
@@ -215,7 +281,11 @@ enum AccountCommands {
 /// successfully.
 #[tokio::main]
 async fn main() -> ExitCode {
-    load_env();
+    // The workbench supplies the whole simulator environment. dotenv also reads
+    // parent directories, so host settings could otherwise leak in.
+    if !simulator::ENABLED {
+        load_env();
+    }
     let cli = Cli::parse();
     let running_under_systemd = is_systemd_service_process();
 
@@ -404,6 +474,62 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
+        }
+        Commands::MexcOrderCheck {
+            market,
+            quantity,
+            price_decimals,
+            confirm,
+        } => {
+            if let Err(e) = commands::mexc_order_check::check(&market, quantity, price_decimals, confirm).await {
+                eprintln!("MEXC order check failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::MexcWithdrawCheck {
+            asset,
+            network,
+            address,
+            amount,
+            confirm,
+        } => {
+            if let Err(e) = commands::mexc_withdraw_check::check(&asset, &network, &address, amount, confirm).await {
+                eprintln!("MEXC withdraw check failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Reconcile {
+            liq_id,
+            leg,
+            landed,
+            absent,
+            release,
+            sock_path,
+        } => {
+            let action = match (landed, absent, release) {
+                (Some(receipt), _, _) => ReconcileAction::Answer(OperatorDecision::Landed { receipt }),
+                (None, true, _) => ReconcileAction::Answer(OperatorDecision::Absent),
+                (None, false, true) => ReconcileAction::Release,
+                (None, false, false) => ReconcileAction::Show,
+            };
+            let request = ReconcileRequest {
+                liq_id,
+                leg_id: leg,
+                action,
+            };
+            let sock_path = sock_path.unwrap_or_else(control_plane::default_sock_path);
+            match control_plane::send_reconcile(&sock_path, &request).await {
+                Ok(report) => {
+                    println!("{report}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Reconcile failed: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
         }
         Commands::Account { subcommand } => {
             let outcome = match subcommand {

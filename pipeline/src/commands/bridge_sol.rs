@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use candid::{CandidType, Encode, Nat, Principal};
 use ic_agent::Agent;
@@ -6,8 +6,9 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::{
     amount_utils::amount_to_nat_units_strict,
     bridge_backend::{
-        BridgeBackend, BridgeDestination, BridgeRequest, BridgeStatus, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
-        SolanaBridgeBackend,
+        BridgeBackend, BridgeDestination, BridgeRequest, BridgeStatus, BridgeSubmission,
+        DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, DepositNotice, SolanaBridgeBackend,
+        cksol_transfer_without_deposit_id,
     },
     icp_backend::IcpBackendImpl,
     solana_backend::{SolanaBackend, SolanaBackendImpl},
@@ -21,6 +22,10 @@ use solana_sdk::{signature::Keypair, signer::Signer};
 
 use crate::config::Config;
 const SOL_DECIMALS: u8 = 9;
+/// The minter reads a deposit at finalized commitment, about 13 s after the
+/// transfer confirms. So the notice is sent again within this bound.
+const DEPOSIT_NOTICE_ATTEMPTS: usize = 8;
+const DEPOSIT_NOTICE_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SolanaPrefundPlan {
@@ -46,22 +51,6 @@ impl BridgeSolDirection {
             )),
         }
     }
-}
-
-fn parse_icp_account_like(address: &str) -> Result<Account, String> {
-    if let Ok(account) = Account::from_str(address) {
-        return Ok(account);
-    }
-    if let Ok(owner) = Principal::from_text(address) {
-        return Ok(Account {
-            owner,
-            subaccount: None,
-        });
-    }
-    Err(format!(
-        "invalid ICP account-like address '{}'; expected Account or principal",
-        address
-    ))
 }
 
 fn bridge_solana_address(config: &Config) -> String {
@@ -133,11 +122,7 @@ fn build_backend(
     proxy_canister: Option<Principal>,
 ) -> Result<SolanaBridgeBackend<Agent, IcpBackendImpl<Agent>, SolanaBackendImpl>, String> {
     let agent = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.bridge_ic_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
+        crate::context::build_ic_agent(&config.ic_url, config.bridge_ic_identity.clone())
             .map_err(|e| format!("ic agent(bridge-sol command) build failed: {e}"))?,
     );
 
@@ -449,7 +434,7 @@ pub async fn submit(
 
     let request = match direction {
         BridgeSolDirection::SolToCkSol => {
-            let destination_account = parse_icp_account_like(destination_value)?;
+            let destination_account = crate::finalizers::bridge_planner::parse_icp_account_like(destination_value)?;
             let source_value = resolve_sol_to_cksol_source(source, &bridge_source_address)?;
             let bridge_available_lamports = backend.solana_backend.native_balance().await.map_err(|e| {
                 format!(
@@ -526,11 +511,27 @@ pub async fn submit(
         direction_raw, amount, request.source_address, destination_value
     );
 
-    let submission = backend.submit_bridge(request).await?;
+    let destination = request.destination.clone();
+    let mut submission = backend
+        .submit_bridge(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    // A SOL transfer that the minter has not queued is never swept.
+    if let Some(signature) = cksol_transfer_without_deposit_id(&submission.bridge_id) {
+        match notify_until_queued(&backend, &destination, &signature, DEPOSIT_NOTICE_DELAY).await {
+            Some(queued) => submission = queued,
+            None => println!(
+                "SOL transfer {signature} landed, but the minter did not queue it; call deposit_sol for {destination:?} before another transfer"
+            ),
+        }
+    }
     println!("Bridge submitted. bridge_id={}", submission.bridge_id);
 
     if check_status {
-        let status = backend.get_bridge_status(&submission.bridge_id).await?;
+        let status = backend
+            .get_bridge_status(&submission.bridge_id)
+            .await
+            .map_err(|error| error.to_string())?;
         println!(
             "Immediate bridge status for {}: {}",
             submission.bridge_id,
@@ -541,6 +542,26 @@ pub async fn submit(
     Ok(())
 }
 
+/// Sends the ckSOL deposit notice again until the minter queues the deposit.
+async fn notify_until_queued(
+    backend: &impl BridgeBackend,
+    destination: &BridgeDestination,
+    signature: &str,
+    delay: Duration,
+) -> Option<BridgeSubmission> {
+    for attempt in 1..=DEPOSIT_NOTICE_ATTEMPTS {
+        tokio::time::sleep(delay).await;
+        match backend.track_deposit("SOL", "SOL", destination, "", signature).await {
+            Ok(DepositNotice::Accepted(submission)) => return Some(submission),
+            Ok(DepositNotice::NotYet { reason }) => {
+                println!("Deposit not queued yet ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {reason}")
+            }
+            Err(error) => println!("Deposit notice failed ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {error}"),
+        }
+    }
+    None
+}
+
 pub async fn status(bridge_id: &str) -> Result<(), String> {
     let bridge_id = bridge_id.trim();
     if bridge_id.is_empty() {
@@ -549,7 +570,10 @@ pub async fn status(bridge_id: &str) -> Result<(), String> {
 
     let config = Config::load().await?;
     let backend = build_backend(config, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, None)?;
-    let status = backend.get_bridge_status(bridge_id).await?;
+    let status = backend
+        .get_bridge_status(bridge_id)
+        .await
+        .map_err(|error| error.to_string())?;
 
     println!("Bridge status for {}: {}", bridge_id, format_bridge_status(&status));
     Ok(())
@@ -724,12 +748,50 @@ mod tests {
         BridgeSolDirection, build_sol_to_cksol_prefund_plan, parse_deposit_bridge_account, parse_optional_principal,
         parse_subaccount_override, resolve_proxy_canister, resolve_sol_to_cksol_source,
     };
+
     use crate::config::Config;
     use candid::{Nat, Principal};
     use ic_agent::identity::AnonymousIdentity;
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// Review finding 35: the one notice went out before finality, so the
+    /// minter refused it and the SOL was never swept.
+    #[tokio::test]
+    async fn the_deposit_notice_repeats_until_the_minter_queues_it() {
+        use liquidium_pipeline_connectors::backend::bridge_backend::{
+            BridgeDestination, BridgeSubmission, DepositNotice, MockBridgeBackend,
+        };
+        let mut backend = MockBridgeBackend::new();
+        let mut notices = 0;
+        backend
+            .expect_track_deposit()
+            .times(3)
+            .returning(move |asset, _, _, handle, receipt| {
+                assert_eq!((asset, handle, receipt), ("SOL", "", "sig-1"));
+                notices += 1;
+                Ok(if notices < 3 {
+                    DepositNotice::NotYet {
+                        reason: "ValueTooSmall".into(),
+                    }
+                } else {
+                    DepositNotice::Accepted(BridgeSubmission {
+                        bridge_id: "queued".into(),
+                    })
+                })
+            });
+        let destination = BridgeDestination::IcpAccount(icrc_ledger_types::icrc1::account::Account {
+            owner: Principal::anonymous(),
+            subaccount: None,
+        });
+
+        let queued = super::notify_until_queued(&backend, &destination, "sig-1", super::Duration::ZERO).await;
+
+        assert_eq!(
+            queued.map(|submission| submission.bridge_id),
+            Some("queued".to_string())
+        );
+    }
     #[test]
     fn parse_direction_accepts_expected_values() {
         assert_eq!(
@@ -871,6 +933,7 @@ mod tests {
             db_path: String::new(),
             max_allowed_dex_slippage: 125,
             max_allowed_cex_slippage_bps: 200,
+            max_widened_cex_slippage_bps: 400,
             bad_debt_collateral_slippage_bps: 500,
             cex_min_exec_usd: 1.0,
             cex_slice_target_ratio: 0.7,
@@ -885,17 +948,23 @@ mod tests {
             multi_venue_bad_debt_min_net_edge_bps: -150,
             multi_venue_max_oracle_discount_bps: 250,
             multi_venue_oracle_snapshot_max_age_secs: 300,
+            cycles_usd_per_trillion: 1.35,
             cex_delay_buffer_bps: 75,
             cex_route_fee_bps: 25,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
+            cex_mexc_best_output_routing: false,
+            cex_kraken_available_pairs: vec![],
+            cex_kraken_max_hops: 2,
             icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
                 .expect("principal"),
             icpswap_fee_tiers: vec![Nat::from(500u32), Nat::from(3000u32)],
             icpswap_max_price_impact_bps: 100.0,
             icpswap_max_search_iterations: 16,
             icpswap_dust_fallback_max_price_impact_bps: 150.0,
+            cex_max_price_impact_bps: 200.0,
             icpswap_test_allocation_usd: None,
+            mexc_test_allocation_usd: None,
             enabled_swap_venues: vec!["icpswap".to_string(), "mexc".to_string()],
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

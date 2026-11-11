@@ -59,7 +59,7 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                 // amount_native is in e8s for ICP
                 let block_index = self
                     .backend
-                    .icp_transfer(*ledger, to_account_id_hex, amount_native)
+                    .icp_transfer(*ledger, to_account_id_hex, amount_native, None)
                     .await?;
 
                 Ok(block_index.to_string())

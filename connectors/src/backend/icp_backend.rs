@@ -61,6 +61,42 @@ impl From<IcrcTransferError> for TransferFailure {
     }
 }
 
+/// Candid types of the native ICP ledger `transfer` method.
+#[derive(CandidType, Deserialize, Debug)]
+pub(crate) struct Tokens {
+    e8s: u64,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+pub(crate) struct TimeStamp {
+    timestamp_nanos: u64,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+pub(crate) struct TransferArgs {
+    to: Vec<u8>,
+    fee: Tokens,
+    memo: u64,
+    from_subaccount: Option<Vec<u8>>,
+    created_at_time: Option<TimeStamp>,
+    amount: Tokens,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+pub(crate) enum TransferError1 {
+    TxTooOld { allowed_window_nanos: u64 },
+    BadFee { expected_fee: Tokens },
+    TxDuplicate { duplicate_of: u64 },
+    TxCreatedInFuture,
+    InsufficientFunds { balance: Tokens },
+}
+
+#[derive(CandidType, Deserialize)]
+pub(crate) enum Result6 {
+    Ok(u64),
+    Err(TransferError1),
+}
+
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait IcpBackend: Send + Sync {
@@ -83,11 +119,14 @@ pub trait IcpBackend: Send + Sync {
     async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg)
     -> Result<Nat, IcrcTransferError>;
 
+    /// `created_at_time_nanos` makes the ledger deduplicate a repeat of the
+    /// same arguments; `None` sends a plain transfer.
     async fn icp_transfer(
         &self,
         ledger: Principal,
         to_account_id_hex: &str,
         amount_e8s: Nat,
+        created_at_time_nanos: Option<u64>,
     ) -> Result<u64, TransferFailure>;
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
@@ -195,42 +234,8 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         ledger: Principal,
         to_account_id_hex: &str,
         amount_e8s: Nat,
+        created_at_time_nanos: Option<u64>,
     ) -> Result<u64, TransferFailure> {
-        #[derive(CandidType, Deserialize, Debug)]
-        struct Tokens {
-            e8s: u64,
-        }
-
-        #[derive(CandidType, Deserialize, Debug)]
-        struct TimeStamp {
-            timestamp_nanos: u64,
-        }
-
-        #[derive(CandidType, Deserialize, Debug)]
-        struct TransferArgs {
-            to: Vec<u8>,
-            fee: Tokens,
-            memo: u64,
-            from_subaccount: Option<Vec<u8>>,
-            created_at_time: Option<TimeStamp>,
-            amount: Tokens,
-        }
-
-        #[derive(CandidType, Deserialize, Debug)]
-        enum TransferError1 {
-            TxTooOld { allowed_window_nanos: u64 },
-            BadFee { expected_fee: Tokens },
-            TxDuplicate { duplicate_of: u64 },
-            TxCreatedInFuture,
-            InsufficientFunds { balance: Tokens },
-        }
-
-        #[derive(CandidType, Deserialize)]
-        enum Result6 {
-            Ok(u64),
-            Err(TransferError1),
-        }
-
         // Nothing below this point has been submitted yet, so every early
         // return is a refusal that moved no funds.
         let to = hex::decode(to_account_id_hex).map_err(|e| TransferFailure::Rejected(e.to_string()))?;
@@ -248,7 +253,7 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
             fee,
             memo: 0,
             from_subaccount: None,
-            created_at_time: None,
+            created_at_time: created_at_time_nanos.map(|timestamp_nanos| TimeStamp { timestamp_nanos }),
             amount,
         };
 
@@ -260,6 +265,12 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
 
         match res {
             Result6::Ok(block_index) => Ok(block_index),
+            // A deduplicated transfer is the original transfer.
+            Result6::Err(TransferError1::TxDuplicate { duplicate_of }) => Ok(duplicate_of),
+            // Outside the window the ledger cannot say whether a first copy landed.
+            Result6::Err(e @ TransferError1::TxTooOld { .. }) => {
+                Err(TransferFailure::Ambiguous(format!("icp_transfer error: {e:?}")))
+            }
             // The ledger answered. Whatever it refused, it refused without
             // applying anything.
             Result6::Err(e) => Err(TransferFailure::Rejected(format!("icp_transfer error: {e:?}"))),
@@ -326,6 +337,36 @@ mod tests {
         };
 
         assert_eq!(backend.icrc1_transfer_with_args(ledger, args).await, Ok(duplicate_of));
+    }
+
+    #[tokio::test]
+    async fn native_icp_retry_with_one_created_at_time_returns_the_first_block() {
+        let ledger = Principal::from_slice(&[1]);
+        for (answer, expected) in [
+            (Result6::Err(TransferError1::TxDuplicate { duplicate_of: 9 }), Ok(9)),
+            (
+                Result6::Err(TransferError1::TxTooOld { allowed_window_nanos: 1 }),
+                Err("ambiguous"),
+            ),
+        ] {
+            let mut agent = MockPipelineAgent::new();
+            agent
+                .expect_call_update::<Result6>()
+                .times(1)
+                .withf(|_, method, arg| {
+                    let args: TransferArgs = candid::decode_one(arg).unwrap();
+                    method == "transfer" && args.created_at_time.is_some_and(|t| t.timestamp_nanos == 42)
+                })
+                .return_once(move |_, _, _| Ok(answer));
+            let backend = IcpBackendImpl::new(Arc::new(agent));
+
+            let result = backend.icp_transfer(ledger, "00", Nat::from(5u64), Some(42)).await;
+
+            match expected {
+                Ok(block) => assert_eq!(result, Ok(block)),
+                Err(_) => assert!(matches!(result, Err(TransferFailure::Ambiguous(_))), "{result:?}"),
+            }
+        }
     }
 
     #[tokio::test]
