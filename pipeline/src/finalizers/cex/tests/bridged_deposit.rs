@@ -550,7 +550,7 @@ async fn a_deposit_bridge_that_never_starts_ends_at_its_bound() {
 }
 
 #[tokio::test]
-async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
+async fn mexc_deposit_bridge_waits_when_the_cketh_fee_balance_drops_after_funding() {
     let mut cex = MockCexBackend::new();
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
@@ -576,13 +576,17 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
         .times(1)
         .returning(|_token, _to, _amount| Ok("tx-bridge-fund-fee-wait".to_string()));
 
+    // The gas balance covers the withdrawal when the funding is sized, and is
+    // short by the time the call is saved: another leg spent it in between.
+    let cketh_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     bridge
         .expect_get_source_balance()
-        .times(2)
-        .returning(|asset, chain, _address| {
+        .times(3)
+        .returning(move |asset, chain, _address| {
             assert_eq!(chain, "ICP");
             match asset {
                 "ckUSDC" => Ok(0.99),
+                "ckETH" if cketh_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => Ok(0.001),
                 "ckETH" => Ok(0.000_080_356_126_532_001),
                 other => panic!("unexpected source balance asset {other}"),
             }
@@ -629,6 +633,54 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
     assert!(matches!(state.step, CexStep::DepositPending));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-fund-fee-wait"));
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+}
+
+/// A bridge account short of ckETH gas refuses the route before the funding
+/// transfer, so the funds stay in the trader account.
+#[tokio::test]
+async fn a_bridge_account_short_of_cketh_gas_refuses_the_deposit_before_funding() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    cex.expect_get_balance().returning(|_| Ok(10.0));
+    cex.expect_get_deposit_address().returning(|_, _| {
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ETH".to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+    transfers.expect_transfer().times(0);
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, _address| {
+            assert_eq!((asset, chain), ("ckETH", "ICP"));
+            Ok(0.000_080_356_126_532_001)
+        });
+    bridge.expect_get_fee_budget().returning(|_, _, _| {
+        Ok(BridgeFeeBudget {
+            source_fee_budget: 0.01,
+            destination_fee_budget: 0.0,
+            provider_fee_budget_native_units: Some(Nat::from(138_541_176_852_000u64)),
+            ..BridgeFeeBudget::default()
+        })
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    bridge.expect_submit_bridge().times(0);
+
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let receipt = make_execution_receipt_with_assets(84, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");
+
+    let error = finalizer.deposit(&mut state).await.unwrap_err();
+
+    assert!(error.to_string().contains("ckUSDC withdrawal needs for gas"), "{error}");
+    assert!(state.deposit.deposit_funding.is_none(), "no transfer is saved");
+    assert!(state.deposit.deposit_txid.is_none());
 }
 
 #[tokio::test]

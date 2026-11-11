@@ -4,9 +4,8 @@
 //! provider history.
 use async_trait::async_trait;
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_amount_via_core;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec, BridgeStatus, resolve_route,
+    BridgeFeeBudget, BridgeRouteSpec, BridgeStatus, resolve_route,
 };
 use liquidium_pipeline_core::{
     outbound::{OutboundIntent, OutboundSender},
@@ -16,10 +15,12 @@ use liquidium_pipeline_core::{
 use log::{debug, info};
 
 use super::{
-    BRIDGE_FEE_TOKEN_CHAIN, BRIDGE_FEE_TOKEN_SYMBOL, BRIDGE_START_TIMEOUT_SECS, BridgeLegError, BridgeLegOutcome,
-    BridgeOutState, CKETH_DECIMALS, SOURCE_BALANCE_TOLERANCE, SavedCallStep, WaitBound, bridge_failure,
+    BRIDGE_DELIVERY_TIMEOUT_SECS, BRIDGE_FEE_TOKEN_CHAIN, BRIDGE_FEE_TOKEN_SYMBOL, BRIDGE_START_TIMEOUT_SECS,
+    BridgeLegError, BridgeLegOutcome, BridgeOutState, SOURCE_BALANCE_TOLERANCE, SavedCallStep, WaitBound,
+    bridge_failure,
     bridge_sizing::{
         BridgeDepositSizing, BridgedDepositArrival, bridge_source_transfer_destination, bridged_deposit_arrival,
+        withdrawal_gas_shortfall,
     },
     drive_saved_call, note_bridge_wait, read_bridge_status, route_label, save_provider_call, wait_within_bound,
 };
@@ -209,29 +210,21 @@ impl Submission<'_> {
             requested
         };
 
-        if route.route_kind == BridgeRouteKind::CkEthErc20Reverse
-            && let Some(required_fee_budget) = provider_fee
+        if let Some((fee_available, required_fee_budget)) =
+            withdrawal_gas_shortfall(self.bridge, route, provider_fee, &self.source_address, 1.0).await?
         {
-            let required_fee_budget = nat_units_to_amount_via_core(required_fee_budget, CKETH_DECIMALS)?;
-            let fee_available = self
-                .bridge
-                .backend
-                .get_source_balance(BRIDGE_FEE_TOKEN_SYMBOL, BRIDGE_FEE_TOKEN_CHAIN, &self.source_address)
-                .await?;
-            if fee_available + SOURCE_BALANCE_TOLERANCE < required_fee_budget {
-                debug!(
-                    "[bridge] liq_id={} bridged deposit waiting for fee funding: available={} expected={} tolerance={} source={} fee_asset={}@{} route={}",
-                    leg_id,
-                    fee_available,
-                    required_fee_budget,
-                    SOURCE_BALANCE_TOLERANCE,
-                    self.source_address,
-                    BRIDGE_FEE_TOKEN_SYMBOL,
-                    BRIDGE_FEE_TOKEN_CHAIN,
-                    route_label(route),
-                );
-                return Ok(None);
-            }
+            debug!(
+                "[bridge] liq_id={} bridged deposit waiting for fee funding: available={} expected={} tolerance={} source={} fee_asset={}@{} route={}",
+                leg_id,
+                fee_available,
+                required_fee_budget,
+                SOURCE_BALANCE_TOLERANCE,
+                self.source_address,
+                BRIDGE_FEE_TOKEN_SYMBOL,
+                BRIDGE_FEE_TOKEN_CHAIN,
+                route_label(route),
+            );
+            return Ok(None);
         }
         Ok(Some(amount))
     }
@@ -407,6 +400,14 @@ async fn poll(
                 &bridge_id,
                 unreadable.as_deref(),
             )?;
+            // The provider holds the funds, so the poll goes on while the
+            // errors spend the retry budget and raise the alert.
+            let mut wait = WaitBound {
+                since: &mut state.deposit_bridge_submitted_at_ts,
+                timeout_secs: BRIDGE_DELIVERY_TIMEOUT_SECS,
+            };
+            let reason = format!("bridge {bridge_id} is still pending and the provider holds the funds");
+            wait_within_bound(leg_id, &mut wait, "bridged deposit", &reason)?;
             Ok(BridgeLegOutcome::Waiting { stalled })
         }
         ended => Err(bridge_failure("bridged deposit", leg_id, &bridge_id, ended)),

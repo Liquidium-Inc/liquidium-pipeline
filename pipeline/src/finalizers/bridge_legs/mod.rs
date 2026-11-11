@@ -51,6 +51,9 @@ pub(crate) const BRIDGE_START_TIMEOUT_SECS: i64 = 60 * 60;
 pub(crate) const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
 /// A bridge that has not credited within this time is stamped on the leg.
 pub(crate) const BRIDGE_CREDIT_STALL_SECS: i64 = 40 * 60;
+/// A submitted bridge out must deliver within this time. After it, each
+/// polling cycle errors, so a withdrawal the provider holds parks with an alert.
+pub(crate) const BRIDGE_DELIVERY_TIMEOUT_SECS: i64 = 4 * 60 * 60;
 /// How often a reverted deposit send is made again before an operator decides.
 pub(crate) const MAX_REVERTED_BRIDGE_RESUBMITS: u32 = 2;
 /// A confirmed Solana transfer is final after about 13 seconds.
