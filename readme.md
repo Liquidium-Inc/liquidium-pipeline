@@ -578,31 +578,17 @@ The bot asks for seized collateral in cash. When the canister refuses that becau
 collateral pool has no free cash (`NoLiquidity`, or a partial fill below the minimum collateral),
 it calls once more and takes the collateral as supply in its own profile. That liquidation still
 closes the position, and the liquidator holds the collateral and its price risk until it is
-released. The receipt waits in `WaitingCollateral` while every settlement pass moves it on:
+paid out.
 
-1. Wait until the collateral pool shows enough free cash.
-2. Withdraw the collateral into a holding subaccount of the liquidator that is used for this
-   one liquidation.
-3. Read that subaccount on the ledger. The payout counts as arrived only once the full
-   expected amount is there, so dust sent by someone else proves nothing.
-4. Send it to the account that swaps it, through a saved transfer, and enqueue the receipt.
+The canister keeps that liquidation's collateral transfer pending, so the receipt waits in
+`WaitingCollateral` like any unpaid collateral. On every settlement pass the bot checks the
+collateral pool's free cash and, once there is enough, calls `claim_liquidation_collateral`.
+The canister then pays the collateral to the liquidation's receiver through its normal
+collateral transfer, and the receipt moves on to the swap when that transfer has landed.
 
-Each step is written to the WAL before the next one starts. Collateral that may still be in
-supply is subtracted from the capital available for other liquidations.
-
-If a withdrawal call gets no answer, the bot does not call again. It keeps reading the holding
-subaccount: the full payout there means the withdrawal ran and the release continues. If
-nothing arrives it alerts the operator channel once. A transfer out that the ledger cannot
-decide is settled the same way: only this release moves funds out of the holding subaccount,
-so its balance shows whether the transfer landed.
-
-A withdrawal that never ran can be retried. The command refuses when the payout is in the
-holding subaccount or the supply position is already smaller than the collateral parked in
-it, and it never overwrites a row the bot changed meanwhile:
-
-```bash
-liquidator supply retry-release --row <liquidation row id> --confirmed-not-withdrawn
-```
+The canister pays a liquidation out once, so a claim whose answer was lost is simply asked
+again. Collateral that is still parked in supply is not counted as capital for other
+liquidations, in the bot's sizing and in the canister.
 
 Requirements: the lending canister must expose `liquidate_from_supply`, and the liquidator's
 Liquidium profile must not borrow.

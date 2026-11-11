@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     liquidation::lending_queries::get_liquidation_inflow,
-    liquidation::supply_funding::{CollateralPayout, CollateralRelease},
+    liquidation::supply_funding::CollateralPayout,
     persistance::LiquidationIntentStore,
     stage::PipelineStage,
     watchdog::WatchdogEvent,
@@ -52,10 +52,10 @@ pub struct ExecutionReceipt {
     /// Whether the change transfer had settled at the last read of the
     /// liquidation. For display only; no retry or recovery reads it.
     pub change_received: bool,
-    /// Set while seized collateral sits in the liquidator's supply and has not reached the
-    /// account that swaps it. Cleared once it has.
+    /// True when the collateral was credited to the liquidator's supply because the collateral
+    /// pool could not pay it out. It is then claimed once the pool has liquidity.
     #[serde(default)]
-    pub collateral_release: Option<CollateralRelease>,
+    pub collateral_held_as_supply: bool,
 }
 
 impl ExecutionReceipt {
@@ -99,7 +99,7 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     liquidation_result: None,
                     status: ExecutionStatus::Success,
                     change_received: true,
-                    collateral_release: None,
+                    collateral_held_as_supply: false,
                 };
 
                 let liq_req = executor_request.liquidation.clone();
@@ -204,12 +204,10 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 // collateral to the finalizer. The batch end reports the unpaid change (audit L04).
                 receipt.change_received = matches!(liq.change_tx.status, TransferStatus::Success);
 
+                // Taken as supply: the canister keeps the collateral leg pending until it is claimed.
+                receipt.collateral_held_as_supply =
+                    collateral_as_supply && !matches!(liq.collateral_tx.status, TransferStatus::Success);
                 let collateral_error = match &liq.collateral_tx.status {
-                    // Credited as supply: the settlement watcher withdraws it to the receiver.
-                    TransferStatus::Success if collateral_as_supply => {
-                        receipt.collateral_release = Some(CollateralRelease::Held);
-                        Some("collateral held as supply until the pool can pay it out".to_string())
-                    }
                     TransferStatus::Success => None,
                     TransferStatus::Pending => Some("collateral pending".to_string()),
                     TransferStatus::Failed(err) => Some(err.clone()),
@@ -559,7 +557,12 @@ mod tests {
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .withf(move |_, _, arg| payout_of(arg) == Some(CollateralPayout::Supply))
             .times(1)
-            .returning(|_, _, _| Ok(Ok(make_liquidation_result(8u128))));
+            .returning(|_, _, _| {
+                // The canister keeps the collateral leg pending until it is claimed.
+                let mut held = make_liquidation_result(8u128);
+                held.collateral_tx.status = TransferStatus::Pending;
+                Ok(Ok(held))
+            });
 
         let executor = BasicExecutor::new(
             Arc::new(agent),
@@ -590,7 +593,7 @@ mod tests {
             .expect("executor process should succeed");
 
         // then the receipt waits for the collateral to be released from supply
-        assert_eq!(receipts[0].collateral_release, Some(CollateralRelease::Held));
+        assert!(receipts[0].collateral_held_as_supply);
         assert!(matches!(
             receipts[0].status,
             ExecutionStatus::CollateralTransferFailed(_)

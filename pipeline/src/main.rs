@@ -280,16 +280,6 @@ enum SupplyCommands {
         #[arg(long)]
         absent: bool,
     },
-
-    // Retries a collateral withdrawal that got no answer and did not run
-    RetryRelease {
-        /// Liquidation row id shown in the alert
-        #[arg(long)]
-        row: String,
-        /// The lending canister's events show no withdrawal of this collateral
-        #[arg(long)]
-        confirmed_not_withdrawn: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -578,10 +568,6 @@ async fn main() -> ExitCode {
                 SupplyCommands::Deposit { asset, amount } => commands::supply::deposit(&asset, &amount).await,
                 SupplyCommands::Withdraw { asset, amount } => commands::supply::withdraw(&asset, &amount).await,
                 SupplyCommands::TopUps => commands::supply::top_ups().await,
-                SupplyCommands::RetryRelease {
-                    row,
-                    confirmed_not_withdrawn,
-                } => commands::supply::retry_release(&row, confirmed_not_withdrawn).await,
                 SupplyCommands::ResolveTopUp {
                     asset,
                     send,

@@ -84,7 +84,7 @@ pub(super) fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         liquidation_result: Some(liq_result),
         status: ExecutionStatus::Success,
         change_received: false,
-        collateral_release: None,
+        collateral_held_as_supply: false,
     }
 }
 
@@ -141,7 +141,7 @@ pub(super) fn make_execution_receipt_with_assets(
         liquidation_result: Some(liq_result),
         status: ExecutionStatus::Success,
         change_received: false,
-        collateral_release: None,
+        collateral_held_as_supply: false,
     }
 }
 

@@ -18,21 +18,25 @@ use liquidium_pipeline_core::balance_service::BalanceService;
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender};
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::{TransferActions, TransferFailure};
-use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidationRequest, ProtocolError};
+use liquidium_pipeline_core::types::protocol_types::{
+    AssetType, LiquidationRequest, LiquidationResult, ProtocolError, TransferStatus,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::liquidation::supply_resupply_journal::ResupplyJournal;
-use crate::outbound::driver::{OutboundError, OutboundPhase, OutboundRecord, step_outbound};
+use crate::outbound::driver::{OutboundError, OutboundPhase, step_outbound};
 use crate::persistance::{ResultStatus, WalStore};
 use crate::utils::now_ts;
 use crate::wal::decode_receipt_wrapper;
 use crate::watchdog::{Watchdog, WatchdogEvent};
-use sha2::{Digest, Sha256};
 
 /// Lending endpoint used in wallet mode: the canister pulls the debt asset from the wallet.
 pub const WALLET_LIQUIDATE_METHOD: &str = "liquidate_with_slippage";
 /// Lending endpoint used in supply mode: the canister burns the caller's supply.
 pub const SUPPLY_LIQUIDATE_METHOD: &str = "liquidate_from_supply";
+
+/// Lending endpoint that pays out collateral a supply-funded liquidation left as supply.
+pub const CLAIM_COLLATERAL_METHOD: &str = "claim_liquidation_collateral";
 
 /// Signed requests must expire within the canister's signature window (5 minutes).
 const REQUEST_EXPIRY_SECS: u64 = 4 * 60;
@@ -135,51 +139,6 @@ pub(crate) struct LendingPoolView {
     pub(crate) borrow_index: Nat,
 }
 
-/// The part of the lending `OutflowDetails` a withdrawal answer is read for.
-#[derive(Debug, Clone, CandidType, Deserialize)]
-pub(crate) struct WithdrawOutflow {
-    pub(crate) amount: Nat,
-}
-
-/// Where collateral that was credited as supply stands on its way to the account that swaps it.
-///
-/// It leaves supply through a withdrawal into a holding subaccount that belongs to this one
-/// liquidation, so its arrival can be read from the ledger, and is then sent on from there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CollateralRelease {
-    /// Still supplied in the collateral pool under the liquidator's profile.
-    Held,
-    /// A withdrawal call was started and its answer is not known. It ran if `expected` shows
-    /// up in the holding subaccount. `alerted` records that an operator was told.
-    Withdrawing { expected: Nat, alerted: bool },
-    /// The withdrawal was accepted at this unix time; `expected` should reach the holding
-    /// subaccount.
-    Requested { at: i64, expected: Nat },
-    /// The collateral is in the holding subaccount and `amount` is being sent to the receiver.
-    Forwarding { amount: Nat, send: Option<OutboundRecord> },
-    /// The collateral reached the receiver. The receipt's collateral amount is final.
-    Released,
-}
-
-impl CollateralRelease {
-    /// True while the collateral may still be part of the liquidator's supply position.
-    pub fn still_supplied(&self) -> bool {
-        matches!(self, Self::Held | Self::Withdrawing { .. })
-    }
-}
-
-/// Builds the sender that moves funds out of one holding subaccount of the liquidator.
-pub type HoldingSender = Arc<dyn Fn([u8; 32]) -> Arc<dyn OutboundSender> + Send + Sync>;
-
-/// The ledger subaccount of the liquidator that holds one liquidation's collateral between
-/// its withdrawal from supply and its transfer to the receiver.
-pub fn release_holding_subaccount(liquidation_id: u128) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"liquidium-pipeline/collateral-release/");
-    hasher.update(liquidation_id.to_be_bytes());
-    hasher.finalize().into()
-}
-
 #[derive(Debug, Clone, CandidType)]
 enum InflowSubaccount {
     #[allow(dead_code)]
@@ -249,14 +208,13 @@ impl<D: WalStore> HeldCollateral for WalHeldCollateral<D> {
                     continue;
                 };
                 let receipt = meta.receipt;
-                let supplied = receipt
-                    .collateral_release
-                    .as_ref()
-                    .is_some_and(CollateralRelease::still_supplied);
-                if !supplied || receipt.request.liquidation.collateral_pool_id != pool_id {
+                if !receipt.collateral_held_as_supply || receipt.request.liquidation.collateral_pool_id != pool_id {
                     continue;
                 }
-                if let Some(liquidation) = &receipt.liquidation_result {
+                // Until the collateral transfer has landed, the amount may still be in supply.
+                if let Some(liquidation) = &receipt.liquidation_result
+                    && !matches!(liquidation.collateral_tx.status, TransferStatus::Success)
+                {
                     held += liquidation.amounts.collateral_received.clone();
                 }
             }
@@ -336,15 +294,8 @@ pub async fn register_profile<A: PipelineAgent>(
 }
 
 #[derive(Debug, Clone, CandidType, Deserialize)]
-pub(crate) enum AccountType {
+enum AccountType {
     Native(Principal),
-    Icrc(IcrcAccount),
-}
-
-#[derive(Debug, Clone, CandidType, Deserialize)]
-pub(crate) struct IcrcAccount {
-    pub(crate) owner: Principal,
-    pub(crate) subaccount: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, CandidType, Deserialize)]
@@ -379,28 +330,9 @@ pub async fn withdraw_supply<A: PipelineAgent>(
     pool_id: Principal,
     amount: Nat,
 ) -> Result<(), String> {
-    let receiver = AccountType::Native(liquidator);
-    withdraw_to(agent, lending_canister, liquidator, profile, pool_id, receiver, amount)
-        .await?
-        .map(|_| ())
-        .map_err(|e| format!("withdraw rejected: {e:?}"))
-}
-
-/// Calls the lending `withdraw` and pays `receiver`. The outer error is a call with no decided
-/// answer; the inner one is a refusal by the canister, which moved nothing. On success it
-/// returns the amount withdrawn, before the ledger fee of the payout.
-pub(crate) async fn withdraw_to<A: PipelineAgent>(
-    agent: &A,
-    lending_canister: &Principal,
-    liquidator: Principal,
-    profile: Principal,
-    pool_id: Principal,
-    receiver: AccountType,
-    amount: Nat,
-) -> Result<Result<Nat, ProtocolError>, String> {
     let request = SignedRequest {
         data: WithdrawRequest {
-            account: receiver,
+            account: AccountType::Native(liquidator),
             pool_id,
             amount,
             expiry_timestamp: request_expiry()?,
@@ -408,10 +340,26 @@ pub(crate) async fn withdraw_to<A: PipelineAgent>(
         signature_info: caller_auth(liquidator),
     };
     let args = Encode!(&profile, &request).map_err(|e| format!("withdraw encode error: {e}"))?;
-    let answer = agent
-        .call_update::<Result<WithdrawOutflow, ProtocolError>>(lending_canister, "withdraw", args)
-        .await?;
-    Ok(answer.map(|outflow| outflow.amount))
+    agent
+        .call_update::<Result<candid::Reserved, ProtocolError>>(lending_canister, "withdraw", args)
+        .await?
+        .map(|_| ())
+        .map_err(|e| format!("withdraw rejected: {e:?}"))
+}
+
+/// Asks the lending canister to pay out collateral that liquidation `liquidation_id` left in
+/// the liquidator's supply. The canister pays a liquidation out once, so calling again after a
+/// lost answer is safe. The outer error is a call with no decided answer; the inner one is a
+/// refusal, such as `NoLiquidity`, which changed nothing.
+pub async fn claim_collateral<A: PipelineAgent>(
+    agent: &A,
+    lending_canister: &Principal,
+    liquidation_id: u128,
+) -> Result<Result<LiquidationResult, ProtocolError>, String> {
+    let args = Encode!(&liquidation_id).map_err(|e| format!("claim encode error: {e}"))?;
+    agent
+        .call_update::<Result<LiquidationResult, ProtocolError>>(lending_canister, CLAIM_COLLATERAL_METHOD, args)
+        .await
 }
 
 /// Cash the pool can pay out right now, from its last synced totals.
@@ -1054,7 +1002,7 @@ mod tests {
             LiquidationAmounts, LiquidationResult, LiquidationStatus, TransferStatus, TxStatus,
         };
 
-        // given three waiting rows: held in pool A, already withdrawn from pool A, held in pool B
+        // given waiting rows across two pools
         let pool_a = Principal::from_slice(b"pool-a");
         let pool_b = Principal::from_slice(b"pool-b");
         let token = ChainToken::Icp {
@@ -1063,7 +1011,7 @@ mod tests {
             decimals: 8,
             fee: Nat::from(10u8),
         };
-        let row = |id: u128, pool: Principal, amount: u64, release: CollateralRelease| {
+        let row = |id: u128, pool: Principal, amount: u64, held: bool, collateral: TransferStatus| {
             let receipt = ExecutionReceipt {
                 request: ExecutorRequest {
                     liquidation: LiquidationRequest {
@@ -1101,12 +1049,12 @@ mod tests {
                     },
                     collateral_tx: TxStatus {
                         tx_id: None,
-                        status: TransferStatus::Success,
+                        status: collateral,
                     },
                 }),
                 status: ExecutionStatus::Success,
                 change_received: true,
-                collateral_release: Some(release),
+                collateral_held_as_supply: held,
             };
             let mut record = LiqResultRecord {
                 id: id.to_string(),
@@ -1122,25 +1070,12 @@ mod tests {
             record
         };
         let rows = vec![
-            row(1, pool_a, 500, CollateralRelease::Held),
-            row(
-                2,
-                pool_a,
-                300,
-                CollateralRelease::Requested {
-                    at: 0,
-                    expected: Nat::from(290u64),
-                },
-            ),
-            row(
-                3,
-                pool_b,
-                70,
-                CollateralRelease::Withdrawing {
-                    expected: Nat::from(60u64),
-                    alerted: false,
-                },
-            ),
+            row(1, pool_a, 500, true, TransferStatus::Pending),
+            // Claimed and paid out: no longer in supply.
+            row(2, pool_a, 300, true, TransferStatus::Success),
+            // An ordinary cash payout that is still in flight was never in supply.
+            row(3, pool_a, 40, false, TransferStatus::Pending),
+            row(4, pool_b, 70, true, TransferStatus::Pending),
         ];
         let mut wal = MockWalStore::new();
         wal.expect_list_by_status_after()

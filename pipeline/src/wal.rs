@@ -224,7 +224,7 @@ mod tests {
             }),
             status: ExecutionStatus::Success,
             change_received: true,
-            collateral_release: None,
+            collateral_held_as_supply: false,
         }
     }
 

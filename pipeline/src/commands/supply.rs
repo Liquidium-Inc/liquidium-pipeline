@@ -10,13 +10,10 @@ use liquidium_pipeline_core::tokens::{
 use prettytable::{Cell, Row, Table, format};
 
 use crate::context::{PipelineContext, init_context};
-use crate::liquidation::supply_funding::{self, CollateralRelease, DepositError, HeldCollateral, WalHeldCollateral};
+use crate::liquidation::supply_funding::{self, DepositError};
 use crate::liquidation::supply_resupply_journal::ResupplyJournal;
 use crate::outbound::driver::OperatorDecision;
-use crate::persistance::{WalStore, sqlite::SqliteWalStore};
 use crate::utils::now_ts;
-use crate::wal::{decode_receipt_wrapper, encode_meta};
-use icrc_ledger_types::icrc1::account::Account;
 
 /// Registers a Liquidium profile for the liquidator principal, or shows the existing one.
 pub async fn register() -> Result<()> {
@@ -202,80 +199,6 @@ pub async fn resolve_top_up(asset: &str, send: &str, landed: Option<String>, abs
     println!(
         "Recorded. A running bot applies it on its next pass; run `liquidator supply top-ups` afterwards to confirm it cleared."
     );
-    Ok(())
-}
-
-/// Puts a collateral release whose withdrawal got no answer back to "held", so the bot
-/// withdraws it again. Refused unless the ledger and the supply position are consistent
-/// with a withdrawal that never ran, and the operator confirms it.
-pub async fn retry_release(row_id: &str, confirmed_not_withdrawn: bool) -> Result<()> {
-    let ctx = init_context().await.map_err(|e| anyhow!(e))?;
-    let config = &ctx.config;
-    let wal = Arc::new(SqliteWalStore::new(&config.db_path)?);
-    let row = wal
-        .get_result(row_id)
-        .await?
-        .ok_or_else(|| anyhow!("no liquidation row `{row_id}`"))?;
-    let mut meta = decode_receipt_wrapper(&row)
-        .map_err(|e| anyhow!(e))?
-        .ok_or_else(|| anyhow!("row `{row_id}` has no receipt"))?;
-    let Some(CollateralRelease::Withdrawing { expected, .. }) = meta.receipt.collateral_release.clone() else {
-        bail!(
-            "row `{row_id}` is not waiting on an unanswered collateral withdrawal (state: {:?})",
-            meta.receipt.collateral_release
-        );
-    };
-    let liquidation = meta
-        .receipt
-        .liquidation_result
-        .clone()
-        .ok_or_else(|| anyhow!("row `{row_id}` has no liquidation result"))?;
-    let pool = meta.receipt.request.liquidation.collateral_pool_id;
-    let ChainToken::Icp { ledger, .. } = &meta.receipt.request.collateral_asset else {
-        bail!("collateral of row `{row_id}` is not an ICP ledger token");
-    };
-
-    // A payout in the holding subaccount means the withdrawal ran.
-    let holding = Account {
-        owner: config.liquidator_principal,
-        subaccount: Some(supply_funding::release_holding_subaccount(liquidation.id)),
-    };
-    let arrived = supply_funding::ledger_balance(ctx.agent.as_ref(), *ledger, holding)
-        .await
-        .map_err(|e| anyhow!(e))?;
-    if expected > 0u8 && arrived >= expected {
-        bail!(
-            "the payout of {arrived} is in the holding subaccount: the withdrawal ran, and the bot continues by itself"
-        );
-    }
-
-    // A supply position smaller than everything parked in it means collateral already left.
-    let profile = require_profile(&ctx).await?;
-    let supplied = supply_funding::supplied_native(ctx.agent.as_ref(), &config.lending_canister, profile, pool)
-        .await
-        .map_err(|e| anyhow!(e))?;
-    let parked = WalHeldCollateral::new(wal.clone())
-        .held_native(pool)
-        .await
-        .map_err(|e| anyhow!(e))?;
-    if supplied < parked {
-        bail!(
-            "the liquidator's supply in the collateral pool ({supplied}) is below the collateral parked in it ({parked}): a withdrawal already ran. Wait for its payout or investigate; do not retry"
-        );
-    }
-    if !confirmed_not_withdrawn {
-        bail!(
-            "supply ({supplied}) still covers the parked collateral ({parked}) and nothing arrived, which fits a withdrawal that never ran. This cannot be proven when the pool also holds working capital. If no withdrawal of this collateral appears in the lending canister's events, run again with --confirmed-not-withdrawn"
-        );
-    }
-
-    meta.receipt.collateral_release = Some(CollateralRelease::Held);
-    let mut updated = row.clone();
-    encode_meta(&mut updated, &meta).map_err(|e| anyhow!(e))?;
-    if !wal.replace_meta_if_unchanged(row_id, &row.meta_json, &updated.meta_json)? {
-        bail!("row `{row_id}` changed while this command ran; nothing was written. Check its state and run again");
-    }
-    println!("Row {row_id} is held again; the bot withdraws it on a later pass once the pool has cash.");
     Ok(())
 }
 

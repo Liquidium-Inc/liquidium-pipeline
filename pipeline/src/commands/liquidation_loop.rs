@@ -41,11 +41,8 @@ use crate::{
     },
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
-        export::ExportStage,
-        finalize::FinalizeStage,
-        opportunity::OpportunityFinder,
-        settlement_watcher::{SettlementWatcher, SupplyRelease},
-        simple_strategy::SimpleLiquidationStrategy,
+        export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
+        settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::icpswap::{identity::IcpswapExecutionIdentity, types::IcpswapExecutionState},
     wal::decode_receipt_wrapper,
@@ -544,32 +541,11 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         }
     };
 
-    let mut settlement = SettlementWatcher::new(wal.clone(), ctx.agent.clone(), config.lending_canister);
-    if config.liquidation_funding == LiquidationFunding::Supply {
-        // `init` already required the profile, so a missing one here is a lookup failure.
-        let profile = match supply_funding::lookup_profile(
-            ctx.agent.as_ref(),
-            &config.lending_canister,
-            config.liquidator_principal,
-        )
-        .await
-        {
-            Ok(Some(profile)) => profile,
-            Ok(None) | Err(_) => {
-                tracing::error!("Could not resolve the liquidator's Liquidium profile for collateral release");
-                return ExitCode::FAILURE;
-            }
-        };
-        settlement = settlement.with_supply_release(
-            SupplyRelease {
-                liquidator: config.liquidator_principal,
-                profile,
-                holding_sender: ctx.main_holding_sender.clone(),
-            },
-            slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN),
-        );
-    }
-    let settlement = Arc::new(settlement);
+    let settlement = Arc::new(SettlementWatcher::new(
+        wal.clone(),
+        ctx.agent.clone(),
+        config.lending_canister,
+    ));
 
     let debt_asset_principals = debt_asset_principals(&ctx.registry);
     let debt_assets = debt_assets_as_text(&debt_asset_principals);
@@ -860,7 +836,7 @@ mod tests {
             liquidation_result: None,
             status: ExecutionStatus::Success,
             change_received: true,
-            collateral_release: None,
+            collateral_held_as_supply: false,
         };
         let wrapper = LiqMetaWrapper {
             meta_v2: Some(meta_v2),

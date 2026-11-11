@@ -100,21 +100,6 @@ impl SqliteWalStore {
         Ok(conn)
     }
 
-    /// Replaces a row's meta only if it still holds `expected_meta_json`. Returns whether it
-    /// did. A second process uses this so it never overwrites progress the bot made meanwhile.
-    pub fn replace_meta_if_unchanged(&self, liq_id: &str, expected_meta_json: &str, meta_json: &str) -> Result<bool> {
-        self.ensure_writable()?;
-        let mut conn = self.get_conn()?;
-        let updated = diesel::update(
-            tbl::table
-                .filter(tbl::liq_id.eq(liq_id))
-                .filter(tbl::meta_json.eq(expected_meta_json)),
-        )
-        .set((tbl::meta_json.eq(meta_json), tbl::updated_at.eq(now_secs())))
-        .execute(&mut conn)?;
-        Ok(updated == 1)
-    }
-
     pub(in crate::persistance) fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
             anyhow::bail!("wal store opened read-only");
