@@ -81,7 +81,7 @@ the requested subaccount is preserved.
 
 ## At a Glance
 
-- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. Add `rift` for a bridge-and-swap fallback on ckUSDC, ckUSDT, ckETH and ckBTC (see [Rift Venue](#rift-venue)). This release disables Kraken: `kraken` in the list stops startup.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. Add `rift` for a bridge-and-swap fallback on ckUSDC, ckUSDT, ckETH and ckBTC (see [Rift Venue](#rift-venue)). Add `kraken` for ICP, ckUSDC and ckETH on Kraken (see [Kraken Venue](#kraken-venue)).
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
@@ -900,11 +900,14 @@ liquidator tui --log-file ./liquidator.log
 
 ## Kraken Venue
 
-This release disables Kraken: `kraken` in `ENABLED_SWAP_VENUES` stops startup. When a release enables it again, Kraken is opt-in. Before you enable it:
+Kraken is opt-in. Before you enable it:
 
 1. Create an API key with balance and funding reads, order create and query, and withdrawal access only. Use an IP allowlist.
-2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address.
-3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a narrow `CEX_KRAKEN_AVAILABLE_PAIRS`, then add `kraken` to `ENABLED_SWAP_VENUES`.
+2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address. For a Solana deposit, create a permanent deposit address; the pipeline reads it and never creates one.
+3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a narrow `CEX_KRAKEN_AVAILABLE_PAIRS`.
+4. Run `liquidator kraken-check`. It reads the balances, the allowed markets and their minimums, and for each route the deposit address and whether our destination is a verified withdrawal address. It moves nothing. Fix each route it lists, then add `kraken` to `ENABLED_SWAP_VENUES`.
+
+Checked on 2026-11-11: ICP, USDC and ETH deposit and withdraw. The account offers no USDT deposit method, so ckUSDT cannot reach Kraken; USDT can still be withdrawn.
 
 Before any funds move, a Kraken quote checks the route: a deposit method and address for the asset and network (an ICP deposit that needs a memo is refused), the deposit minimum, and a verified withdrawal address. A refused route gets no quote, so the planner uses another venue.
 
