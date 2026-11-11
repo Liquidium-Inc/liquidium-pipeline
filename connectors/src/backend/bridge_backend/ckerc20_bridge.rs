@@ -18,8 +18,9 @@ use super::{
     },
     types::{
         BridgeError, CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus,
-        HelperContract, LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg,
-        WithdrawalDetail, WithdrawalError, WithdrawalRet, WithdrawalSearchParameter,
+        HelperContract, LedgerError, MinterWithdrawalStatus, TxFinalizedStatus, WithdrawErc20Arg, WithdrawErc20Error,
+        WithdrawErc20Ret, WithdrawalArg, WithdrawalDetail, WithdrawalError, WithdrawalProgress, WithdrawalRet,
+        WithdrawalSearchParameter,
     },
     utils::{ensure_source_matches_bridge_owner, parse_source_icp_account},
 };
@@ -1016,6 +1017,52 @@ where
         Ok(Some((route, parse_source_icp_account(&request.source_address)?)))
     }
 
+    /// The minter's record of one withdrawal as a bridge status. Only a
+    /// finalized, successful Ethereum transaction completes the bridge.
+    async fn withdrawal_progress(&self, withdrawal_id: u64) -> Result<BridgeStatus, BridgeError> {
+        let arg = Encode!(&WithdrawalSearchParameter::ByWithdrawalId(withdrawal_id))
+            .map_err(|e| BridgeError::Other(format!("encode withdrawal_status args failed: {e}")))?;
+        let minter = &self.cketh_minter_canister;
+        let records = self
+            .agent
+            .call_query::<Vec<WithdrawalProgress>>(minter, "withdrawal_status", arg)
+            .await
+            .map_err(|e| BridgeError::Unreadable(format!("withdrawal_status call failed for minter {minter}: {e}")))?;
+        let Some(record) = records.into_iter().find(|record| record.withdrawal_id == withdrawal_id) else {
+            return Ok(BridgeStatus::Unknown);
+        };
+        Ok(match record.status {
+            MinterWithdrawalStatus::Pending | MinterWithdrawalStatus::TxCreated => BridgeStatus::Pending,
+            MinterWithdrawalStatus::TxSent(tx) => {
+                log::debug!(
+                    "[ckerc20 bridge] withdrawal {withdrawal_id} is on Ethereum in {}, not final yet",
+                    tx.transaction_hash
+                );
+                BridgeStatus::Pending
+            }
+            MinterWithdrawalStatus::TxFinalized(TxFinalizedStatus::Success { transaction_hash, .. }) => {
+                log::info!("[ckerc20 bridge] withdrawal {withdrawal_id} is final on Ethereum in {transaction_hash}");
+                BridgeStatus::Completed
+            }
+            MinterWithdrawalStatus::TxFinalized(TxFinalizedStatus::PendingReimbursement(tx)) => {
+                log::warn!(
+                    "[ckerc20 bridge] withdrawal {withdrawal_id} failed on Ethereum in {} and waits for its reimbursement",
+                    tx.transaction_hash
+                );
+                BridgeStatus::Pending
+            }
+            MinterWithdrawalStatus::TxFinalized(TxFinalizedStatus::Reimbursed {
+                transaction_hash,
+                reimbursed_amount,
+                reimbursed_in_block,
+            }) => BridgeStatus::Canceled {
+                reason: Some(format!(
+                    "the minter reimbursed withdrawal {withdrawal_id} ({reimbursed_amount} units in block {reimbursed_in_block}) after Ethereum transaction {transaction_hash} failed"
+                )),
+            },
+        })
+    }
+
     /// Every withdrawal the minter holds for `sender`. A certified read goes
     /// through consensus, so a negative answer is safe to act on.
     async fn minter_withdrawals(&self, sender: &Account, certified: bool) -> Result<Vec<WithdrawalDetail>, String> {
@@ -1338,10 +1385,9 @@ where
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
         if bridge_id.starts_with("ic-withdraw:") || bridge_id.starts_with("ic-withdraw-eth:") {
-            // The reverse-route caller separately requires the exchange deposit
-            // credit before trading. This legacy status releases that polling
-            // phase; it is not evidence of an Ethereum payout or destination mint.
-            return Ok(BridgeStatus::Completed);
+            let withdrawal_id = minter_withdrawal_id(bridge_id)
+                .ok_or_else(|| BridgeError::Other(format!("bridge id {bridge_id} names no minter withdrawal")))?;
+            return self.withdrawal_progress(withdrawal_id).await;
         }
 
         // New handles persist the audit-log boundary taken before submission.

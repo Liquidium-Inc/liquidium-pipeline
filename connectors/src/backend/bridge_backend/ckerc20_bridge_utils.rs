@@ -143,7 +143,7 @@ pub(super) fn minter_withdrawal_id(bridge_id: &str) -> Option<u64> {
 }
 
 /// A handle rebuilt from the minter's withdrawal record. The record has no
-/// ckERC20 burn index, and the status poller only reads the prefix.
+/// ckERC20 burn index, and the status poller reads only the withdrawal id.
 pub(super) fn recovered_bridge_id(route_kind: BridgeRouteKind, withdrawal_id: u64) -> String {
     match route_kind {
         BridgeRouteKind::CkEthToEth => format!("ic-withdraw-eth:{withdrawal_id}"),

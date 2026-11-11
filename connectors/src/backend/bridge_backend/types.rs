@@ -447,6 +447,42 @@ pub(super) struct WithdrawalDetail {
     pub status: candid::Reserved,
 }
 
+/// A withdrawal's progress as the ckETH minter reports it, by its candid tags.
+#[allow(clippy::enum_variant_names)]
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+pub(super) enum MinterWithdrawalStatus {
+    Pending,
+    TxCreated,
+    TxSent(EthTransaction),
+    TxFinalized(TxFinalizedStatus),
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+pub(super) struct EthTransaction {
+    pub transaction_hash: String,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+pub(super) enum TxFinalizedStatus {
+    Success {
+        transaction_hash: String,
+        effective_transaction_fee: Option<Nat>,
+    },
+    PendingReimbursement(EthTransaction),
+    Reimbursed {
+        transaction_hash: String,
+        reimbursed_amount: Nat,
+        reimbursed_in_block: Nat,
+    },
+}
+
+/// The id and progress of one minter withdrawal. Candid skips the other fields.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct WithdrawalProgress {
+    pub withdrawal_id: u64,
+    pub status: MinterWithdrawalStatus,
+}
+
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub(super) struct RetrieveErc20Request {
     pub ckerc20_block_index: Nat,
