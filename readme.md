@@ -563,6 +563,13 @@ liquidation is in flight.
 Each top-up transfer is saved to `<DB_PATH>.resupply.json` before it is sent. A lost answer or a
 restart resumes that same transfer, which the ledger applies at most once, and no new top-up
 starts for that asset until it is decided. One that stays undecided alerts the operator channel.
+Check the ledger, then record what you found; a running bot applies it on its next pass:
+
+```bash
+liquidator supply top-ups                                        # open top-ups and their state
+liquidator supply resolve-top-up --asset ckUSDC --landed 123456  # the transfer is in this block
+liquidator supply resolve-top-up --asset ckUSDC --absent         # the transfer never happened
+```
 
 Profit figures in this mode charge two ledger fees per liquidation for the top-up (the wallet
 transfer and the pool's sweep) instead of the wallet-mode transfer fees.

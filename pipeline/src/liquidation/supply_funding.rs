@@ -492,6 +492,11 @@ impl<A: PipelineAgent + 'static> Resupplier<A> {
     }
 
     pub async fn run_once(&self) {
+        // Pick up operator decisions recorded by `liquidator supply resolve-top-up`.
+        if let Err(err) = self.journal.reload() {
+            tracing::error!(error = %err, "resupply journal cannot be read; no top-up runs this pass");
+            return;
+        }
         for target in &self.targets {
             // Credit any earlier deposit that landed but was not swept.
             self.sweep_leftover(target).await;

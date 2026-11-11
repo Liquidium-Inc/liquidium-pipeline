@@ -2,7 +2,9 @@
 //! instead of forgetting it or sending a second one.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::outbound::driver::OutboundRecord;
@@ -22,12 +24,7 @@ impl ResupplyJournal {
     /// Loads the journal. A missing file is an empty journal; an unreadable one is an error,
     /// because it may hold a send that already ran.
     pub fn open(path: PathBuf, now: i64) -> Result<Self, String> {
-        let mut records: BTreeMap<String, OutboundRecord> = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| format!("resupply journal {} is unreadable: {e}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => return Err(format!("could not read resupply journal {}: {e}", path.display())),
-        };
+        let mut records = Self::read(&path)?;
         // A send saved before a restart may have gone out.
         for record in records.values_mut() {
             record.mark_uncertain(now);
@@ -38,22 +35,67 @@ impl ResupplyJournal {
         })
     }
 
+    fn read(path: &Path) -> Result<BTreeMap<String, OutboundRecord>, String> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("resupply journal {} is unreadable: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(format!("could not read resupply journal {}: {e}", path.display())),
+        }
+    }
+
+    /// Reads the file again, so an operator decision recorded by the CLI reaches a running bot.
+    pub fn reload(&self) -> Result<(), String> {
+        let records = Self::read(&self.path)?;
+        *self.records.lock().expect("resupply journal lock") = records;
+        Ok(())
+    }
+
     pub fn get(&self, key: &str) -> Option<OutboundRecord> {
         self.records.lock().expect("resupply journal lock").get(key).cloned()
     }
 
-    /// Stores or clears the record for `key` and writes the journal before returning.
+    pub fn entries(&self) -> Vec<(String, OutboundRecord)> {
+        let records = self.records.lock().expect("resupply journal lock");
+        records
+            .iter()
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect()
+    }
+
+    /// Stores or clears the record for `key`. The change counts only once it is on disk: on an
+    /// error the journal keeps its previous contents, in memory and in the file.
     pub fn set(&self, key: &str, record: Option<OutboundRecord>) -> Result<(), String> {
         let mut records = self.records.lock().expect("resupply journal lock");
+        let mut candidate = records.clone();
         match record {
-            Some(record) => records.insert(key.to_string(), record),
-            None => records.remove(key),
+            Some(record) => candidate.insert(key.to_string(), record),
+            None => candidate.remove(key),
         };
 
-        let bytes = serde_json::to_vec_pretty(&*records).map_err(|e| format!("resupply journal encode error: {e}"))?;
+        self.write(&candidate)?;
+        *records = candidate;
+        Ok(())
+    }
+
+    /// Replaces the file through a synced temporary file, then syncs the directory entry.
+    fn write(&self, records: &BTreeMap<String, OutboundRecord>) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(records).map_err(|e| format!("resupply journal encode error: {e}"))?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, bytes).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("could not replace {}: {e}", self.path.display()))
+        let describe = |step: &str, e: std::io::Error| format!("could not {step} {}: {e}", self.path.display());
+
+        let mut file = File::create(&tmp).map_err(|e| describe("create the temporary file for", e))?;
+        file.write_all(&bytes).map_err(|e| describe("write", e))?;
+        file.sync_all().map_err(|e| describe("sync", e))?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| describe("replace", e))?;
+
+        let dir = match self.path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| describe("sync the directory of", e))
     }
 }
 
@@ -113,6 +155,39 @@ mod tests {
             reopened.get("ledger-a").unwrap().phase,
             OutboundPhase::Submitted { at: 42 }
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_write_changes_nothing_in_memory() {
+        // given a journal whose file cannot be written
+        let journal = ResupplyJournal::open(PathBuf::from("/nonexistent-dir/resupply.json"), 0).unwrap();
+
+        // when
+        let result = journal.set("ledger-a", Some(record(true)));
+
+        // then a later pass does not find a record that never reached the disk
+        assert!(result.is_err());
+        assert_eq!(journal.get("ledger-a"), None);
+    }
+
+    #[test]
+    fn reload_picks_up_a_decision_written_by_another_process() {
+        // given a running bot's journal and a CLI that opens the same file
+        let path = temp_path("reload");
+        let _ = std::fs::remove_file(&path);
+        let bot = ResupplyJournal::open(path.clone(), 0).unwrap();
+        bot.set("ledger-a", Some(record(true))).unwrap();
+        let cli = ResupplyJournal::open(path.clone(), 0).unwrap();
+        let mut decided = cli.get("ledger-a").unwrap();
+        decided.decide(crate::outbound::driver::OperatorDecision::Absent);
+        cli.set("ledger-a", Some(decided.clone())).unwrap();
+
+        // when
+        bot.reload().unwrap();
+
+        // then
+        assert_eq!(bot.get("ledger-a"), Some(decided));
         let _ = std::fs::remove_file(&path);
     }
 

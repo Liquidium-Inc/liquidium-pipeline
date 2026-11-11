@@ -11,6 +11,9 @@ use prettytable::{Cell, Row, Table, format};
 
 use crate::context::{PipelineContext, init_context};
 use crate::liquidation::supply_funding::{self, DepositError};
+use crate::liquidation::supply_resupply_journal::ResupplyJournal;
+use crate::outbound::driver::OperatorDecision;
+use crate::utils::now_ts;
 
 /// Registers a Liquidium profile for the liquidator principal, or shows the existing one.
 pub async fn register() -> Result<()> {
@@ -149,6 +152,62 @@ pub async fn withdraw(asset: &str, amount: &str) -> Result<()> {
         config.liquidator_principal
     );
     Ok(())
+}
+
+/// Lists supply top-up transfers that are saved and not decided yet.
+pub async fn top_ups() -> Result<()> {
+    let ctx = init_context().await.map_err(|e| anyhow!(e))?;
+    let journal = open_journal(&ctx)?;
+    let entries = journal.entries();
+    if entries.is_empty() {
+        println!("No supply top-up is open.");
+        return Ok(());
+    }
+
+    for (ledger, record) in entries {
+        let asset = icp_debt_tokens(&ctx)
+            .into_iter()
+            .find(|token| matches!(token, ChainToken::Icp { ledger: l, .. } if l.to_text() == ledger))
+            .map(|token| token.symbol())
+            .unwrap_or_else(|| ledger.clone());
+        println!("{asset}: send {} is {:?}", record.prepared.identity, record.phase);
+        println!("  payload: {}", record.prepared.payload);
+        if let Some(decision) = &record.decision {
+            println!("  operator decision: {decision:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Records what an operator found about a top-up the ledger could not decide. Check the ledger
+/// first: `landed` is the block index of the transfer, `absent` means it never happened.
+pub async fn resolve_top_up(asset: &str, landed: Option<String>, absent: bool) -> Result<()> {
+    let decision = match (landed, absent) {
+        (Some(receipt), false) => OperatorDecision::Landed { receipt },
+        (None, true) => OperatorDecision::Absent,
+        _ => bail!("pass exactly one of --landed <block index> or --absent"),
+    };
+
+    let ctx = init_context().await.map_err(|e| anyhow!(e))?;
+    let token = find_token(&ctx, asset)?;
+    let ChainToken::Icp { ledger, .. } = &token else {
+        bail!("{} is not an ICP ledger token", token.symbol());
+    };
+    let key = ledger.to_text();
+    let journal = open_journal(&ctx)?;
+    let mut record = journal
+        .get(&key)
+        .ok_or_else(|| anyhow!("no supply top-up is open for {}", token.symbol()))?;
+    record.decide(decision);
+    journal.set(&key, Some(record)).map_err(|e| anyhow!(e))?;
+    println!(
+        "Recorded. A running bot applies it on its next pass; run `liquidator supply top-ups` afterwards to confirm it cleared."
+    );
+    Ok(())
+}
+
+fn open_journal(ctx: &PipelineContext) -> Result<ResupplyJournal> {
+    ResupplyJournal::open(ResupplyJournal::path_for_db(&ctx.config.db_path), now_ts()).map_err(|e| anyhow!(e))
 }
 
 async fn existing_profile(ctx: &PipelineContext) -> Result<Option<Principal>> {

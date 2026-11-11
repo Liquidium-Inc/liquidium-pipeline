@@ -261,6 +261,22 @@ enum SupplyCommands {
         #[arg(long)]
         amount: String,
     },
+
+    // Lists supply top-up transfers that are not decided yet
+    TopUps,
+
+    // Records an operator's finding about an undecided supply top-up
+    ResolveTopUp {
+        /// Asset symbol (e.g., "ckUSDC")
+        #[arg(long)]
+        asset: String,
+        /// Block index of the transfer, when the ledger shows it landed
+        #[arg(long)]
+        landed: Option<String>,
+        /// The ledger shows the transfer never happened
+        #[arg(long)]
+        absent: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -548,6 +564,10 @@ async fn main() -> ExitCode {
                 SupplyCommands::Status => commands::supply::status().await,
                 SupplyCommands::Deposit { asset, amount } => commands::supply::deposit(&asset, &amount).await,
                 SupplyCommands::Withdraw { asset, amount } => commands::supply::withdraw(&asset, &amount).await,
+                SupplyCommands::TopUps => commands::supply::top_ups().await,
+                SupplyCommands::ResolveTopUp { asset, landed, absent } => {
+                    commands::supply::resolve_top_up(&asset, landed, absent).await
+                }
             };
             if let Err(e) = outcome {
                 eprintln!("Supply command failed: {:#}", e);
