@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashSet, sync::Mutex, time::Duration};
 
 use candid::{Encode, Nat, Principal};
@@ -18,6 +19,7 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 use crate::{
     approval_state::ApprovalState,
+    liquidation::supply_funding::LiquidationFunding,
     persistance::LiquidationIntentStore,
     utils::{approval_threshold, max_for_ledger},
     watchdog::{Watchdog, noop_watchdog},
@@ -46,9 +48,20 @@ pub struct BasicExecutor<A: PipelineAgent, D: LiquidationIntentStore + Sync + Se
     pub lending_canister: Principal,
     pub intents: Arc<D>,
     pub approval_state: Arc<ApprovalState>,
+    pub funding: LiquidationFunding,
+    in_flight: Arc<AtomicUsize>,
     /// Where a liquidation that may have run without a WAL row is reported.
     pub(crate) watchdog: Arc<dyn Watchdog>,
     low_balance_allowance_warned_ledgers: Mutex<HashSet<Principal>>,
+}
+
+/// Counts a liquidation as in flight until the guard is dropped.
+pub(crate) struct InFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
@@ -65,9 +78,32 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
             lending_canister,
             intents,
             approval_state,
+            funding: LiquidationFunding::Wallet,
+            in_flight: Arc::new(AtomicUsize::new(0)),
             watchdog: noop_watchdog(),
             low_balance_allowance_warned_ledgers: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn with_funding(mut self, funding: LiquidationFunding) -> Self {
+        self.funding = funding;
+        self
+    }
+
+    /// Shared count of liquidation calls whose receipt is not yet persisted. Wallet sweeps must
+    /// wait for zero so they never move collateral that has not been tracked yet.
+    pub fn in_flight_counter(&self) -> Arc<AtomicUsize> {
+        self.in_flight.clone()
+    }
+
+    pub(crate) fn begin_in_flight(&self) -> InFlightGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlightGuard(self.in_flight.clone())
+    }
+
+    /// Supply-funded liquidations never pull from the wallet, so they need no allowances.
+    fn needs_allowances(&self) -> bool {
+        self.funding == LiquidationFunding::Wallet
     }
 
     pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
@@ -76,6 +112,10 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
     }
 
     pub async fn init(&mut self, tokens: &[Principal]) -> Result<(), String> {
+        if !self.needs_allowances() {
+            info!("[executor] supply funding enabled; skipping lending allowances");
+            return Ok(());
+        }
         let results = self.collect_allowance_results(tokens).await;
         let mut stats = InitAllowanceStats::default();
         for (ledger, result) in results {
@@ -86,6 +126,9 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
     }
 
     pub async fn refresh_allowances(&self, tokens: &[Principal]) -> Result<(), String> {
+        if !self.needs_allowances() {
+            return Ok(());
+        }
         for (ledger, result) in self.collect_allowance_results(tokens).await {
             self.log_refresh_allowance_result(ledger, result);
         }

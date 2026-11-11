@@ -51,6 +51,8 @@ pub struct PipelineContext {
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
+    /// ICP ledger sends from the liquidator account that are saved before they run.
+    pub main_outbound: Arc<dyn OutboundSender>,
     /// Sends from the trader account that are saved before they run.
     pub trader_outbound: Arc<dyn OutboundSender>,
     pub icpswap_finalizer: Option<Arc<IcpswapFinalizer>>,
@@ -265,6 +267,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             solana_transfer_main,
         ));
         let main_transfers = TransferService::new(registry.clone(), transfer_router_main);
+        let main_outbound: Arc<dyn OutboundSender> = Arc::new(IcpSender::new(icp_backend_main.clone(), main_icp_account));
 
         let icp_transfer_trader = Arc::new(IcpTransferAdapter::new(icp_backend_trader.clone(), trader_icp_account));
         let evm_transfer_trader = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
@@ -368,6 +371,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             bridge_service: Arc::new(bridge_service),
             main_transfers: Arc::new(main_transfers),
             trader_transfers: Arc::new(trader_transfers),
+            main_outbound,
             trader_outbound,
             recovery_transfers: Arc::new(recovery_transfers),
             bridge_transfers: Arc::new(bridge_transfers),
@@ -523,6 +527,7 @@ mod tests {
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: "executions.csv".to_string(),
             buy_bad_debt: false,
+            liquidation_funding: Default::default(),
             db_path: "wal.db".to_string(),
             max_allowed_dex_slippage: 125,
             max_allowed_cex_slippage_bps: 200,

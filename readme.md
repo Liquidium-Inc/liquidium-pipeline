@@ -207,6 +207,8 @@ OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
 ```bash
 # Optional operation flags
 BUY_BAD_DEBT=false
+# wallet (default) or supply: pay liquidations from the liquidator's Liquidium supply
+LIQUIDATION_FUNDING=wallet
 DB_PATH=./wal.db
 EXPORT_PATH=executions.csv
 WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
@@ -548,6 +550,55 @@ The production finalizer quotes enabled venues through one amount-scoped adapter
 - **Idempotent operations** prevent double-liquidations
 
 ---
+
+## Supply Funding
+
+With `LIQUIDATION_FUNDING=supply`, the liquidator keeps its capital supplied in the Liquidium debt
+pools, where it earns supply yield, instead of holding it in the wallet. Liquidations call the lending
+canister's `liquidate_from_supply`, which repays the borrower by burning the liquidator's supply. No
+tokens move in and no ICRC-2 approvals are needed. Every 60 seconds the daemon supplies idle
+debt-asset balances in the main wallet (swap proceeds) back to their pools. It skips any pass where a
+liquidation is in flight.
+
+Each top-up transfer is saved to `<DB_PATH>.resupply.json` before it is sent. A lost answer or a
+restart resumes that same transfer, which the ledger applies at most once, and no new top-up
+starts for that asset until it is decided. One that stays undecided alerts the operator channel.
+Check the ledger, then record what you found; a running bot applies it on its next pass:
+
+```bash
+liquidator supply top-ups                                        # open top-ups and their state
+liquidator supply resolve-top-up --asset ckUSDC --send <id> --landed 123456  # it is in this block
+liquidator supply resolve-top-up --asset ckUSDC --send <id> --absent         # it never happened
+```
+
+Profit figures in this mode charge two ledger fees per liquidation for the top-up (the wallet
+transfer and the pool's sweep) instead of the wallet-mode transfer fees.
+
+The bot asks for seized collateral in cash. When the canister refuses that because the
+collateral pool has no free cash (`NoLiquidity`, or a partial fill below the minimum collateral),
+it calls once more and takes the collateral as supply in its own profile. That liquidation still
+closes the position, and the liquidator holds the collateral and its price risk until it is
+paid out.
+
+The canister keeps that liquidation's collateral transfer pending, so the receipt waits in
+`WaitingCollateral` like any unpaid collateral. On every settlement pass the bot checks the
+collateral pool's free cash and, once there is enough, calls `claim_liquidation_collateral`.
+The canister then pays the collateral to the liquidation's receiver through its normal
+collateral transfer, and the receipt moves on to the swap when that transfer has landed.
+
+The canister pays a liquidation out once, so a claim whose answer was lost is simply asked
+again. Collateral that is still parked in supply is not counted as capital for other
+liquidations, in the bot's sizing and in the canister.
+
+Requirements: the lending canister must expose `liquidate_from_supply`, and the liquidator's
+Liquidium profile must not borrow.
+
+```bash
+liquidator supply register                                # one-time: create the profile
+liquidator supply deposit --asset ckUSDC --amount 10000   # move wallet funds into supply
+liquidator supply status                                  # wallet vs supplied per asset
+liquidator supply withdraw --asset ckUSDC --amount all    # back to the wallet
+```
 
 ## CLI Commands
 

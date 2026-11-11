@@ -34,6 +34,7 @@ use crate::{
     },
     operator::OperatorDesk,
     liquidation::collateral_service::CollateralService,
+    liquidation::supply_funding::{self, LendingSupplyBalances, LiquidationFunding, Resupplier, WalHeldCollateral},
     persistance::{
         FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,
         WalStore, sqlite::SqliteWalStore,
@@ -55,6 +56,7 @@ use crate::{
     },
 };
 use ic_agent::Agent;
+use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
     tokens::{chain_token::ChainToken, token_registry::TokenRegistry},
@@ -238,12 +240,19 @@ async fn init(
         db.clone(),
         ctx.approval_state.clone(),
     )
+    .with_funding(config.liquidation_funding)
     .with_watchdog(slack_watchdog.clone());
 
     executor
         .init(&tokens)
         .await
         .map_err(|e| format!("executor token init failed: {e}"))?;
+    let supply_profile = match config.liquidation_funding {
+        LiquidationFunding::Wallet => None,
+        LiquidationFunding::Supply => {
+            Some(start_supply_funding(ctx.as_ref(), &executor, slack_watchdog.clone()).await?)
+        }
+    };
     let executor = Arc::new(executor);
 
     // One bridge for every exchange venue: they share its accounts, so they
@@ -349,7 +358,7 @@ async fn init(
         .filter_map(|venue_id| CexVenueProfile::for_venue(venue_id))
         .flat_map(|profile| profile.direct_assets().iter().map(|symbol| symbol.to_string()))
         .collect();
-    let strategy = SimpleLiquidationStrategy::new(
+    let mut strategy = SimpleLiquidationStrategy::new(
         config.clone(),
         registry.clone(),
         collateral_service.clone(),
@@ -358,12 +367,59 @@ async fn init(
     )
     .with_watchdog(wd)
     .with_venue_native_symbols(venue_native_symbols);
+    if let Some(profile) = supply_profile {
+        strategy = strategy.with_supply_balances(Arc::new(LendingSupplyBalances::new(
+            agent.clone(),
+            config.lending_canister,
+            profile,
+            Arc::new(WalHeldCollateral::new(db.clone())),
+        )));
+    }
 
     let exporter = Arc::new(ExportStage {
         path: config.export_path.clone(),
     });
 
     Ok((finder, strategy, executor, exporter, finalizer, db, operator))
+}
+
+/// Resolves the liquidator's Liquidium profile and starts supplying idle wallet balances.
+async fn start_supply_funding(
+    ctx: &PipelineContext,
+    executor: &BasicExecutor<Agent, SqliteWalStore>,
+    watchdog: Arc<dyn crate::watchdog::Watchdog>,
+) -> Result<Principal, String> {
+    use crate::liquidation::supply_resupply_journal::ResupplyJournal;
+
+    let config = &ctx.config;
+    let profile = supply_funding::lookup_profile(
+        ctx.agent.as_ref(),
+        &config.lending_canister,
+        config.liquidator_principal,
+    )
+    .await?
+    .ok_or_else(|| {
+        "LIQUIDATION_FUNDING=supply needs a Liquidium profile for the liquidator; run `liquidator supply register`"
+            .to_string()
+    })?;
+
+    let debt_tokens = ctx.registry.debt_assets().into_iter().map(|(_, token)| token).collect();
+    let resupplier = Resupplier::new(
+        ctx.agent.clone(),
+        config.lending_canister,
+        profile,
+        debt_tokens,
+        ctx.main_service.clone(),
+        ctx.main_outbound.clone(),
+        ResupplyJournal::open(ResupplyJournal::path_for_db(&config.db_path), crate::utils::now_ts())?,
+        watchdog,
+        executor.in_flight_counter(),
+    )
+    .await?;
+    Arc::new(resupplier).spawn();
+
+    info!(profile = %profile, "Supply funding enabled; liquidations burn supplied balance");
+    Ok(profile)
 }
 
 fn bridge_low_balance_service(ctx: &PipelineContext) -> Arc<BalanceService> {
@@ -501,6 +557,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         max_dex_slippage_bps = config.max_allowed_dex_slippage,
         max_cex_slippage_bps = config.max_allowed_cex_slippage_bps,
         buy_bad_debt = config.buy_bad_debt,
+        liquidation_funding = ?config.liquidation_funding,
         "Startup configuration"
     );
     info!("Liquidator started; scanning for liquidation opportunities...");
@@ -543,23 +600,25 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     }
 
     let low_balance_monitor = slack_watchdog.as_ref().map(|slack| {
-        Arc::new(LowBalanceMonitor::new(
-            vec![
+        let mut accounts = vec![MonitoredBalanceAccount {
+            label: "bridge",
+            service: bridge_low_balance_service(&ctx),
+            only_symbols: None,
+            exclude_symbols: None,
+        }];
+        // In supply mode the main wallet is swept into the pools on purpose.
+        if config.liquidation_funding == LiquidationFunding::Wallet {
+            accounts.insert(
+                0,
                 MonitoredBalanceAccount {
                     label: "main",
                     service: ctx.main_service.clone(),
                     only_symbols: None,
                     exclude_symbols: balance_check_exclude_from_env(),
                 },
-                MonitoredBalanceAccount {
-                    label: "bridge",
-                    service: bridge_low_balance_service(&ctx),
-                    only_symbols: None,
-                    exclude_symbols: None,
-                },
-            ],
-            slack.clone(),
-        ))
+            );
+        }
+        Arc::new(LowBalanceMonitor::new(accounts, slack.clone()))
     });
 
     let _execution_worker = match spawn_execution_worker(
@@ -771,11 +830,13 @@ mod tests {
                 debt_ref_price: Nat::from(0u8),
                 ref_price_at: 0,
                 debt_approval_needed: false,
+                supply_funded: false,
                 min_collateral_amount: Nat::from(0u8),
             },
             liquidation_result: None,
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let wrapper = LiqMetaWrapper {
             meta_v2: Some(meta_v2),

@@ -226,6 +226,60 @@ enum Commands {
         #[command(subcommand)]
         subcommand: AccountCommands,
     },
+
+    // Manages the liquidator's Liquidium supply (used with LIQUIDATION_FUNDING=supply)
+    Supply {
+        #[command(subcommand)]
+        subcommand: SupplyCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SupplyCommands {
+    // Registers a Liquidium profile for the liquidator principal
+    Register,
+
+    // Shows wallet and supplied balances per debt asset
+    Status,
+
+    // Supplies wallet funds to the asset's pool
+    Deposit {
+        /// Asset symbol (e.g., "ckUSDC")
+        #[arg(long)]
+        asset: String,
+        /// Amount as decimal, or "all"
+        #[arg(long)]
+        amount: String,
+    },
+
+    // Withdraws supply back to the liquidator wallet
+    Withdraw {
+        /// Asset symbol (e.g., "ckUSDC")
+        #[arg(long)]
+        asset: String,
+        /// Amount as decimal, or "all"
+        #[arg(long)]
+        amount: String,
+    },
+
+    // Lists supply top-up transfers that are not decided yet
+    TopUps,
+
+    // Records an operator's finding about an undecided supply top-up
+    ResolveTopUp {
+        /// Asset symbol (e.g., "ckUSDC")
+        #[arg(long)]
+        asset: String,
+        /// Send id shown by `supply top-ups`
+        #[arg(long)]
+        send: String,
+        /// Block index of the transfer, when the ledger shows it landed
+        #[arg(long)]
+        landed: Option<String>,
+        /// The ledger shows the transfer never happened
+        #[arg(long)]
+        absent: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -503,6 +557,26 @@ async fn main() -> ExitCode {
             };
             if let Err(e) = outcome {
                 eprintln!("Account command failed: {:#}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Supply { subcommand } => {
+            let outcome = match subcommand {
+                SupplyCommands::Register => commands::supply::register().await,
+                SupplyCommands::Status => commands::supply::status().await,
+                SupplyCommands::Deposit { asset, amount } => commands::supply::deposit(&asset, &amount).await,
+                SupplyCommands::Withdraw { asset, amount } => commands::supply::withdraw(&asset, &amount).await,
+                SupplyCommands::TopUps => commands::supply::top_ups().await,
+                SupplyCommands::ResolveTopUp {
+                    asset,
+                    send,
+                    landed,
+                    absent,
+                } => commands::supply::resolve_top_up(&asset, &send, landed, absent).await,
+            };
+            if let Err(e) = outcome {
+                eprintln!("Supply command failed: {:#}", e);
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS

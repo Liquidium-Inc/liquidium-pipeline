@@ -30,6 +30,9 @@ pub struct ExecutorRequest {
     pub ref_price_at: i64,
     #[serde(default)]
     pub debt_approval_needed: bool,
+    // True when the debt was paid by burning supplied balance, not by a wallet transfer.
+    #[serde(default)]
+    pub supply_funded: bool,
     #[serde(default)]
     pub min_collateral_amount: Nat,
 }
