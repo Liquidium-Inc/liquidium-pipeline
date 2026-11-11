@@ -5,7 +5,8 @@ use alloy::{
     sol,
 };
 use async_trait::async_trait;
-use candid::{Encode, Nat, Principal};
+use candid::{CandidType, Encode, Nat, Principal};
+use serde::de::DeserializeOwned;
 use icrc_ledger_types::icrc1::account::Account;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1020,14 +1021,10 @@ where
     /// The minter's record of one withdrawal as a bridge status. Only a
     /// finalized, successful Ethereum transaction completes the bridge.
     async fn withdrawal_progress(&self, withdrawal_id: u64) -> Result<BridgeStatus, BridgeError> {
-        let arg = Encode!(&WithdrawalSearchParameter::ByWithdrawalId(withdrawal_id))
-            .map_err(|e| BridgeError::Other(format!("encode withdrawal_status args failed: {e}")))?;
-        let minter = &self.cketh_minter_canister;
-        let records = self
-            .agent
-            .call_query::<Vec<WithdrawalProgress>>(minter, "withdrawal_status", arg)
+        let records: Vec<WithdrawalProgress> = self
+            .withdrawal_records(WithdrawalSearchParameter::ByWithdrawalId(withdrawal_id), false)
             .await
-            .map_err(|e| BridgeError::Unreadable(format!("withdrawal_status call failed for minter {minter}: {e}")))?;
+            .map_err(BridgeError::Unreadable)?;
         let Some(record) = records.into_iter().find(|record| record.withdrawal_id == withdrawal_id) else {
             return Ok(BridgeStatus::Unknown);
         };
@@ -1066,17 +1063,22 @@ where
     /// Every withdrawal the minter holds for `sender`. A certified read goes
     /// through consensus, so a negative answer is safe to act on.
     async fn minter_withdrawals(&self, sender: &Account, certified: bool) -> Result<Vec<WithdrawalDetail>, String> {
-        let arg = Encode!(&WithdrawalSearchParameter::BySenderAccount(*sender))
-            .map_err(|e| format!("encode withdrawal_status args failed: {e}"))?;
+        self.withdrawal_records(WithdrawalSearchParameter::BySenderAccount(*sender), certified)
+            .await
+    }
+
+    /// The minter's withdrawal records for one search, read as `T`.
+    async fn withdrawal_records<T: CandidType + DeserializeOwned + Send + 'static>(
+        &self,
+        search: WithdrawalSearchParameter,
+        certified: bool,
+    ) -> Result<Vec<T>, String> {
+        let arg = Encode!(&search).map_err(|e| format!("encode withdrawal_status args failed: {e}"))?;
         let minter = &self.cketh_minter_canister;
         let result = if certified {
-            self.agent
-                .call_update::<Vec<WithdrawalDetail>>(minter, "withdrawal_status", arg)
-                .await
+            self.agent.call_update::<Vec<T>>(minter, "withdrawal_status", arg).await
         } else {
-            self.agent
-                .call_query::<Vec<WithdrawalDetail>>(minter, "withdrawal_status", arg)
-                .await
+            self.agent.call_query::<Vec<T>>(minter, "withdrawal_status", arg).await
         };
         result.map_err(|e| format!("withdrawal_status call failed for minter {minter}: {e}"))
     }

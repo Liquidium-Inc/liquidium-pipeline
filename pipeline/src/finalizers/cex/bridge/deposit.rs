@@ -1,7 +1,7 @@
 //! A bridged deposit on the exchange side: the exchange balance baseline and the
 //! deposit address around the shared leg out, and its outcome mapped onto the steps.
 use super::*;
-use super::funding::credit_refusal;
+use super::funding::check_credit;
 use liquidium_pipeline_connectors::backend::cex_backend::FundingRoute;
 
 use crate::finalizers::bridge_legs::{
@@ -12,9 +12,7 @@ use crate::finalizers::bridge_legs::{
 /// The exchange deposit address, looked up when the provider call is saved.
 struct ExchangeDepositAddress<'a, C: CexBackend> {
     backend: &'a C,
-    asset: &'a str,
-    network: &'a str,
-    /// The route the exchange checks; its deposit amount is set per arrival.
+    /// The deposit and withdrawal the exchange checks; the amount is set per arrival.
     route: FundingRoute,
 }
 
@@ -23,7 +21,7 @@ impl<C: CexBackend> BridgeDestinationProvider for ExchangeDepositAddress<'_, C> 
     async fn destination(&self) -> Result<String, String> {
         Ok(self
             .backend
-            .get_deposit_address(self.asset, self.network)
+            .get_deposit_address(&self.route.deposit_asset, &self.route.deposit_network)
             .await?
             .address)
     }
@@ -35,7 +33,7 @@ impl<C: CexBackend> BridgeDestinationProvider for ExchangeDepositAddress<'_, C> 
             deposit_amount: expected_amount,
             ..self.route.clone()
         };
-        self.backend.check_funding_route(&route).await.map_err(credit_refusal)
+        check_credit(self.backend, &route).await
     }
 }
 
@@ -53,12 +51,7 @@ where
 
     /// A deposit through a bridge: the shared leg out, then the exchange balance
     /// check once the bridge completes.
-    pub(super) async fn deposit_bridged(
-        &self,
-        state: &mut CexState,
-        planned_asset: &str,
-        planned_network: &str,
-    ) -> Result<(), CexBackendError> {
+    pub(super) async fn deposit_bridged(&self, state: &mut CexState, planned_asset: &str) -> Result<(), CexBackendError> {
         let bridge = self.bridge_runtime()?;
         let route = Self::deposit_route(state, planned_asset)?;
         // The baseline is taken once, before the funding transfer is sized.
@@ -67,8 +60,6 @@ where
         }
         let destination = ExchangeDepositAddress {
             backend: self.backend.as_ref(),
-            asset: planned_asset,
-            network: planned_network,
             route: self.funding_route(state, 0.0)?,
         };
         // While the funding transfer is saved or in flight the step stays at

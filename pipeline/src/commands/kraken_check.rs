@@ -101,7 +101,6 @@ fn print_route(route: &KrakenRouteCheck, destination: &str) -> bool {
                 withdrawal.network.as_deref().unwrap_or("-"),
                 withdrawal.minimum
             );
-            println!("  verified:   {:?}", withdrawal.verified);
             match &withdrawal.fee_at_minimum {
                 Some(Ok(fee)) => println!("  target:     {destination} is verified; fee at the minimum {fee}"),
                 Some(Err(error)) => println!("  target:     {destination} is verified; fee read failed: {error}"),

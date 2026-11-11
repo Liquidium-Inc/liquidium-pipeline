@@ -330,7 +330,7 @@ where
         if !state.deposit.bridge.deposit_bridge_required {
             return self.deposit_direct(state, &planned_asset, &planned_network).await;
         }
-        self.deposit_bridged(state, &planned_asset, &planned_network).await
+        self.deposit_bridged(state, &planned_asset).await
     }
 
     /// Execute one resumable trade invocation for the current CEX route leg.
