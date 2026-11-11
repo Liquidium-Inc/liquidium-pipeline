@@ -608,8 +608,6 @@ const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 4] = ["icpswap", "mexc", "rift", "kraken"];
 pub(crate) const DEFAULT_RIFT_API_URL: &str = "https://api.rift.trade";
 pub(crate) const DEFAULT_RIFT_MAX_ORDER_USD: f64 = 25_000.0;
-/// Venues this release refuses to start with. Remove a venue here to release it.
-const RELEASE_DISABLED_SWAP_VENUES: [&str; 1] = ["kraken"];
 
 fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
     env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
@@ -791,11 +789,6 @@ fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
             return Err(format!(
                 "ENABLED_SWAP_VENUES contains unsupported venue `{venue_id}`; expected one of {}",
                 SUPPORTED_SWAP_VENUES.join(", ")
-            ));
-        }
-        if RELEASE_DISABLED_SWAP_VENUES.contains(&venue_id.as_str()) {
-            return Err(format!(
-                "ENABLED_SWAP_VENUES contains `{venue_id}`, which this release disables; remove it to start"
             ));
         }
         if !seen.insert(venue_id.clone()) {
@@ -1445,16 +1438,17 @@ mod tests {
         }
     }
 
-    /// This release disables Kraken, so a config that names it does not start.
-    #[cfg(not(feature = "simulator"))]
+    /// Kraken is opt-in: a config that names it starts with it.
     #[test]
-    fn kraken_stops_startup_until_it_is_released() {
+    fn kraken_is_enabled_when_the_config_names_it() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc,kraken");
+            env::set_var("ENABLED_SWAP_VENUES", "icpswap,rift,kraken");
         }
-        let error = parse_enabled_swap_venues_from_env().expect_err("Kraken is disabled in this release");
-        assert!(error.contains("`kraken`"), "{error}");
+        assert_eq!(
+            parse_enabled_swap_venues_from_env().unwrap(),
+            vec!["icpswap".to_string(), "rift".to_string(), "kraken".to_string()]
+        );
         unsafe {
             env::remove_var("ENABLED_SWAP_VENUES");
         }
