@@ -1833,6 +1833,11 @@ mod lost_submission_lookup {
         assert_eq!(minter_withdrawal_id("ic-withdraw:12:105"), Some(105));
         assert_eq!(minter_withdrawal_id("ic-withdraw:recovered:105"), Some(105));
         assert_eq!(minter_withdrawal_id("ic-withdraw-eth:77"), Some(77));
+        // Live handles print candid Nat with digit separators (row 1762).
+        assert_eq!(minter_withdrawal_id("ic-withdraw-eth:1_118_452"), Some(1_118_452));
+        assert_eq!(minter_withdrawal_id("ic-withdraw:812_326:1_118_316"), Some(1_118_316));
+        assert_eq!(minter_withdrawal_id("ic-withdraw-eth:"), None);
+        assert_eq!(minter_withdrawal_id("ic-withdraw-eth:12a"), None);
         assert_eq!(minter_withdrawal_id("0xabc"), None);
         assert_eq!(minter_withdrawal_id("ckmint:1:0xabc:{}"), None);
         assert_eq!(recovered_bridge_id(BridgeRouteKind::CkEthToEth, 77), "ic-withdraw-eth:77");

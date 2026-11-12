@@ -136,10 +136,20 @@ pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result
 /// The ckETH burn index inside a reverse-route handle. The minter indexes every
 /// withdrawal by it, so it is the one id that both handle formats share.
 pub(super) fn minter_withdrawal_id(bridge_id: &str) -> Option<u64> {
-    if let Some(id) = bridge_id.strip_prefix("ic-withdraw-eth:") {
-        return id.parse().ok();
+    let id = match bridge_id.strip_prefix("ic-withdraw-eth:") {
+        Some(id) => id,
+        None => bridge_id.strip_prefix("ic-withdraw:")?.rsplit(':').next()?,
+    };
+    parse_block_index(id)
+}
+
+/// A block index as a handle stores it. Handles print candid `Nat`, which
+/// groups digits with `_` (`1_118_452`), so the separators are dropped first.
+fn parse_block_index(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return None;
     }
-    bridge_id.strip_prefix("ic-withdraw:")?.rsplit(':').next()?.parse().ok()
+    text.replace('_', "").parse().ok()
 }
 
 /// A handle rebuilt from the minter's withdrawal record. The record has no
