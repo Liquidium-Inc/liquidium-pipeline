@@ -97,7 +97,8 @@ impl From<CexBackendError> for PreviewFailure {
 impl From<BridgeLegError> for PreviewFailure {
     fn from(error: BridgeLegError) -> Self {
         match error {
-            BridgeLegError::BelowMinimum(reason) => Self::Transport(reason),
+            // Both refuse this transport only; another one may still carry the amount.
+            BridgeLegError::BelowMinimum(reason) | BridgeLegError::GasShortfall(reason) => Self::Transport(reason),
             other => Self::Venue(other.to_string()),
         }
     }
@@ -622,5 +623,21 @@ where
         }
         side_costs.extend(budget.side_costs);
         Ok(net)
+    }
+}
+
+#[cfg(test)]
+mod preview_failure_tests {
+    use super::*;
+
+    /// A gas shortfall belongs to one bridge route. It must not hide a direct
+    /// transport that already has a quote.
+    #[test]
+    fn a_gas_shortfall_refuses_its_transport_and_not_the_venue() {
+        let failure = PreviewFailure::from(BridgeLegError::GasShortfall("no ckETH".to_string()));
+        assert!(matches!(failure, PreviewFailure::Transport(_)), "{failure:?}");
+
+        let failure = PreviewFailure::from(BridgeLegError::Other("read failed".to_string()));
+        assert!(matches!(failure, PreviewFailure::Venue(_)), "{failure:?}");
     }
 }

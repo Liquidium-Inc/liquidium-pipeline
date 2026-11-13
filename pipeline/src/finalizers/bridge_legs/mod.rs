@@ -89,6 +89,10 @@ pub enum BridgeLegError {
     /// operator can say what happened, so no automatic retry is safe.
     #[error("{0}")]
     Ambiguous(String),
+    /// The route's own bridge account lacks the gas to start. No funds moved,
+    /// and another route can still carry the amount.
+    #[error("{0}")]
+    GasShortfall(String),
     /// Any other failure, under the caller's normal retry policy.
     #[error("{0}")]
     Other(String),
@@ -135,7 +139,7 @@ impl From<BridgeLegError> for CexBackendError {
         match error {
             BridgeLegError::BelowMinimum(message) => Self::BelowMinimum(message),
             BridgeLegError::Ambiguous(message) => Self::Ambiguous(message),
-            BridgeLegError::Other(message) => Self::Other(message),
+            BridgeLegError::GasShortfall(message) | BridgeLegError::Other(message) => Self::Other(message),
         }
     }
 }
@@ -237,7 +241,7 @@ impl From<BridgeLegError> for VenueStepError {
         match error {
             BridgeLegError::BelowMinimum(reason) => Self::BelowMinimum(reason),
             BridgeLegError::Ambiguous(reason) => Self::Ambiguous(reason),
-            BridgeLegError::Other(reason) => Self::Other(reason),
+            BridgeLegError::GasShortfall(reason) | BridgeLegError::Other(reason) => Self::Other(reason),
         }
     }
 }

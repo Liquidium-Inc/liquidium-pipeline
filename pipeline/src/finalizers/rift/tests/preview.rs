@@ -306,3 +306,17 @@ async fn a_pair_of_the_same_asset_is_unavailable() {
         "{error}"
     );
 }
+
+/// The ckERC20 withdrawal floors its amount, so the order asks the floored
+/// amount too. A rounded order sat one unit above the delivery.
+#[test]
+fn the_order_amount_floors_as_the_bridge_withdrawal_does() {
+    let delivered = crate::finalizers::rift::preview::delivered_units(&ckusdc(), 257.891063);
+
+    assert_eq!(delivered.value, Nat::from(257_891_062u64));
+    assert_eq!(
+        ChainTokenAmount::from_formatted(ckusdc(), 257.891063).value,
+        Nat::from(257_891_063u64),
+        "the rounded amount is one unit above what the bridge sends"
+    );
+}
