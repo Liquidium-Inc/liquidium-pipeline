@@ -267,11 +267,6 @@ impl<A: PipelineAgent> CkBtcMinter<A> {
         self.update("update_balance", &MinterAccountArgs::from(account)).await
     }
 
-    /// The deposits the minter has minted to `account`, whoever asked.
-    pub async fn get_known_utxos(&self, account: &Account) -> Result<Vec<Utxo>, String> {
-        self.query("get_known_utxos", &MinterAccountArgs::from(account)).await
-    }
-
     /// The fee a retrieval of `amount` pays, or the fee of a typical one.
     pub async fn estimate_withdrawal_fee(&self, amount: Option<u64>) -> Result<WithdrawalFee, String> {
         self.query("estimate_withdrawal_fee", &EstimateWithdrawalFeeArg { amount })

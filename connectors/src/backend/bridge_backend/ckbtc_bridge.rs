@@ -12,7 +12,8 @@ use super::{
     BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind,
     BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, resolve_route,
     utils::{
-        ensure_source_matches_bridge_owner, ledger_blocks, ledger_length, ledger_transaction, parse_source_icp_account,
+        account_transactions, ensure_source_matches_bridge_owner, ledger_index, ledger_transaction,
+        parse_source_icp_account,
     },
     validate_destination_for_route,
 };
@@ -38,10 +39,9 @@ pub const RETRIEVE_BRIDGE_ID_PREFIX: &str = "ckbtc-retrieve:";
 /// The handle of a minted deposit: the ckBTC ledger block of the mint, then
 /// the Bitcoin transaction that paid it.
 pub const MINT_BRIDGE_ID_PREFIX: &str = "ckbtc-mint:";
-/// How far back the ckBTC ledger is searched for a mint another caller
-/// triggered. The ledger writes a few thousand blocks a day.
-const MINT_SEARCH_WINDOW: u64 = 20_000;
-const MINT_SEARCH_CHUNK: u64 = 1_000;
+/// How many of the account's newest transactions are searched for a mint
+/// another caller triggered. An account that only trades fills it in months.
+const MINT_SEARCH_DEPTH: u64 = 200;
 
 /// True when a minter memo holds `bytes`. The memo is CBOR with an address
 /// or a transaction id as plain bytes inside, so they are searched directly.
@@ -188,47 +188,34 @@ where
     }
 
     /// Anyone may run `update_balance` for any account, so a deposit this
-    /// call did not mint may be minted already. The minter's known UTXOs say
-    /// so, and the mint's ledger memo names the block.
+    /// call did not mint may be minted already. The minter forgets a deposit
+    /// when it spends it, so the mint in the account's history decides.
     async fn minted_by_another_call(&self, account: &Account, txid: &str) -> Result<DepositNotice, String> {
-        let known = match self.minter.get_known_utxos(account).await {
-            Ok(known) => known,
-            Err(error) => return Ok(Self::unanswered("get_known_utxos", error)),
-        };
-        let Some(utxo) = known.into_iter().find(|utxo| display_txid(&utxo.outpoint.txid) == txid) else {
-            return Ok(DepositNotice::NotYet {
-                reason: format!("the minter does not see deposit {txid} yet"),
-            });
-        };
-        let block_index = match self.mint_block_of(account, &utxo.outpoint.txid).await {
-            Ok(Some(block_index)) => block_index,
-            Ok(None) => {
-                return Err(format!(
-                    "the minter minted deposit {txid} ({} satoshi) to {account}, but no mint in the last {MINT_SEARCH_WINDOW} ckBTC ledger blocks names it",
-                    utxo.value
-                ));
+        // The minter's memo holds the transaction id in Bitcoin's byte order.
+        let mut txid_bytes = hex::decode(txid).map_err(|error| format!("deposit {txid}: {error}"))?;
+        txid_bytes.reverse();
+        match self.mint_block_of(account, &txid_bytes).await {
+            Ok(Some(block_index)) => {
+                log::info!(
+                    "[ckbtc bridge] deposit {txid} was minted to {account} by another call, in ckBTC block {block_index}"
+                );
+                Ok(Self::accepted(block_index, txid))
             }
-            Err(error) => return Ok(Self::unanswered("the ckBTC ledger", error)),
-        };
-        log::info!(
-            "[ckbtc bridge] deposit {txid} ({} satoshi) was minted to {account} by another call, in ckBTC block {block_index}",
-            utxo.value
-        );
-        Ok(Self::accepted(block_index, txid))
+            Ok(None) => Ok(DepositNotice::NotYet {
+                reason: format!("no mint to {account} names deposit {txid} yet"),
+            }),
+            Err(error) => Ok(Self::unanswered("the ckBTC index", error)),
+        }
     }
 
-    /// The newest ledger block that mints to `account` with the deposit's
-    /// transaction in its memo, searched back from the tip.
+    /// The newest mint to `account` with the deposit's transaction in its memo.
     async fn mint_block_of(&self, account: &Account, txid: &[u8]) -> Result<Option<u64>, String> {
         let agent = self.minter.agent();
-        let tip = ledger_length(agent, self.ledger).await?;
-        let floor = tip.saturating_sub(MINT_SEARCH_WINDOW);
-        let mut end = tip;
-        while end > floor {
-            let start = end.saturating_sub(MINT_SEARCH_CHUNK).max(floor);
-            let mut blocks = ledger_blocks(agent, self.ledger, start, end - start).await?;
-            blocks.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
-            let found = blocks.into_iter().find(|(_, transaction)| {
+        let index = ledger_index(agent, self.ledger).await?;
+        let transactions = account_transactions(agent, index, account, MINT_SEARCH_DEPTH).await?;
+        Ok(transactions
+            .into_iter()
+            .find(|(_, transaction)| {
                 transaction.mint.as_ref().is_some_and(|mint| {
                     mint.to == *account
                         && mint
@@ -236,13 +223,8 @@ where
                             .as_ref()
                             .is_some_and(|memo| memo_holds(&memo.0, txid))
                 })
-            });
-            if let Some((index, _)) = found {
-                return Ok(Some(index));
-            }
-            end = start;
-        }
-        Ok(None)
+            })
+            .map(|(block_index, _)| block_index))
     }
 
     fn route_for_request(request: &BridgeRequest) -> Result<&'static BridgeRouteSpec, String> {

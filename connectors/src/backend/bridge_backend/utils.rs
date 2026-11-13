@@ -1,7 +1,8 @@
 use bitcoin::{Address as BitcoinAddress, Network};
-use candid::{Encode, Nat, Principal};
+use candid::{CandidType, Deserialize, Encode, Nat, Principal};
 use icrc_ledger_types::{
     icrc1::account::Account,
+    icrc106::errors::Icrc106Error,
     icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Transaction, TransactionRange},
 };
 use num_traits::ToPrimitive;
@@ -12,52 +13,61 @@ use super::{
 };
 use crate::pipeline_agent::PipelineAgent;
 
-/// The ledger's block count, so a search can start from the tip.
-pub(super) async fn ledger_length<A: PipelineAgent + ?Sized>(agent: &A, ledger: Principal) -> Result<u64, String> {
-    let request = GetTransactionsRequest {
-        start: Nat::from(0u8),
-        length: Nat::from(0u8),
-    };
-    let arg = Encode!(&request).map_err(|error| error.to_string())?;
-    let response: GetTransactionsResponse = agent.call_query(&ledger, "get_transactions", arg).await?;
-    nat_index(&response.log_length)
+#[derive(CandidType)]
+struct AccountTransactionsArgs {
+    account: Account,
+    start: Option<Nat>,
+    max_results: Nat,
 }
 
-/// The blocks from `start`, `length` of them, with their indexes. Blocks the
-/// ledger moved to an archive are read from there.
-pub(super) async fn ledger_blocks<A: PipelineAgent + ?Sized>(
+#[derive(CandidType, Deserialize)]
+pub(super) struct AccountTransactions {
+    pub(super) transactions: Vec<IndexedTransaction>,
+}
+
+#[derive(CandidType, Deserialize)]
+pub(super) struct IndexedTransaction {
+    pub(super) id: Nat,
+    pub(super) transaction: Transaction,
+}
+
+#[derive(CandidType, Deserialize)]
+pub(super) struct AccountTransactionsError {
+    pub(super) message: String,
+}
+
+pub(super) type AccountTransactionsAnswer = Result<AccountTransactions, AccountTransactionsError>;
+
+/// The index canister of `ledger`, as the ledger itself declares it (ICRC-106).
+pub(super) async fn ledger_index<A: PipelineAgent + ?Sized>(agent: &A, ledger: Principal) -> Result<Principal, String> {
+    let arg = Encode!().map_err(|error| error.to_string())?;
+    let answer: Result<Principal, Icrc106Error> = agent
+        .call_query(&ledger, "icrc106_get_index_principal", arg)
+        .await?;
+    answer.map_err(|error| format!("ledger {ledger} names no index canister: {error:?}"))
+}
+
+/// The newest `max_results` transactions of `account` with their block
+/// indexes, newest first, from the ledger's index canister.
+pub(super) async fn account_transactions<A: PipelineAgent + ?Sized>(
     agent: &A,
-    ledger: Principal,
-    start: u64,
-    length: u64,
+    index: Principal,
+    account: &Account,
+    max_results: u64,
 ) -> Result<Vec<(u64, Transaction)>, String> {
-    let request = GetTransactionsRequest {
-        start: Nat::from(start),
-        length: Nat::from(length),
+    let request = AccountTransactionsArgs {
+        account: *account,
+        start: None,
+        max_results: Nat::from(max_results),
     };
     let arg = Encode!(&request).map_err(|error| error.to_string())?;
-    let response: GetTransactionsResponse = agent.call_query(&ledger, "get_transactions", arg).await?;
-    let first = nat_index(&response.first_index)?;
-    let mut blocks: Vec<(u64, Transaction)> = indexed(first, response.transactions);
-    for archived in response.archived_transactions {
-        let request = GetTransactionsRequest {
-            start: archived.start.clone(),
-            length: archived.length.clone(),
-        };
-        let arg = Encode!(&request).map_err(|error| error.to_string())?;
-        let range: TransactionRange = agent
-            .call_query(&archived.callback.canister_id, &archived.callback.method, arg)
-            .await?;
-        blocks.extend(indexed(nat_index(&archived.start)?, range.transactions));
-    }
-    Ok(blocks)
-}
-
-fn indexed(first: u64, transactions: Vec<Transaction>) -> Vec<(u64, Transaction)> {
-    transactions
+    let answer: AccountTransactionsAnswer =
+        agent.call_query(&index, "get_account_transactions", arg).await?;
+    answer
+        .map_err(|error| format!("index {index} did not list {account}: {}", error.message))?
+        .transactions
         .into_iter()
-        .enumerate()
-        .map(|(offset, transaction)| (first + offset as u64, transaction))
+        .map(|entry| Ok((nat_index(&entry.id)?, entry.transaction)))
         .collect()
 }
 
