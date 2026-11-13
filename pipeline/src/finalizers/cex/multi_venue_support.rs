@@ -1,7 +1,7 @@
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::BridgeRouteKind,
-    cex_backend::{CexBackend, CexBackendError, FundingRoute, FundingRouteError},
+    cex_backend::{CexBackend, CexBackendError, FundingRouteError},
 };
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
@@ -10,6 +10,10 @@ use log::warn;
 use super::{finalizer::CexVenueFinalizer, utils::LIQUIDITY_EPS};
 use crate::{
     finalizers::{
+        bridge_legs::{
+            BridgeLegError, bridged_deposit_arrival, ensure_return_gas, fee_adjusted_transfer, net_of_withdraw_fee,
+            solana_repayment_bridge_amount,
+        },
         bridge_planner::{BridgePlan, BridgePlanner, BridgeTransportPlan},
         cex::state::{
             CexDepositBridgeState, CexDepositState, CexRouteLeg, CexState, CexStep, CexTradeState,
@@ -85,6 +89,16 @@ impl From<CexBackendError> for PreviewFailure {
     fn from(error: CexBackendError) -> Self {
         match error {
             CexBackendError::BelowMinimum(reason) => Self::Transport(reason),
+            other => Self::Venue(other.to_string()),
+        }
+    }
+}
+
+impl From<BridgeLegError> for PreviewFailure {
+    fn from(error: BridgeLegError) -> Self {
+        match error {
+            // Both refuse this transport only; another one may still carry the amount.
+            BridgeLegError::BelowMinimum(reason) | BridgeLegError::GasShortfall(reason) => Self::Transport(reason),
             other => Self::Venue(other.to_string()),
         }
     }
@@ -173,7 +187,6 @@ where
                     deposit_bridge_expected_amount: None,
                     deposit_bridge_provider_fee_budget_native_units: None,
                     deposit_bridge_call: None,
-                    legacy_bridge_submit_phase: None,
                     deposit_bridge_call_unrecorded: false,
                 },
             },
@@ -445,16 +458,10 @@ where
         }
         // The exchange confirms, before any funds move, that it credits this
         // deposit and pays out to this address.
-        self.backend
-            .check_funding_route(&FundingRoute {
-                deposit_asset: <Self as BridgePlanner>::planned_deposit_asset(&state),
-                deposit_network: <Self as BridgePlanner>::planned_deposit_network(&state),
-                deposit_amount: initial_amount,
-                withdraw_asset: <Self as BridgePlanner>::planned_withdraw_asset(&state),
-                withdraw_network: <Self as BridgePlanner>::planned_withdraw_network(&state),
-                withdraw_address: self.planned_withdraw_address(&state).map_err(PreviewFailure::Venue)?,
-            })
-            .await?;
+        let route = self
+            .funding_route(&state, initial_amount)
+            .map_err(PreviewFailure::Venue)?;
+        self.backend.check_funding_route(&route).await?;
         // Order book reads are untyped, so a failed read counts as a market that
         // cannot carry the amount. A typed read error is a follow-up.
         let legs = self
@@ -551,7 +558,7 @@ where
         side_costs: &mut Vec<SideCost>,
     ) -> Result<f64, PreviewFailure> {
         if !state.deposit.bridge.deposit_bridge_required {
-            let (_, executable_pay) = Self::compute_fee_adjusted_deposit_transfer(
+            let (_, executable_pay) = fee_adjusted_transfer(
                 &state.deposit.deposit_asset,
                 &state.size_in,
                 self.deposit_fee_count(&state.deposit.deposit_asset),
@@ -562,8 +569,7 @@ where
         let bridge = self.bridge_runtime().map_err(PreviewFailure::Venue)?;
         let route = Self::deposit_route(state, &<Self as BridgePlanner>::planned_deposit_asset(state))
             .map_err(PreviewFailure::Venue)?;
-        let arrival =
-            Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
+        let arrival = bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
         side_costs.extend(arrival.sizing.fee_budget.side_costs);
         Ok(arrival.expected_amount)
     }
@@ -592,7 +598,7 @@ where
                 terms.minimum
             )));
         }
-        let mut net = Self::net_of_withdraw_fee(trade_out, terms.fee).map_err(PreviewFailure::Transport)?;
+        let mut net = net_of_withdraw_fee(trade_out, terms.fee).map_err(PreviewFailure::Transport)?;
 
         let (true, Some(route)) = (
             state.withdraw.bridge.withdraw_bridge_required,
@@ -606,13 +612,32 @@ where
             .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
             .await
             .map_err(PreviewFailure::Venue)?;
+        ensure_return_gas(bridge, route, &budget)
+            .await
+            .map_err(PreviewFailure::Transport)?;
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
-            net = Self::solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)
+            net = solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)
                 .await?
                 .to_f64();
         }
         side_costs.extend(budget.side_costs);
         Ok(net)
+    }
+}
+
+#[cfg(test)]
+mod preview_failure_tests {
+    use super::*;
+
+    /// A gas shortfall belongs to one bridge route. It must not hide a direct
+    /// transport that already has a quote.
+    #[test]
+    fn a_gas_shortfall_refuses_its_transport_and_not_the_venue() {
+        let failure = PreviewFailure::from(BridgeLegError::GasShortfall("no ckETH".to_string()));
+        assert!(matches!(failure, PreviewFailure::Transport(_)), "{failure:?}");
+
+        let failure = PreviewFailure::from(BridgeLegError::Other("read failed".to_string()));
+        assert!(matches!(failure, PreviewFailure::Venue(_)), "{failure:?}");
     }
 }

@@ -67,9 +67,7 @@ pub fn build_mexc_finalizer(
         ctx.config.cex_mexc_available_pairs.clone(),
         ctx.config.cex_mexc_max_hops,
     );
-    Ok(Arc::new(
-        finalizer.with_best_output_routing(ctx.config.cex_mexc_best_output_routing),
-    ))
+    Ok(Arc::new(finalizer))
 }
 
 /// Kraken is opt-in: it needs its keys and an explicit market allowlist.

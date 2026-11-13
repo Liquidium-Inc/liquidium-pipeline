@@ -5,17 +5,17 @@ use std::cmp::max;
 
 use candid::Nat;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{
     BPS_DENOMINATOR, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError, KRAKEN_VENUE_ID,
-    MEXC_VENUE_ID,
+    MEXC_VENUE_ID, RIFT_VENUE_ID,
 };
 use crate::finalizers::multi_venue::{VenueRoutePreview, planning::venue_registry::VenuePreviewOutcome};
 
-/// The order the exchanges are asked in. A venue outside it follows in
-/// registry order.
-const CEX_POLICY_ORDER: [&str; 2] = [MEXC_VENUE_ID, KRAKEN_VENUE_ID];
+/// The order the overflow venues are asked in: MEXC, then Rift when MEXC's
+/// book is thin, then Kraken. A venue outside it follows in registry order.
+const CEX_POLICY_ORDER: [&str; 3] = [MEXC_VENUE_ID, RIFT_VENUE_ID, KRAKEN_VENUE_ID];
 
 /// Sorts the overflow venues into policy order. The sort is stable, so venues
 /// the policy does not name keep their registry order.
@@ -61,16 +61,40 @@ impl IcpswapFirstPlanner {
                 .join("; ");
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(summary));
         }
-        let ceiling_applies = self.overflow_venue_ids.len() > 1;
+        // A venue that can never carry the pair is no second exchange: it must
+        // not switch the ceiling on, and it has no quote to give.
+        let (venue_ids, absent): (Vec<&String>, Vec<&String>) = self.overflow_venue_ids.iter().partition(|venue_id| {
+            self.venues
+                .adapter(venue_id)
+                .is_none_or(|adapter| adapter.carries(&input.request_for(venue_id, pay_value.clone())))
+        });
+        let ceiling_applies = venue_ids.len() > 1;
         let mut legs = Vec::new();
         let mut remainder = pay_value;
         let mut refusals = Vec::new();
-        for (index, venue_id) in self.overflow_venue_ids.iter().enumerate() {
-            let is_last = index + 1 == self.overflow_venue_ids.len();
-            let refusal = match self.preview_cex(input, venue_id, remainder.clone()).await? {
+        // The pay amount of a thin-book partial or a capped slice that is still the
+        // last leg. The $ floor that kept it ignores each later venue's own minimum.
+        let mut open_partial: Option<Nat> = None;
+        for (index, venue_id) in venue_ids.iter().copied().enumerate() {
+            let is_last = index + 1 == venue_ids.len();
+            let slice = match self.venue_slice(input, venue_id, is_last, &remainder) {
+                Ok(slice) => slice,
+                Err(refusal) => {
+                    refusals.push(refusal);
+                    continue;
+                }
+            };
+            let capped = slice != remainder;
+            let refusal = match self.preview_cex(input, venue_id, slice.clone()).await? {
                 VenuePreviewOutcome::Quoted(preview) if !ceiling_applies || self.is_safe_cex(&preview) => {
                     legs.push(preview);
-                    return Ok(legs);
+                    if !capped {
+                        return Ok(legs);
+                    }
+                    // A capped slice is open too: the rest can be under the next venue's minimum.
+                    open_partial = Some(slice.clone());
+                    remainder -= slice;
+                    continue;
                 }
                 VenuePreviewOutcome::Quoted(preview) => {
                     let reason = format!(
@@ -79,7 +103,7 @@ impl IcpswapFirstPlanner {
                     );
                     if !is_last
                         && let Some(partial) = self
-                            .search_safe_cex_allocation(input, venue_id, remainder.clone())
+                            .search_safe_cex_allocation(input, venue_id, slice.clone())
                             .await?
                     {
                         let left = remainder.clone() - partial.request.pay_amount.value.clone();
@@ -87,6 +111,7 @@ impl IcpswapFirstPlanner {
                         // A dust remainder is never a leg, so the next exchange takes it all.
                         if input.meets_cex_minimum(&left_amount, self.config.cex_min_exec_usd) {
                             remainder = left;
+                            open_partial = Some(partial.request.pay_amount.value.clone());
                             legs.push(partial);
                         }
                     }
@@ -95,10 +120,50 @@ impl IcpswapFirstPlanner {
                         permanent: false,
                     }
                 }
-                VenuePreviewOutcome::BelowMinimum(reason) => Refusal {
-                    reason: format!("{} amount below minimum ({reason})", venue_id.to_uppercase()),
-                    permanent: true,
-                },
+                VenuePreviewOutcome::BelowMinimum(reason) => {
+                    let below = format!("{} amount below minimum ({reason})", venue_id.to_uppercase());
+                    // The partial gives way when this venue can take the whole
+                    // amount; otherwise it stays for a later venue.
+                    let Some(partial_value) = open_partial.clone() else {
+                        refusals.push(Refusal {
+                            reason: below,
+                            permanent: true,
+                        });
+                        continue;
+                    };
+                    let whole = remainder.clone() + partial_value.clone();
+                    match self
+                        .whole_amount_quote(input, venue_id, is_last, &whole, ceiling_applies)
+                        .await?
+                    {
+                        Ok((whole_slice, preview)) => {
+                            let given_back = legs.pop();
+                            debug_assert!(
+                                given_back
+                                    .as_ref()
+                                    .is_some_and(|leg| leg.request.pay_amount.value == partial_value),
+                                "the open partial is the last leg"
+                            );
+                            info!(
+                                "[multi-venue] liq_id={} {venue_id} takes the whole amount and the {} partial is dropped: the remainder was below the {venue_id} minimum ({reason})",
+                                input.liquidation_id,
+                                given_back.map_or_else(|| "-".to_string(), |leg| leg.venue_id),
+                            );
+                            legs.push(preview);
+                            open_partial = None;
+                            if whole_slice == whole {
+                                return Ok(legs);
+                            }
+                            remainder = whole - whole_slice;
+                            continue;
+                        }
+                        // The reason is kept: without it the row reports only the minimum.
+                        Err(whole_refusal) => Refusal {
+                            reason: format!("{below}; its quote for the whole amount failed: {}", whole_refusal.reason),
+                            permanent: whole_refusal.permanent,
+                        },
+                    }
+                }
                 VenuePreviewOutcome::Unavailable(error) => Refusal {
                     reason: format!("{} unavailable ({error})", venue_id.to_uppercase()),
                     permanent: false,
@@ -112,15 +177,105 @@ impl IcpswapFirstPlanner {
         }
         let summary = refusals
             .iter()
-            .map(|refusal| refusal.reason.as_str())
+            .map(|refusal| refusal.reason.clone())
+            .chain(
+                absent
+                    .iter()
+                    .map(|venue_id| format!("{} does not carry this pair", venue_id.to_uppercase())),
+            )
             .collect::<Vec<_>>()
             .join("; ");
         // Only an amount every exchange refused as too small is a dead end; an
         // outage or a thin book can clear by the next cycle (audit L17).
-        if legs.is_empty() && refusals.iter().all(|refusal| refusal.permanent) {
+        if legs.is_empty() && !refusals.is_empty() && refusals.iter().all(|refusal| refusal.permanent) {
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(summary));
         }
         Err(IcpswapFirstPlannerError::NoViableRoute(summary))
+    }
+
+    /// The venue's quote for `whole`, when an earlier partial gives way to it,
+    /// or why the venue cannot take it. Only a minimum is a permanent refusal.
+    async fn whole_amount_quote(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        venue_id: &str,
+        is_last: bool,
+        whole: &Nat,
+        ceiling_applies: bool,
+    ) -> Result<Result<(Nat, VenueRoutePreview), Refusal>, IcpswapFirstPlannerError> {
+        let whole_slice = match self.venue_slice(input, venue_id, is_last, whole) {
+            Ok(whole_slice) => whole_slice,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let (reason, permanent) = match self.preview_cex(input, venue_id, whole_slice.clone()).await? {
+            VenuePreviewOutcome::Quoted(preview) if !ceiling_applies || self.is_safe_cex(&preview) => {
+                return Ok(Ok((whole_slice, preview)));
+            }
+            VenuePreviewOutcome::Quoted(preview) => (
+                format!(
+                    "quote impact {:.2} bps exceeds {:.2} bps",
+                    preview.quote.estimated_price_impact_bps, self.config.max_cex_price_impact_bps
+                ),
+                false,
+            ),
+            VenuePreviewOutcome::BelowMinimum(reason) => (format!("below minimum ({reason})"), true),
+            VenuePreviewOutcome::Unavailable(error) => (format!("unavailable ({error})"), false),
+            VenuePreviewOutcome::Invalid(error) => (format!("quote rejected ({error})"), false),
+        };
+        Ok(Err(Refusal { reason, permanent }))
+    }
+
+    /// The most one order at this venue may carry, in pay units at the oracle
+    /// price. Only Rift has a cap. Without a price the cap cannot be sized, so
+    /// Rift refuses: an order with no bound is worse than no Rift leg.
+    fn venue_order_cap(&self, input: &IcpswapFirstPlanInput, venue_id: &str) -> Result<Option<Nat>, Refusal> {
+        if venue_id != RIFT_VENUE_ID {
+            return Ok(None);
+        }
+        let cap_usd = self.config.rift_max_order_usd;
+        match input.pay_reference_price_usd {
+            Some(price) if price.is_finite() && price > 0.0 && cap_usd.is_finite() && cap_usd > 0.0 => Ok(Some(
+                ChainTokenAmount::from_formatted(input.total_pay.token.clone(), cap_usd / price).value,
+            )),
+            _ => Err(Refusal {
+                reason: "RIFT order cap cannot be sized without a reference price".to_string(),
+                permanent: false,
+            }),
+        }
+    }
+
+    /// The amount one venue is asked for: all of `remainder`, or its order cap.
+    /// The last venue cannot pass an excess on, so it refuses instead.
+    fn venue_slice(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        venue_id: &str,
+        is_last: bool,
+        remainder: &Nat,
+    ) -> Result<Nat, Refusal> {
+        match self.venue_order_cap(input, venue_id)? {
+            Some(cap) if cap < *remainder => {
+                if is_last {
+                    return Err(Refusal {
+                        reason: format!(
+                            "{} amount exceeds its order cap of ${:.0}",
+                            venue_id.to_uppercase(),
+                            self.config.rift_max_order_usd
+                        ),
+                        permanent: false,
+                    });
+                }
+                let left = remainder.clone() - cap.clone();
+                let left_amount = ChainTokenAmount::from_raw(input.total_pay.token.clone(), left);
+                // A dust leftover is never a leg, so the cap gives way by that much.
+                if input.meets_cex_minimum(&left_amount, self.config.cex_min_exec_usd) {
+                    Ok(cap)
+                } else {
+                    Ok(remainder.clone())
+                }
+            }
+            _ => Ok(remainder.clone()),
+        }
     }
 
     /// One exchange's answer for an exact amount, after its amount check and

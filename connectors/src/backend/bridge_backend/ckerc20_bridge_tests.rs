@@ -1111,7 +1111,7 @@ async fn reverse_bridge_skips_approvals_when_icrc2_allowances_are_sufficient() {
     let ckusdc_ledger_for_fee = ckusdc_ledger;
     let cketh_ledger_for_fee = cketh_ledger;
     // The ckETH approve fee is part of the ckETH budget the withdrawal needs.
-    mock_icp.expect_icrc1_fee().times(2).returning(move |ledger| {
+    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
         if ledger == ckusdc_ledger_for_fee {
             Ok(Nat::from(10_000u64))
         } else if ledger == cketh_ledger_for_fee {
@@ -1246,7 +1246,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
     let ckusdc_ledger_for_fee = ckusdc_ledger;
     let cketh_ledger_for_fee = cketh_ledger;
     // The ckETH approve fee is part of the ckETH budget the withdrawal needs.
-    mock_icp.expect_icrc1_fee().times(2).returning(move |ledger| {
+    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
         if ledger == ckusdc_ledger_for_fee {
             Ok(Nat::from(10_000u64))
         } else if ledger == cketh_ledger_for_fee {
@@ -1494,7 +1494,7 @@ async fn native_reverse_bridge_allows_exact_minimum() {
         });
 
     let mut mock_icp = MockIcpBackend::new();
-    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+    mock_icp.expect_icrc1_fee().times(0).returning(move |ledger| {
         if ledger == cketh_ledger {
             Ok(Nat::from(2_000_000_000_000u64))
         } else {
@@ -1833,6 +1833,11 @@ mod lost_submission_lookup {
         assert_eq!(minter_withdrawal_id("ic-withdraw:12:105"), Some(105));
         assert_eq!(minter_withdrawal_id("ic-withdraw:recovered:105"), Some(105));
         assert_eq!(minter_withdrawal_id("ic-withdraw-eth:77"), Some(77));
+        // Live handles print candid Nat with digit separators (row 1762).
+        assert_eq!(minter_withdrawal_id("ic-withdraw-eth:1_118_452"), Some(1_118_452));
+        assert_eq!(minter_withdrawal_id("ic-withdraw:812_326:1_118_316"), Some(1_118_316));
+        assert_eq!(minter_withdrawal_id("ic-withdraw-eth:"), None);
+        assert_eq!(minter_withdrawal_id("ic-withdraw-eth:12a"), None);
         assert_eq!(minter_withdrawal_id("0xabc"), None);
         assert_eq!(minter_withdrawal_id("ckmint:1:0xabc:{}"), None);
         assert_eq!(recovered_bridge_id(BridgeRouteKind::CkEthToEth, 77), "ic-withdraw-eth:77");
@@ -2309,4 +2314,128 @@ fn minter_refusals_keep_their_kind() {
         BridgeError::from(WithdrawalError::TemporarilyUnavailable("busy".into())),
         BridgeError::Deferred(_)
     ));
+}
+
+/// A minter withdrawal is done only when its Ethereum transaction is final and
+/// succeeded. Before, every withdrawal handle read as done once submitted.
+mod withdrawal_progress {
+    use super::*;
+    use crate::backend::bridge_backend::BridgeStatus;
+    use crate::backend::bridge_backend::types::{
+        EthTransaction, MinterWithdrawalStatus, TxFinalizedStatus, WithdrawalProgress,
+    };
+
+    fn tx() -> EthTransaction {
+        EthTransaction {
+            transaction_hash: "0xabc".into(),
+        }
+    }
+
+    async fn status_of(bridge_id: &str, reply: Vec<WithdrawalProgress>) -> Result<BridgeStatus, BridgeError> {
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<Vec<WithdrawalProgress>>()
+            .times(1)
+            .returning(move |_, method, arg| {
+                assert_eq!(method, "withdrawal_status");
+                let parameter: super::super::WithdrawalSearchParameter = candid::decode_one(&arg).unwrap();
+                assert!(matches!(
+                    parameter,
+                    super::super::WithdrawalSearchParameter::ByWithdrawalId(105)
+                ));
+                Ok(reply.clone())
+            });
+        let backend = CkErc20BridgeBackend::new(
+            Arc::new(agent),
+            Arc::new(MockIcpBackend::new()),
+            Arc::new(MockBridgeEvmBackend::new()),
+            Principal::anonymous(),
+            Principal::management_canister(),
+        );
+        backend.get_bridge_status(bridge_id).await
+    }
+
+    fn record(status: MinterWithdrawalStatus) -> Vec<WithdrawalProgress> {
+        vec![WithdrawalProgress {
+            withdrawal_id: 105,
+            status,
+        }]
+    }
+
+    #[tokio::test]
+    async fn each_minter_status_maps_to_one_bridge_status() {
+        let cases = [
+            (MinterWithdrawalStatus::Pending, "pending"),
+            (MinterWithdrawalStatus::TxCreated, "pending"),
+            (MinterWithdrawalStatus::TxSent(tx()), "pending"),
+            (
+                MinterWithdrawalStatus::TxFinalized(TxFinalizedStatus::PendingReimbursement(tx())),
+                "pending",
+            ),
+            (
+                MinterWithdrawalStatus::TxFinalized(TxFinalizedStatus::Success {
+                    transaction_hash: "0xabc".into(),
+                    effective_transaction_fee: None,
+                }),
+                "completed",
+            ),
+            (
+                MinterWithdrawalStatus::TxFinalized(TxFinalizedStatus::Reimbursed {
+                    transaction_hash: "0xabc".into(),
+                    reimbursed_amount: Nat::from(60_000_000u64),
+                    reimbursed_in_block: Nat::from(812_400u64),
+                }),
+                "canceled",
+            ),
+        ];
+        for (status, expected) in cases {
+            let label = format!("{status:?}");
+            let got = status_of("ic-withdraw:812326:105", record(status)).await.unwrap();
+            let kind = match got {
+                BridgeStatus::Pending => "pending",
+                BridgeStatus::Completed => "completed",
+                BridgeStatus::Canceled { reason } => {
+                    assert!(reason.unwrap().contains("812_400"), "{label}");
+                    "canceled"
+                }
+                other => panic!("{label} mapped to {other:?}"),
+            };
+            assert_eq!(kind, expected, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_and_recovered_handles_read_the_same_withdrawal() {
+        for bridge_id in ["ic-withdraw-eth:105", "ic-withdraw:recovered:105"] {
+            let got = status_of(bridge_id, record(MinterWithdrawalStatus::Pending))
+                .await
+                .unwrap();
+            assert_eq!(got, BridgeStatus::Pending, "{bridge_id}");
+        }
+    }
+
+    /// No record is not a completion; a failed read is unreadable, never done.
+    #[tokio::test]
+    async fn a_missing_record_is_unknown_and_a_failed_read_is_unreadable() {
+        assert_eq!(
+            status_of("ic-withdraw:1:105", Vec::new()).await.unwrap(),
+            BridgeStatus::Unknown
+        );
+
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<Vec<WithdrawalProgress>>()
+            .returning(|_, _, _| Err("replica unreachable".into()));
+        let backend = CkErc20BridgeBackend::new(
+            Arc::new(agent),
+            Arc::new(MockIcpBackend::new()),
+            Arc::new(MockBridgeEvmBackend::new()),
+            Principal::anonymous(),
+            Principal::management_canister(),
+        );
+        assert!(matches!(
+            backend.get_bridge_status("ic-withdraw:1:105").await,
+            Err(BridgeError::Unreadable(_))
+        ));
+    }
 }

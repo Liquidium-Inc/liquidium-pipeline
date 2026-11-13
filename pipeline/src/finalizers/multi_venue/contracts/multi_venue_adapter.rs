@@ -110,6 +110,12 @@ pub trait MultiVenueAdapter: Send + Sync {
         Ok(())
     }
 
+    /// False when the venue can never carry this pair, whatever the amount.
+    /// The default carries every pair, so a venue opts out explicitly.
+    fn carries(&self, _request: &SwapRequest) -> bool {
+        true
+    }
+
     /// Checks provider amount limits without transferring or reserving funds.
     async fn check_amount(&self, _request: &SwapRequest) -> Result<(), VenueAmountError> {
         Ok(())

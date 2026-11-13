@@ -299,13 +299,13 @@ async fn mexc_resolves_ckusdt_to_icp_route_from_configured_pairs() {
     assert_eq!(legs[1].side, "buy");
 }
 
+/// At equal prices the direct market pays one taker fee and the hop route two,
+/// so the preview keeps the direct route.
 #[tokio::test]
 async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
 
-    let observed_markets = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
-    let observed_markets_handle = observed_markets.clone();
     let liquid = OrderBook {
         bids: vec![OrderBookLevel {
             price: 100.0,
@@ -317,25 +317,30 @@ async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
         }],
         taker_fee_bps: 10.0,
     };
+    let stable = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 1.0,
+            quantity: 1_000_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 1.0001,
+            quantity: 1_000_000.0,
+        }],
+        taker_fee_bps: 10.0,
+    };
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
         taker_fee_bps: 10.0,
     };
-    backend.expect_get_orderbook().returning(move |market, _limit| {
-        *observed_markets_handle
-            .lock()
-            .unwrap()
-            .entry(market.to_string())
-            .or_insert(0) += 1;
-        match market {
-            "BTC_USDT" => Ok(liquid.clone()),
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "BTC_USDT" | "BTC_USDC" => Ok(liquid.clone()),
             "USDT_BTC" => Ok(empty.clone()),
-            "BTC_USDC" => Ok(liquid.clone()),
-            "USDC_USDT" => Ok(liquid.clone()),
+            "USDC_USDT" => Ok(stable.clone()),
             _ => Err(format!("unexpected market {}", market)),
-        }
-    });
+        });
 
     backend
         .expect_execute_swap_detailed_with_options()
@@ -381,10 +386,6 @@ async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
     assert_eq!(state.trade.trade_resolved_legs[0].market, "BTC_USDT");
     assert_eq!(state.trade.trade_resolved_legs[0].side, "sell");
     assert!(matches!(state.step, CexStep::Withdraw));
-
-    let markets = observed_markets.lock().unwrap();
-    assert_eq!(markets.get("BTC_USDC").copied().unwrap_or(0), 0);
-    assert_eq!(markets.get("USDC_USDT").copied().unwrap_or(0), 0);
 }
 
 #[tokio::test]
@@ -662,46 +663,32 @@ async fn mexc_resolves_ckbtc_to_ckusdt_from_the_configured_pairs() {
     assert_eq!(markets(&legs), vec!["CKBTC_BTC", "BTC_USDT"]);
 }
 
+/// ETH/USDC has no fixed route any more. Without a direct market, the configured
+/// hops through USDT carry it, both ways.
 #[tokio::test]
-async fn mexc_resolves_eth_to_usdc_via_usdt_special_route_without_direct_probe() {
+async fn mexc_resolves_eth_and_usdc_through_configured_hops_without_a_direct_market() {
     let mut backend = MockCexBackend::new();
-    let transfers = MockTransferActions::new();
-    backend.expect_get_orderbook().times(0);
-
-    let finalizer =
-        test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(vec!["ETH_USDC".to_string()], 2);
+    let liquid = liquid_orderbook();
+    backend.expect_get_orderbook().returning(move |market, _| match market {
+        "ETH_USDT" | "USDC_USDT" => Ok(liquid.clone()),
+        _ => Err(format!("no market {market}")),
+    });
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
+        .with_route_config(vec!["ETH_USDT".to_string(), "USDC_USDT".to_string()], 2);
 
     let legs = finalizer
         .resolve_trade_legs_for_symbols("ETH", "USDC")
         .await
-        .expect("ETH -> USDC special route should resolve");
-
-    assert_eq!(legs.len(), 2);
-    assert_eq!(legs[0].market, "ETH_USDT");
-    assert_eq!(legs[0].side, "sell");
-    assert_eq!(legs[1].market, "USDC_USDT");
-    assert_eq!(legs[1].side, "buy");
-}
-
-#[tokio::test]
-async fn mexc_resolves_usdc_to_eth_via_usdt_special_route_without_direct_probe() {
-    let mut backend = MockCexBackend::new();
-    let transfers = MockTransferActions::new();
-    backend.expect_get_orderbook().times(0);
-
-    let finalizer =
-        test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(vec!["USDC_ETH".to_string()], 2);
+        .expect("ETH -> USDC through USDT");
+    assert_eq!(markets(&legs), vec!["ETH_USDT", "USDC_USDT"]);
+    assert_eq!((legs[0].side.as_str(), legs[1].side.as_str()), ("sell", "buy"));
 
     let legs = finalizer
         .resolve_trade_legs_for_symbols("USDC", "ETH")
         .await
-        .expect("USDC -> ETH special route should resolve");
-
-    assert_eq!(legs.len(), 2);
-    assert_eq!(legs[0].market, "USDC_USDT");
-    assert_eq!(legs[0].side, "sell");
-    assert_eq!(legs[1].market, "ETH_USDT");
-    assert_eq!(legs[1].side, "buy");
+        .expect("USDC -> ETH through USDT");
+    assert_eq!(markets(&legs), vec!["USDC_USDT", "ETH_USDT"]);
+    assert_eq!((legs[0].side.as_str(), legs[1].side.as_str()), ("sell", "buy"));
 }
 
 #[tokio::test]
@@ -922,8 +909,7 @@ async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
         Arc::new(btc_usdt_books(usdc_fee_bps.clone())),
         Arc::new(MockTransferActions::new()),
     )
-    .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2)
-    .with_best_output_routing(true);
+    .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2);
 
     let small = finalizer
         .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
@@ -947,25 +933,9 @@ async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
     assert_eq!(markets(&expensive), vec!["BTC_USDT"]);
 }
 
-/// Without the switch, the first executable route stands, as before the workbench.
+/// No SOL-only market any more: a configured SOL book with the better price wins.
 #[tokio::test]
-async fn routing_keeps_the_first_executable_route_without_best_output() {
-    let finalizer = test_finalizer(
-        Arc::new(btc_usdt_books(Arc::new(AtomicU64::new(5)))),
-        Arc::new(MockTransferActions::new()),
-    )
-    .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2);
-
-    let legs = finalizer
-        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
-        .await
-        .unwrap();
-    assert_eq!(markets(&legs), vec!["BTC_USDT"]);
-}
-
-/// MEXC trades SOL on `SOL_USDT` only, so best-output routing must not pick a better SOL book.
-#[tokio::test]
-async fn best_output_routing_keeps_mexc_sol_on_its_one_market() {
+async fn best_output_routing_uses_any_configured_sol_market() {
     let mut backend = MockCexBackend::new();
     backend.expect_get_orderbook().returning(|market, _| match market {
         "SOL_USDT" => Ok(book(100.0, 1000.0, 5.0)),
@@ -974,13 +944,11 @@ async fn best_output_routing_keeps_mexc_sol_on_its_one_market() {
         _ => Err("unlisted market".to_string()),
     });
     let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
-        .with_route_config(vec!["SOL_USDT".into(), "SOL_USDC".into(), "USDC_USDT".into()], 2)
-        .with_best_output_routing(true);
+        .with_route_config(vec!["SOL_USDT".into(), "SOL_USDC".into(), "USDC_USDT".into()], 2);
 
-    // Through SOL_USDC and back to USDT pays more, but MEXC must not trade SOL there.
     let legs = finalizer
         .resolve_trade_legs_for_amount("SOL", "USDT", 1.0)
         .await
         .unwrap();
-    assert_eq!(markets(&legs), vec!["SOL_USDT"]);
+    assert_eq!(markets(&legs), vec!["SOL_USDC", "USDC_USDT"]);
 }

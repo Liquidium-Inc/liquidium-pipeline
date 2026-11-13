@@ -13,8 +13,8 @@ use alloy::{
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::{
-        BridgeBackend, CkErc20BridgeBackend, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, RoutedBridgeBackend,
-        SolanaBridgeBackend, cketh_forward_routes,
+        BridgeBackend, CkBtcBridgeBackend, CkErc20BridgeBackend, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
+        RoutedBridgeBackend, SolanaBridgeBackend, cketh_forward_routes,
     },
     evm_backend::EvmBackendImpl,
     icp_backend::IcpBackendImpl,
@@ -108,6 +108,13 @@ impl BridgeRuntime {
             config.bridge_cketh_minter_canister,
             config.bridge_ic_owner_principal,
         ));
+        let btc_backend = Arc::new(CkBtcBridgeBackend::new(
+            bridge_agent.clone(),
+            Arc::new(IcpBackendImpl::new(bridge_agent.clone())),
+            config.bridge_ckbtc_minter_canister,
+            config.bridge_ckbtc_ledger_canister,
+            config.bridge_ic_owner_principal,
+        ));
         let bridge_solana_address = Keypair::new_from_array(config.bridge_solana_private_key_bytes)
             .pubkey()
             .to_string();
@@ -133,6 +140,7 @@ impl BridgeRuntime {
             backend: Arc::new(RoutedBridgeBackend {
                 evm: bridge_backend,
                 solana: solana_backend,
+                btc: btc_backend,
             }),
             sources: BridgeSourceAccounts {
                 ic: config.bridge_ic_account(),

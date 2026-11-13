@@ -11,3 +11,6 @@ _key
 key_
 liquidations.db
 *.daemon.lock
+
+# Leg files of `rift-swap-check` runs
+rift-check-*.json

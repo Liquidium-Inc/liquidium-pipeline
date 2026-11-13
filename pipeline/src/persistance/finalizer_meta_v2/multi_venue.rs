@@ -121,6 +121,9 @@ pub struct VenueLegState {
 pub enum VenueLegFailure {
     /// The amount fell under a route minimum during execution.
     BelowMinimum,
+    /// The venue refunded the deposit to a wallet outside the pipeline's
+    /// accounts. An operator moves the funds by hand.
+    Refunded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

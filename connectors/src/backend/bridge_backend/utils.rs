@@ -1,10 +1,154 @@
 use bitcoin::{Address as BitcoinAddress, Network};
+use candid::{CandidType, Deserialize, Encode, Nat, Principal};
+use icrc_ledger_types::{
+    icrc1::account::Account,
+    icrc106::errors::Icrc106Error,
+    icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Transaction, TransactionRange},
+};
+use num_traits::ToPrimitive;
 use std::str::FromStr;
 
 use super::{
-    BridgeDestination, BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec, BridgeSweepRoute,
-    catalog::BRIDGE_ROUTE_CATALOG,
+    BridgeDestination, BridgeDestinationKind, BridgeRouteSpec, BridgeSweepRoute, catalog::BRIDGE_ROUTE_CATALOG,
 };
+use crate::pipeline_agent::PipelineAgent;
+
+#[derive(CandidType)]
+struct AccountTransactionsArgs {
+    account: Account,
+    start: Option<Nat>,
+    max_results: Nat,
+}
+
+#[derive(CandidType, Deserialize)]
+pub(super) struct AccountTransactions {
+    pub(super) transactions: Vec<IndexedTransaction>,
+}
+
+#[derive(CandidType, Deserialize)]
+pub(super) struct IndexedTransaction {
+    pub(super) id: Nat,
+    pub(super) transaction: Transaction,
+}
+
+#[derive(CandidType, Deserialize)]
+pub(super) struct AccountTransactionsError {
+    pub(super) message: String,
+}
+
+pub(super) type AccountTransactionsAnswer = Result<AccountTransactions, AccountTransactionsError>;
+
+/// The index canister of `ledger`, as the ledger itself declares it (ICRC-106).
+pub(super) async fn ledger_index<A: PipelineAgent + ?Sized>(agent: &A, ledger: Principal) -> Result<Principal, String> {
+    let arg = Encode!().map_err(|error| error.to_string())?;
+    let answer: Result<Principal, Icrc106Error> = agent
+        .call_query(&ledger, "icrc106_get_index_principal", arg)
+        .await?;
+    answer.map_err(|error| format!("ledger {ledger} names no index canister: {error:?}"))
+}
+
+/// The newest `max_results` transactions of `account` with their block
+/// indexes, newest first, from the ledger's index canister.
+pub(super) async fn account_transactions<A: PipelineAgent + ?Sized>(
+    agent: &A,
+    index: Principal,
+    account: &Account,
+    max_results: u64,
+) -> Result<Vec<(u64, Transaction)>, String> {
+    let request = AccountTransactionsArgs {
+        account: *account,
+        start: None,
+        max_results: Nat::from(max_results),
+    };
+    let arg = Encode!(&request).map_err(|error| error.to_string())?;
+    let answer: AccountTransactionsAnswer =
+        agent.call_query(&index, "get_account_transactions", arg).await?;
+    answer
+        .map_err(|error| format!("index {index} did not list {account}: {}", error.message))?
+        .transactions
+        .into_iter()
+        .map(|entry| Ok((nat_index(&entry.id)?, entry.transaction)))
+        .collect()
+}
+
+fn nat_index(value: &Nat) -> Result<u64, String> {
+    value
+        .0
+        .to_u64()
+        .ok_or_else(|| format!("ledger index {value} does not fit in u64"))
+}
+
+/// Parses a source ICP account from either textual `Account` form or principal text.
+/// If only principal text is provided, `subaccount` is set to `None`.
+pub(super) fn parse_source_icp_account(source_address: &str) -> Result<Account, String> {
+    if let Ok(account) = Account::from_str(source_address.trim()) {
+        return Ok(account);
+    }
+    if let Ok(owner) = Principal::from_str(source_address.trim()) {
+        return Ok(Account {
+            owner,
+            subaccount: None,
+        });
+    }
+    Err(format!(
+        "invalid source ICP account '{}'; expected principal or Account text",
+        source_address
+    ))
+}
+
+/// Verifies reverse-route source account ownership and enforces principal-only source
+/// accounts for bridge flow safety.
+pub(super) fn ensure_source_matches_bridge_owner(
+    source_account: &Account,
+    bridge_owner: Principal,
+) -> Result<(), String> {
+    if source_account.owner != bridge_owner {
+        return Err(format!(
+            "source ICP account owner {} does not match configured bridge owner {}",
+            source_account.owner, bridge_owner
+        ));
+    }
+    if source_account.subaccount.is_some() {
+        return Err(
+            "bridge reverse route requires principal-only source account (subaccount must be None)".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The transaction `ledger` recorded at `block_index`, from the ledger or,
+/// for an older block, from its archive.
+pub(super) async fn ledger_transaction<A: PipelineAgent + ?Sized>(
+    agent: &A,
+    ledger: Principal,
+    block_index: u64,
+    what: &str,
+) -> Result<Transaction, String> {
+    let request = GetTransactionsRequest {
+        start: Nat::from(block_index),
+        length: Nat::from(1u8),
+    };
+    let arg = Encode!(&request).map_err(|error| error.to_string())?;
+    let response: GetTransactionsResponse = agent.call_query(&ledger, "get_transactions", arg.clone()).await?;
+    match response.transactions.into_iter().next() {
+        Some(transaction) if response.first_index == block_index => Ok(transaction),
+        _ => {
+            let archive = response
+                .archived_transactions
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("the {what} ledger has no block {block_index}"))?;
+            let range: TransactionRange = agent
+                .call_query(&archive.callback.canister_id, &archive.callback.method, arg)
+                .await?;
+            range
+                .transactions
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("the {what} archive has no block {block_index}"))
+        }
+    }
+}
 
 fn validate_solana_address(address: &str, field_name: &str) -> Result<(), String> {
     let trimmed = address.trim();
@@ -33,15 +177,20 @@ pub fn resolve_route(source_asset: &str, source_chain: &str, target_asset: &str)
     })
 }
 
+/// The route that moves `source_asset` off `source_chain`, whatever serves it.
+pub fn resolve_route_by_source(source_asset: &str, source_chain: &str) -> Option<&'static BridgeRouteSpec> {
+    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
+        source_asset.eq_ignore_ascii_case(route.source_asset) && source_chain.eq_ignore_ascii_case(route.source_chain)
+    })
+}
+
 pub fn resolve_cketh_forward_route_by_source(
     source_asset: &str,
     source_chain: &str,
 ) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
-        ) && source_asset.eq_ignore_ascii_case(route.source_asset)
+        route.route_kind.is_cketh_forward()
+            && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
     })
 }
@@ -51,10 +200,8 @@ pub fn resolve_cketh_reverse_route_by_source(
     source_chain: &str,
 ) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
-        ) && source_asset.eq_ignore_ascii_case(route.source_asset)
+        route.route_kind.is_cketh_reverse()
+            && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
     })
 }
@@ -81,23 +228,15 @@ pub fn resolve_forward_route_by_target(target_asset: &str) -> Option<&'static Br
 }
 
 pub fn resolve_cketh_forward_route_by_target(target_asset: &str) -> Option<&'static BridgeRouteSpec> {
-    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
-        ) && target_asset.eq_ignore_ascii_case(route.target_asset)
-    })
+    BRIDGE_ROUTE_CATALOG
+        .iter()
+        .find(|route| route.route_kind.is_cketh_forward() && target_asset.eq_ignore_ascii_case(route.target_asset))
 }
 
 pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {
     BRIDGE_ROUTE_CATALOG
         .iter()
-        .filter(|route| {
-            matches!(
-                route.route_kind,
-                BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
-            )
-        })
+        .filter(|route| route.route_kind.is_cketh_forward())
         .map(|route| BridgeSweepRoute {
             source_asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -110,12 +249,7 @@ pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {
 pub fn cketh_reverse_routes() -> Vec<BridgeSweepRoute> {
     BRIDGE_ROUTE_CATALOG
         .iter()
-        .filter(|route| {
-            matches!(
-                route.route_kind,
-                BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
-            )
-        })
+        .filter(|route| route.route_kind.is_cketh_reverse())
         .map(|route| BridgeSweepRoute {
             source_asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -181,9 +315,9 @@ mod tests {
         assert!(super::resolve_forward_route_by_target("ckBTC").is_none());
     }
 
-    use super::super::BridgeDestinationKind;
+    use super::super::{BridgeDestinationKind, BridgeRouteKind};
     use super::{
-        BridgeDestination, BridgeRouteKind, BridgeRouteSpec, cketh_forward_routes, cketh_reverse_routes,
+        BridgeDestination, BridgeRouteSpec, cketh_forward_routes, cketh_reverse_routes,
         resolve_cketh_forward_route_by_target, resolve_route, validate_destination_for_route,
     };
     use icrc_ledger_types::icrc1::account::Account;

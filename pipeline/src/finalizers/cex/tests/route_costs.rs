@@ -54,6 +54,11 @@ async fn bridged_preview_counts_both_bridges_and_the_mexc_withdrawal() {
             other => Err(format!("unexpected budget {other:?}")),
         });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.005));
+    // The bridge wallet can pay the return gas.
+    bridge.expect_get_gas_balance().returning(|chain, _| {
+        assert_eq!(chain, "ETH");
+        Ok(0.05)
+    });
     let pay = cketh_token();
     let receive = ckusdc_token();
     let registry = liquidium_pipeline_core::tokens::token_registry::TokenRegistry::new(HashMap::from([

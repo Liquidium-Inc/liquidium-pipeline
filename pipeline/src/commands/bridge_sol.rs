@@ -556,6 +556,10 @@ async fn notify_until_queued(
             Ok(DepositNotice::NotYet { reason }) => {
                 println!("Deposit not queued yet ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {reason}")
             }
+            Ok(DepositNotice::Held { reason }) => {
+                println!("Deposit held by the minter: {reason}");
+                return None;
+            }
             Err(error) => println!("Deposit notice failed ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {error}"),
         }
     }
@@ -925,6 +929,8 @@ mod tests {
             bridge_cketh_minter_canister: Principal::from_text("sv3dd-oaaaa-aaaar-qacoa-cai").expect("principal"),
             bridge_cksol_minter_canister: Principal::from_text("ljyxk-riaaa-aaaar-qb5mq-cai").expect("principal"),
             bridge_cksol_ledger_canister: Principal::from_text("la34w-haaaa-aaaar-qb5na-cai").expect("principal"),
+            bridge_ckbtc_minter_canister: Principal::from_text("mqygn-kiaaa-aaaar-qaadq-cai").expect("principal"),
+            bridge_ckbtc_ledger_canister: Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").expect("principal"),
             bridge_ic_proxy_canister: Some(env_proxy),
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: String::new(),
@@ -952,9 +958,13 @@ mod tests {
             cex_route_fee_bps: 25,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
-            cex_mexc_best_output_routing: false,
             cex_kraken_available_pairs: vec![],
             cex_kraken_max_hops: 2,
+            rift_api_url: crate::config::DEFAULT_RIFT_API_URL.to_string(),
+            rift_api_key: None,
+            rift_max_order_usd: 25_000.0,
+            rift_venue_allowlist: Vec::new(),
+            rift_venue_blocklist: Vec::new(),
             icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
                 .expect("principal"),
             icpswap_fee_tiers: vec![Nat::from(500u32), Nat::from(3000u32)],

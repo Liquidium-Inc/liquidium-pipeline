@@ -1,18 +1,17 @@
 use async_trait::async_trait;
 use candid::{CandidType, Encode, Nat, Principal};
-use icrc_ledger_types::{
-    icrc1::account::Account,
-    icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
-    icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Mint, TransactionRange},
-};
+use icrc_ledger_types::{icrc1::account::Account, icrc3::transactions::Mint};
 use num_traits::ToPrimitive;
 use serde::Deserialize;
 use std::{str::FromStr, sync::Arc};
 
 use super::{
     BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind,
-    BridgeRouteSpec, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice, catalog::BRIDGE_ROUTE_CATALOG,
-    resolve_route, validate_destination_for_route,
+    BridgeRouteSpec, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice,
+    catalog::BRIDGE_ROUTE_CATALOG,
+    resolve_route,
+    utils::{ledger_transaction, parse_source_icp_account},
+    validate_destination_for_route,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -26,8 +25,7 @@ use crate::{
         amount_utils::{amount_to_nat_units_strict, nat_units_to_amount_via_core},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
-            icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
-            icrc2_allowance_with_context, icrc2_approve_with_context,
+            MinterBurn, icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
         },
         solana_backend::SolanaBackend,
     },
@@ -220,22 +218,6 @@ where
         self
     }
 
-    fn parse_source_icp_account(source_address: &str) -> Result<Account, String> {
-        if let Ok(account) = Account::from_str(source_address.trim()) {
-            return Ok(account);
-        }
-        if let Ok(owner) = Principal::from_str(source_address.trim()) {
-            return Ok(Account {
-                owner,
-                subaccount: None,
-            });
-        }
-        Err(format!(
-            "invalid source ICP account '{}'; expected principal or Account text",
-            source_address
-        ))
-    }
-
     fn validate_solana_pubkey(address: &str, field_name: &str) -> Result<(), String> {
         let trimmed = address.trim();
         if trimmed.is_empty() {
@@ -285,7 +267,7 @@ where
     }
 
     fn ensure_principal_only_bridge_source(&self, source_address: &str) -> Result<Account, String> {
-        let source = Self::parse_source_icp_account(source_address)?;
+        let source = parse_source_icp_account(source_address)?;
         if source.owner != self.bridge_ic_owner_principal {
             return Err(format!(
                 "source ICP account owner {} does not match configured bridge owner {}",
@@ -522,46 +504,15 @@ where
             })
     }
 
-    async fn ensure_minter_allowance(&self, source_account: &Account, required_allowance: Nat) -> Result<(), String> {
-        let allowance_args = AllowanceArgs {
-            account: *source_account,
-            spender: Account {
-                owner: self.cksol_minter_canister,
-                subaccount: None,
-            },
-        };
-        let current_allowance = icrc2_allowance_with_context(
-            self.icp_backend.as_ref(),
-            self.cksol_ledger_canister,
-            allowance_args,
-            "cksol bridge",
-        )
-        .await?;
-        if current_allowance >= required_allowance {
-            return Ok(());
+    /// A burn of `source_account`'s ckSOL through the minter.
+    fn burn_from(&self, source_account: Account) -> MinterBurn<'_, B> {
+        MinterBurn {
+            backend: self.icp_backend.as_ref(),
+            ledger: self.cksol_ledger_canister,
+            account: source_account,
+            minter: self.cksol_minter_canister,
+            context: "cksol bridge",
         }
-
-        let approve_args = ApproveArgs {
-            from_subaccount: None,
-            spender: Account {
-                owner: self.cksol_minter_canister,
-                subaccount: None,
-            },
-            amount: required_allowance,
-            expected_allowance: None,
-            expires_at: None,
-            fee: None,
-            memo: None,
-            created_at_time: None,
-        };
-        icrc2_approve_with_context(
-            self.icp_backend.as_ref(),
-            self.cksol_ledger_canister,
-            approve_args,
-            "cksol bridge",
-        )
-        .await
-        .map(|_| ())
     }
 
     /// The minter deposit account for a mint to `destination`. Only the bridge
@@ -705,38 +656,10 @@ where
         }))
     }
 
-    /// The mint the ckSOL ledger recorded at `block_index`, read from the ledger
-    /// or, for an older block, from its archive.
+    /// The mint the ckSOL ledger recorded at `block_index`.
     async fn ledger_mint(&self, block_index: u64) -> Result<Mint, String> {
-        let request = GetTransactionsRequest {
-            start: Nat::from(block_index),
-            length: Nat::from(1u8),
-        };
-        let arg = Encode!(&request).map_err(|error| error.to_string())?;
-        let response: GetTransactionsResponse = self
-            .agent
-            .call_query(&self.cksol_ledger_canister, "get_transactions", arg.clone())
-            .await?;
-        let transaction = match response.transactions.into_iter().next() {
-            Some(transaction) if response.first_index == block_index => transaction,
-            _ => {
-                let archive = response
-                    .archived_transactions
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("the ckSOL ledger has no block {block_index}"))?;
-                let range: TransactionRange = self
-                    .agent
-                    .call_query(&archive.callback.canister_id, &archive.callback.method, arg)
-                    .await?;
-                range
-                    .transactions
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("the ckSOL archive has no block {block_index}"))?
-            }
-        };
-        transaction
+        ledger_transaction(self.agent.as_ref(), self.cksol_ledger_canister, block_index, "ckSOL")
+            .await?
             .mint
             .ok_or_else(|| format!("ckSOL block {block_index} is not a mint"))
     }
@@ -802,7 +725,7 @@ where
             .await
         {
             Ok(DepositNotice::Accepted(submission)) => return Ok(submission),
-            Ok(DepositNotice::NotYet { reason }) => reason,
+            Ok(DepositNotice::NotYet { reason }) | Ok(DepositNotice::Held { reason }) => reason,
             Err(error) => error,
         };
         let account = *Self::expect_icp_destination(route, &request.destination)?;
@@ -839,28 +762,7 @@ where
         let decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
         let amount_native = amount_to_nat_units_strict(request.amount, decimals)?;
-        let approve_fee =
-            icrc1_fee_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
-
-        let required_budget = amount_native.clone() + approve_fee;
-        let available_balance = icrc1_balance_with_context(
-            self.icp_backend.as_ref(),
-            self.cksol_ledger_canister,
-            &source_account,
-            "cksol bridge",
-        )
-        .await?;
-        if available_balance < required_budget {
-            let available_formatted = nat_units_to_amount_via_core(&available_balance, decimals)?;
-            let required_formatted = nat_units_to_amount_via_core(&required_budget, decimals)?;
-            return Err(format!(
-                "bridge amount preflight failed: ckSOL balance is below required burn+approve budget (available={} required={} source={})",
-                available_formatted, required_formatted, request.source_address
-            ));
-        }
-
-        self.ensure_minter_allowance(&source_account, amount_native.clone())
-            .await?;
+        self.burn_from(source_account).fund(&amount_native).await?;
 
         let amount_lamports = amount_native.0.to_u64().ok_or_else(|| {
             format!(
@@ -987,6 +889,26 @@ where
 
     async fn get_source_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
         Ok(self.get_fee_budget(asset, chain, target).await?.source_fee_budget)
+    }
+
+    async fn source_fee_due(
+        &self,
+        asset: &str,
+        chain: &str,
+        target: &str,
+        source_address: &str,
+        amount: f64,
+    ) -> Result<f64, String> {
+        let burn = resolve_route(asset, chain, target).filter(|route| route.route_kind == BridgeRouteKind::IcpToSolana);
+        if burn.is_none() {
+            return self.get_source_fee_budget(asset, chain, target).await;
+        }
+        let source_account = parse_source_icp_account(source_address)?;
+        let decimals =
+            icrc1_decimals_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
+        let amount_native = amount_to_nat_units_strict(amount, decimals)?;
+        let fee = self.burn_from(source_account).approve_fee_due(&amount_native).await?;
+        nat_units_to_amount_via_core(&fee, decimals)
     }
 
     async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
@@ -1757,6 +1679,7 @@ mod tests {
                     assert_eq!((saved.deposit_id, saved.transfer_signature.as_str()), (Some(42), "sig-9"));
                 }
                 DepositNotice::NotYet { reason } => assert!(!accepted && reason.contains("42"), "{reason}"),
+                DepositNotice::Held { reason } => panic!("a ckSOL notice is never held: {reason}"),
             }
         }
     }
@@ -2011,7 +1934,7 @@ mod tests {
         mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
         mock_icp
             .expect_icrc1_fee()
-            .times(1)
+            .times(0)
             .returning(|_| Ok(Nat::from(10_000u64)));
         mock_icp
             .expect_icrc1_balance()

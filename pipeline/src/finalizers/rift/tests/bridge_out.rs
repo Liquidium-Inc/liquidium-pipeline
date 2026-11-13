@@ -1,0 +1,204 @@
+//! The leg out on the Rift side: the order must still be payable, and the
+//! bridge must deliver exactly what the order expects.
+use super::*;
+use crate::utils::now_ts;
+
+#[tokio::test]
+async fn an_order_near_its_deadline_is_dropped_before_any_funding() {
+    let finalizer = finalizer(
+        MockRiftBackend::new(),
+        MockBridgeBackend::new(),
+        MockOutboundSender::new(),
+    );
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.order.as_mut().unwrap().deposit_deadline = deadline_in(30 * 60);
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.order.is_none());
+    assert!(state.quote_id.is_none());
+    assert_eq!(state.step, RiftStep::Order, "the next cycle quotes and orders again");
+}
+
+/// A funding transfer without a result may still land. A new order must not
+/// forget it, or the trader account pays twice.
+#[tokio::test]
+async fn an_unsettled_funding_transfer_settles_before_the_deadline_drops_the_order() {
+    let mut sender = MockOutboundSender::new();
+    sender.expect_settle().times(1).returning(|_| SendOutcome::Landed {
+        receipt: "block-9".into(),
+    });
+    let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), sender);
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.order.as_mut().unwrap().deposit_deadline = deadline_in(30 * 60);
+    state.funding = Some(crate::outbound::driver::OutboundRecord {
+        prepared: liquidium_pipeline_core::outbound::PreparedSend {
+            sender: "icp".into(),
+            identity: "funding-1".into(),
+            payload: "{}".into(),
+            replay_safe: false,
+        },
+        phase: crate::outbound::driver::OutboundPhase::Submitted { at: now_ts() },
+        decision: None,
+    });
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.order.is_some(), "the order stays while the transfer settles");
+    assert_eq!(state.funding_txid.as_deref(), Some("block-9"));
+    assert!(state.funds_left_trader_account());
+
+    // The landed funding stays known through the new order.
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.order.is_none());
+    assert_eq!(state.step, RiftStep::Order);
+    assert_eq!(state.funding_txid.as_deref(), Some("block-9"));
+    assert!(state.funds_left_trader_account(), "a minimum refusal cannot end the leg now");
+}
+
+#[tokio::test]
+async fn an_order_with_time_left_is_funded() {
+    let mut bridge = free_bridge();
+    bridge.expect_get_source_balance().times(0);
+    let finalizer = finalizer(MockRiftBackend::new(), bridge, landing_sender());
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.order.as_mut().unwrap().deposit_deadline = deadline_in(3 * 60 * 60);
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.funding.is_some(), "the funding transfer is saved");
+    assert!(state.send_saved);
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}
+
+#[tokio::test]
+async fn a_sized_amount_that_drifts_from_the_order_takes_a_new_order_instead_of_sending() {
+    let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), landing_sender());
+    let mut state = state_at(RiftStep::BridgeOut);
+    // The order was taken for 100.5; the bridge sizes 100 today.
+    state.amount_in = ChainTokenAmount::from_formatted(ckusdc(), 100.5);
+    state.order.as_mut().unwrap().amount_in = "100.5".to_string();
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.funding.is_none(), "the unsent transfer is dropped");
+    assert!(state.order.is_none());
+    assert_eq!(
+        state.amount_in.to_f64(),
+        100.0,
+        "the next order is for what the bridge delivers"
+    );
+    assert_eq!(state.step, RiftStep::Order);
+    assert!(!state.send_saved);
+}
+
+/// The headroom is by design, not a drift: the order asks for less than the
+/// bridge delivers.
+#[tokio::test]
+async fn an_order_under_the_arrival_by_its_headroom_is_funded() {
+    let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), landing_sender());
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.arrival_headroom = ChainTokenAmount::from_formatted(ckusdc(), 0.5);
+    state.amount_in = ChainTokenAmount::from_formatted(ckusdc(), 99.5);
+    state.order.as_mut().unwrap().amount_in = "99.5".to_string();
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.order.is_some(), "no new order");
+    assert!(state.funding.is_some(), "the funding transfer is saved");
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}
+
+#[tokio::test]
+async fn a_deadline_that_is_not_a_date_is_an_error_not_a_send() {
+    let finalizer = finalizer(
+        MockRiftBackend::new(),
+        MockBridgeBackend::new(),
+        MockOutboundSender::new(),
+    );
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.order.as_mut().unwrap().deposit_deadline = "next week".to_string();
+
+    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
+
+    assert!(error.to_string().contains("not a date"), "{error}");
+    assert!(state.order.is_some());
+}
+
+/// A withdrawal the provider holds as pending: the leg waits inside the
+/// delivery bound, then errors every cycle so the row alerts.
+#[tokio::test]
+async fn a_bridge_out_still_pending_past_the_delivery_bound_errors() {
+    use crate::finalizers::multi_venue::VenueStepError;
+    use liquidium_pipeline_connectors::backend::bridge_backend::BridgeStatus;
+
+    for (submitted_secs_ago, waits) in [(3 * 60 * 60, true), (5 * 60 * 60, false)] {
+        let mut bridge = MockBridgeBackend::new();
+        bridge
+            .expect_get_bridge_status()
+            .times(1)
+            .returning(|_| Ok(BridgeStatus::Pending));
+        let finalizer = finalizer(MockRiftBackend::new(), bridge, MockOutboundSender::new());
+        let mut state = state_at(RiftStep::BridgeOut);
+        state.order.as_mut().unwrap().deposit_deadline = deadline_in(6 * 24 * 60 * 60);
+        state.funding_txid = Some("block-9".to_string());
+        state.bridge_out.deposit_bridge_id = Some("bridge-out-1".to_string());
+        state.bridge_out.deposit_bridge_submitted_at_ts = Some(now_ts() - submitted_secs_ago);
+
+        let outcome = finalizer.advance_current_step(&mut state).await;
+
+        match outcome {
+            Ok(()) => assert!(waits, "past the bound the leg must error"),
+            Err(error) => assert!(
+                !waits && matches!(error, VenueStepError::Other(ref m) if m.contains("still waits")),
+                "{error}"
+            ),
+        }
+        assert_eq!(state.step, RiftStep::BridgeOut);
+    }
+}
+
+/// A leg at the bridge poll whose withdrawal the provider no longer lists,
+/// with Rift reporting the order as `rift_status`.
+async fn poll_a_withdrawal_the_provider_forgot(rift_status: RiftOrderStatus) -> RiftState {
+    use liquidium_pipeline_connectors::backend::bridge_backend::BridgeStatus;
+
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_get_bridge_status()
+        .times(1)
+        .returning(|_| Ok(BridgeStatus::Unknown));
+    let mut rift = MockRiftBackend::new();
+    rift.expect_order_state()
+        .times(1)
+        .returning(move |_| Ok(order_state(rift_status.clone(), None)));
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.funding_txid = Some("block-9".to_string());
+    state.bridge_out.deposit_bridge_id = Some("ckbtc-retrieve:77".to_string());
+    state.bridge_out.deposit_bridge_submitted_at_ts = Some(now_ts() - 60);
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+    state
+}
+
+/// Live on 2026-11-13: the ckBTC minter read `Unknown` for a withdrawal it
+/// had sent 22 hours before. Rift has the deposit, so the leg moves on.
+#[tokio::test]
+async fn a_withdrawal_the_provider_forgot_completes_when_rift_has_the_deposit() {
+    for status in [RiftOrderStatus::Funded, RiftOrderStatus::Executing, RiftOrderStatus::Delivered] {
+        let state = poll_a_withdrawal_the_provider_forgot(status.clone()).await;
+
+        assert_eq!(state.step, RiftStep::Swap, "{status:?}");
+        assert!(state.order.unwrap().wait_since_ts.is_some());
+    }
+}
+
+/// Without Rift's word the provider's silence proves nothing, so the leg waits as before.
+#[tokio::test]
+async fn a_withdrawal_the_provider_forgot_waits_while_rift_awaits_the_deposit() {
+    let state = poll_a_withdrawal_the_provider_forgot(RiftOrderStatus::AwaitingDeposit).await;
+
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}

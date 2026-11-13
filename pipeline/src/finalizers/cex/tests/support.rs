@@ -252,15 +252,23 @@ pub(super) fn is_direct_ck_market(market: &str) -> bool {
     matches!(market, "CKBTC_CKUSDT" | "CKUSDT_CKBTC")
 }
 
-/// Books for the four-leg route: no direct ck market, a liquid book elsewhere.
-pub(super) fn legacy_ck_route_books(cex: &mut MockCexBackend) {
-    cex.expect_get_orderbook().returning(|market, _| {
+/// The test exchange's books: no direct ck market, `book` on every other market.
+pub(super) fn books_except_direct_ck(
+    book: OrderBook,
+) -> impl Fn(&str, Option<u32>) -> Result<OrderBook, String> + Send + 'static {
+    move |market, _| {
         if is_direct_ck_market(market) {
             Err(format!("no market {market}"))
         } else {
-            Ok(liquid_orderbook())
+            Ok(book.clone())
         }
-    });
+    }
+}
+
+/// Books for the four-leg route: no direct ck market, a liquid book elsewhere.
+pub(super) fn legacy_ck_route_books(cex: &mut MockCexBackend) {
+    cex.expect_get_orderbook()
+        .returning(books_except_direct_ck(liquid_orderbook()));
 }
 
 /// The finalizer most tests use: an anonymous liquidator, the test tunables

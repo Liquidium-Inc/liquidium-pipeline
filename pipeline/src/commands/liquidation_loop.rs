@@ -26,8 +26,10 @@ use crate::{
             profile::CexVenueProfile,
             runtime::{build_kraken_finalizer, build_mexc_finalizer},
         },
+        rift::runtime::build_rift_finalizer,
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, KRAKEN_VENUE_ID, MEXC_VENUE_ID, MultiVenueAdapter,
+            RIFT_VENUE_ID,
             MultiVenueFinalizer,
         },
         profit_calculator::SimpleProfitCalculator,
@@ -268,6 +270,9 @@ async fn init(
                 };
                 venue_adapters.push(build_mexc_finalizer(ctx.as_ref(), bridge)?)
             }
+            RIFT_VENUE_ID => {
+                venue_adapters.push(build_rift_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?)
+            }
             KRAKEN_VENUE_ID => {
                 venue_adapters.push(build_kraken_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?)
             }
@@ -296,6 +301,7 @@ async fn init(
                 cycles_usd_per_trillion: config.cycles_usd_per_trillion,
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
                 mexc_test_allocation_usd: config.mexc_test_allocation_usd,
+                rift_max_order_usd: config.rift_max_order_usd,
             },
         )?
         .with_watchdog(slack_watchdog.clone())

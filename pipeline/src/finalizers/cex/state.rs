@@ -1,4 +1,3 @@
-use candid::Nat;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
 
@@ -56,40 +55,8 @@ pub struct CexDepositState {
     pub bridge: CexDepositBridgeState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CexDepositBridgeState {
-    /// The provider call that bridges the deposit, saved before it runs.
-    #[serde(default)]
-    pub deposit_bridge_call: Option<crate::outbound::driver::OutboundRecord>,
-    /// From rows saved before the outbound driver. It stays until the bridge
-    /// step upgrades it, so no save between can drop the call.
-    #[serde(default, rename = "deposit_bridge_submit_phase", skip_serializing_if = "Option::is_none")]
-    pub legacy_bridge_submit_phase: Option<crate::bridge::legacy::LegacyBridgeSubmitPhase>,
-    /// True on rows saved before the outbound driver, whose build called the
-    /// provider without a record. The bridge step clears it.
-    #[serde(default = "crate::bridge::legacy::saved_before_driver")]
-    pub deposit_bridge_call_unrecorded: bool,
-    #[serde(default)]
-    pub deposit_planned_asset: Option<String>,
-    #[serde(default)]
-    pub deposit_planned_network: Option<String>,
-    #[serde(default)]
-    pub deposit_bridge_required: bool,
-    #[serde(default)]
-    pub deposit_bridge_id: Option<String>,
-    #[serde(default)]
-    pub deposit_bridge_submitted_at_ts: Option<i64>,
-    #[serde(default)]
-    pub deposit_bridge_polled_at_ts: Option<i64>,
-    #[serde(default)]
-    pub deposit_bridge_destination_snapshot: Option<String>,
-    #[serde(default)]
-    pub deposit_bridge_submit_amount: Option<f64>,
-    #[serde(default)]
-    pub deposit_bridge_expected_amount: Option<f64>,
-    #[serde(default)]
-    pub deposit_bridge_provider_fee_budget_native_units: Option<Nat>,
-}
+/// The leg out, shared with every venue that bridges. CEX keeps its historical field names.
+pub use crate::finalizers::bridge_legs::BridgeOutState as CexDepositBridgeState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexTradeState {
@@ -187,53 +154,8 @@ pub struct CexWithdrawState {
     pub bridge: CexWithdrawBridgeState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CexWithdrawBridgeState {
-    #[serde(default)]
-    pub withdraw_bridge_mint_receipt: Option<liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt>,
-    #[serde(default)]
-    pub withdraw_planned_asset: Option<String>,
-    #[serde(default)]
-    pub withdraw_planned_network: Option<String>,
-    #[serde(default)]
-    pub withdraw_bridge_required: bool,
-    #[serde(default)]
-    pub withdraw_bridge_id: Option<String>,
-    #[serde(default)]
-    pub withdraw_bridge_submitted_at_ts: Option<i64>,
-    #[serde(default)]
-    pub withdraw_bridge_polled_at_ts: Option<i64>,
-    #[serde(default)]
-    pub withdraw_bridge_destination_snapshot: Option<String>,
-    /// The provider call that starts the return bridge, saved before it runs.
-    /// A lost answer settles from the provider history, never with a new call.
-    #[serde(default)]
-    pub withdraw_bridge_call: Option<crate::outbound::driver::OutboundRecord>,
-    /// The send that funds the return bridge, saved before it is sent.
-    #[serde(default)]
-    pub withdraw_bridge_funding: Option<crate::outbound::driver::OutboundRecord>,
-    /// The provider handle saved with that send. It turns the receipt into
-    /// a bridge id.
-    #[serde(default)]
-    pub withdraw_bridge_send_handle: Option<String>,
-    /// The chain receipt of that send, once it landed.
-    #[serde(default)]
-    pub withdraw_bridge_funding_txid: Option<String>,
-    /// When the send landed. The provider must accept it within a window.
-    #[serde(default)]
-    pub withdraw_bridge_funded_at_ts: Option<i64>,
-    /// How often that send reverted and was made again.
-    #[serde(default)]
-    pub withdraw_bridge_reverts: u32,
-}
-
-impl CexWithdrawBridgeState {
-    /// True once a deposit send exists. The source balance then no longer
-    /// holds the bridge amount, so the step must not size a new send.
-    pub fn deposit_send_started(&self) -> bool {
-        self.withdraw_bridge_funding.is_some() || self.withdraw_bridge_funding_txid.is_some()
-    }
-}
+/// The leg back, shared with every venue that bridges. CEX keeps its historical field names.
+pub use crate::finalizers::bridge_legs::BridgeInState as CexWithdrawBridgeState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexState {
@@ -313,7 +235,7 @@ impl CexState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candid::Principal;
+    use candid::{Nat, Principal};
 
     fn sample_state(liq_id: &str) -> CexState {
         let pay = ChainToken::Icp {
@@ -358,7 +280,6 @@ mod tests {
                     deposit_bridge_expected_amount: None,
                     deposit_bridge_provider_fee_budget_native_units: None,
                     deposit_bridge_call: None,
-                    legacy_bridge_submit_phase: None,
                     deposit_bridge_call_unrecorded: false,
                 },
             },
@@ -447,28 +368,27 @@ mod tests {
         assert_eq!(decoded.trade.trade_unexecutable_residual_in, None);
     }
 
+    /// The bridge leg states are shared with other venues now. A saved CEX row
+    /// is one flat object with the historical field names, so it loads as before.
     #[test]
-    fn a_legacy_journal_phase_survives_a_save_until_it_is_upgraded() {
-        let saved = r#"{"deposit_bridge_required":true,"deposit_bridge_submit_phase":{"Submitting":{"id":"a1","asset":"ckUSDC","destination":"0xabc","amount":1.5,"cursor":100,"started_at_ts":5,"called_at_ts":null,"parked_for_operator":true}}}"#;
-        let state: CexDepositBridgeState = serde_json::from_str(saved).unwrap();
-        use crate::bridge::legacy::LegacyBridgeSubmitPhase;
-        let Some(LegacyBridgeSubmitPhase::Submitting(attempt)) = &state.legacy_bridge_submit_phase else {
-            panic!("the saved attempt is read");
-        };
-        assert_eq!((attempt.id.as_str(), attempt.cursor), ("a1", Some(100)));
-        assert!(attempt.parked_for_operator);
-        let saved_again: CexDepositBridgeState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-        assert_eq!(saved_again.legacy_bridge_submit_phase, state.legacy_bridge_submit_phase);
-        assert!(state.deposit_bridge_call_unrecorded, "an old row may hold a call without a record");
-        let upgraded = CexDepositBridgeState::default();
-        let upgraded_json = serde_json::to_string(&upgraded).unwrap();
-        assert!(!upgraded_json.contains("deposit_bridge_submit_phase"));
-        let read_back: CexDepositBridgeState = serde_json::from_str(&upgraded_json).unwrap();
-        assert!(!read_back.deposit_bridge_call_unrecorded);
+    fn a_saved_row_keeps_its_flat_bridge_fields() {
+        let mut state = sample_state("row-1");
+        state.deposit.bridge.deposit_bridge_required = true;
+        state.deposit.bridge.deposit_bridge_id = Some("bridge-7".into());
+        state.withdraw.bridge.withdraw_bridge_required = true;
+        state.withdraw.bridge.withdraw_bridge_funding_txid = Some("0xsend".into());
 
-        let waiting: CexDepositBridgeState =
-            serde_json::from_str(r#"{"deposit_bridge_submit_phase":"WaitingFunds"}"#).unwrap();
-        assert_eq!(waiting.legacy_bridge_submit_phase, Some(LegacyBridgeSubmitPhase::WaitingFunds));
+        let json: serde_json::Value = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["deposit_bridge_id"], "bridge-7");
+        assert_eq!(json["withdraw_bridge_funding_txid"], "0xsend");
+        for nested in ["deposit", "withdraw", "bridge"] {
+            assert!(json.get(nested).is_none(), "{nested} must stay flat");
+        }
+
+        let read_back: CexState = serde_json::from_value(json).unwrap();
+        assert!(read_back.deposit.bridge.deposit_bridge_required);
+        assert_eq!(read_back.deposit.bridge.deposit_bridge_id.as_deref(), Some("bridge-7"));
+        assert!(read_back.withdraw.bridge.deposit_send_started());
     }
 
     #[test]

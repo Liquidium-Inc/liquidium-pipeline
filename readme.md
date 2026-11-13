@@ -62,8 +62,9 @@ withdrawal/bridge route back to the repayment wallet.
 For ckSOL repayment, MEXC trades into native SOL (for example, ICP → USDT →
 SOL), withdraws to the dedicated bridge Solana wallet, then deposits through
 the minter into the repayment ICP account. Include `ICP_USDT` and `SOL_USDT`
-in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. SOL trades always use
-`SOL_USDT`; USDC proceeds convert through `USDC_USDT` when needed. The bridge
+in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. SOL trades on the SOL
+markets in that list; with `SOL_USDT` alone, USDC proceeds convert through
+`USDC_USDT`. The bridge
 reserves SOL for its transfer fee and records the actual minted ckSOL amount. Mint
 destinations are restricted to the bridge owner or the configured liquidator;
 the requested subaccount is preserved.
@@ -80,7 +81,7 @@ the requested subaccount is preserved.
 
 ## At a Glance
 
-- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. This release disables Kraken: `kraken` in the list stops startup.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. Add `rift` for a bridge-and-swap fallback on ckUSDC, ckUSDT, ckETH and ckBTC (see [Rift Venue](#rift-venue)). Add `kraken` for ICP, ckUSDC and ckETH on Kraken (see [Kraken Venue](#kraken-venue)).
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
@@ -248,6 +249,10 @@ CEX_MEXC_API_SECRET=your_api_secret
 # CEX (Kraken) - Optional, only when `kraken` is in ENABLED_SWAP_VENUES
 CEX_KRAKEN_API_KEY=your_api_key
 CEX_KRAKEN_API_SECRET=your_api_secret
+# Rift - Optional, only when `rift` is in ENABLED_SWAP_VENUES
+RIFT_API_URL=https://api.rift.trade
+RIFT_API_KEY=your_api_key
+RIFT_MAX_ORDER_USD=25000
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 MAX_WIDENED_CEX_SLIPPAGE_BPS=400  # 4.00%: widest IOC limit after empty fills at the cap
 
@@ -318,6 +323,12 @@ Quick reference:
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
 | `CEX_KRAKEN_AVAILABLE_PAIRS` | Kraken's market allowlist. Required when `kraken` is enabled: Kraken never trades outside it, and startup stops if it is empty. |
 | `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops in Kraken's route search; defaults to 2. |
+| `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. |
+| `RIFT_API_KEY` | Optional. Names the integrator to Rift; without it Rift serves one request per second. |
+| `BRIDGE_CKBTC_MINTER_CANISTER` | The ckBTC minter; defaults to `mqygn-kiaaa-aaaar-qaadq-cai`. |
+| `BRIDGE_CKBTC_LEDGER_CANISTER` | The ckBTC ledger the minter burns from; defaults to `mxzaz-hqaaa-aaaar-qaada-cai`. |
+| `RIFT_VENUE_ALLOWLIST`, `RIFT_VENUE_BLOCKLIST` | Comma-separated Rift venue names that may, or never may, route an order. A venue's own confirmation count sets a leg's duration, and Rift does not report it. Measured on 2026-11-10 for ckBTC: the OTC route took 120 minutes to deliver, `near_intents` 16, so `RIFT_VENUE_BLOCKLIST=rift_otc` is the shipped default. |
+| `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -889,15 +900,49 @@ liquidator tui --log-file ./liquidator.log
 
 ## Kraken Venue
 
-This release disables Kraken: `kraken` in `ENABLED_SWAP_VENUES` stops startup. When a release enables it again, Kraken is opt-in. Before you enable it:
+Kraken is opt-in. Before you enable it:
 
 1. Create an API key with balance and funding reads, order create and query, and withdrawal access only. Use an IP allowlist.
-2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address.
-3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a narrow `CEX_KRAKEN_AVAILABLE_PAIRS`, then add `kraken` to `ENABLED_SWAP_VENUES`.
+2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address. For a Solana deposit, create a permanent deposit address; the pipeline reads it and never creates one.
+3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a narrow `CEX_KRAKEN_AVAILABLE_PAIRS`.
+4. Run `liquidator kraken-check`. It reads the balances, the allowed markets and their minimums, and for each route the deposit address and whether our destination is a verified withdrawal address. It moves nothing. Fix each route it lists, then add `kraken` to `ENABLED_SWAP_VENUES`.
+
+Checked on 2026-11-11: ICP, USDC and ETH deposit and withdraw. The account offers no USDT deposit method, so ckUSDT cannot reach Kraken; USDT can still be withdrawn.
 
 Before any funds move, a Kraken quote checks the route: a deposit method and address for the asset and network (an ICP deposit that needs a memo is refused), the deposit minimum, and a verified withdrawal address. A refused route gets no quote, so the planner uses another venue.
 
 Every Kraken order is IOC at its price limit. Kraken keeps no caller id for a withdrawal, so a withdrawal whose reply was lost parks for an operator: check Kraken's withdrawal history before you release the leg.
+
+## Rift Venue
+
+[Rift](https://www.rift.trade) swaps one asset for another across chains and pays an address. It has no account and no order book, so it is a fallback for ckUSDC, ckUSDT, ckETH and ckBTC when MEXC's book is thin; it carries no ICP. Add `rift` to `ENABLED_SWAP_VENUES`; the planner asks MEXC first, Rift next, then Kraken.
+
+A Rift leg takes these steps, each saved before it acts:
+
+1. A fresh quote. A quote under the plan's conservative output is refused.
+2. The order. Rift delivers to the bridge EVM wallet. It refunds on the pay asset's chain: to the main EVM wallet, or for a ckBTC leg to the ckBTC minter's Bitcoin address of the recovery account, so the refund mints ckBTC there after `update_balance`.
+3. The ckERC20 bridge, or the ckBTC minter for ckBTC, pays the order's deposit address straight from the minter. Nothing passes through our wallets on the way in. The ckBTC and ckETH minters take their fee out of the amount at execution time, so those orders ask for two fee estimates less than the expected arrival; a fee can triple before it underfunds them. Rift swaps a deposit above the order amount whole, so the headroom is not lost.
+4. The order status until Rift delivers. An underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide. A refunded order parks too; the operator finds the refund transaction and answers `landed <tx>`, which ends the leg as refunded and reports the row failed. The funds sit at the refund address, outside the pipeline.
+5. The ckERC20 bridge brings an Ethereum payout back to ICP as its ck form. A Bitcoin payout goes to the ckBTC minter's address for the final account, so the minter mints ckBTC straight into it once the deposit has four confirmations; the leg only asks the minter until it does. The minter takes its check fee out of the deposit, and the preview takes it off the receive.
+
+Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
+
+### Checking Rift without a liquidation
+
+`rift-swap-check` runs one Rift leg from the trader account, the way the daemon
+would run it inside a liquidation: the quote, the order, the bridge out, the
+wait for Rift, the bridge back. Without `--confirm` it only prints the preview.
+
+```bash
+liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20
+liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20 --confirm
+```
+
+The leg is saved to `rift-check-<ts>.json` in the working directory after every
+cycle. A stopped run continues with `--resume <file>`. A parked leg prints its
+open question; answer it on the resume with `--answer absent` or
+`--answer landed:<receipt>`. The trader account pays the amount plus one ledger
+fee, and the proceeds mint to the liquidator account.
 
 ## Native Simulator
 
@@ -910,7 +955,7 @@ A simulator build differs from a default build in these ways:
 - `account show` writes the public principals and addresses to `SIM_IDENTITY_FILE`.
 - Venues come from the workbench, not from `ENABLED_SWAP_VENUES`: `SIM_ICPSWAP_FACTORY` enables ICPSwap, and `SIM_MEXC_URL` enables a local MEXC at a loopback origin.
 - The local MEXC holds ck assets itself, so it runs without the bridge. `SIM_MEXC_BRIDGE` adds the local bridge, and `SIM_BRIDGE_USDC_ADDRESS` names the local USDC contract.
-- The workbench sets `CEX_MEXC_ROUTE_SELECTION=best-output`, so MEXC picks the route with the largest net output for the amount. This setting works in any build; unset, MEXC keeps the first executable route.
+- MEXC picks the route with the largest net output for the amount, in every build. The former `CEX_MEXC_ROUTE_SELECTION` setting is gone.
 - With no venue, discovery, strategy, execution and settlement run as normal. A settled row then parks as `OperatorRequired` and keeps the collateral in the trader account. It reports no swap and no profit.
 
 A default build reads no `SIM_*` setting and keeps the normal venue rules and IC trust.

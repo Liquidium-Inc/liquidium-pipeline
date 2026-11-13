@@ -10,9 +10,9 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::bridge::legacy::LegacyBridgeSubmitPhase;
 use crate::finalizers::cex::profile::CexVenueProfile;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
+use crate::finalizers::multi_venue::RIFT_VENUE_ID;
 use crate::persistance::{
     FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
     WalProfitSnapshot,
@@ -28,10 +28,7 @@ use super::super::reconcile::ReconcilePanel;
 fn draw_reconcile(f: &mut Frame<'_>, area: Rect, panel: &ReconcilePanel) {
     let mut lines: Vec<Line> = match &panel.reply {
         Ok(report) => report.lines().map(|line| Line::from(line.to_string())).collect(),
-        Err(error) => vec![Line::from(Span::styled(
-            error.clone(),
-            Style::default().fg(Color::Red),
-        ))],
+        Err(error) => vec![Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red)))],
     };
     lines.push(Line::from(""));
     lines.push(Line::from(format!("> {}_", panel.input)));
@@ -494,6 +491,8 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
 
     if let Some(profile) = CexVenueProfile::for_venue(&leg.venue_id) {
         append_cex_leg_transactions(lines, profile.name(), &leg.execution);
+    } else if leg.venue_id == RIFT_VENUE_ID {
+        append_rift_leg_transactions(lines, &leg.execution);
     }
 
     if let Some(result) = &leg.result {
@@ -548,11 +547,68 @@ fn append_cex_leg_transactions(lines: &mut Vec<Line<'static>>, venue: &str, exec
             "   {venue} deposit bridge call: {}",
             describe_bridge_call(call)
         )));
-    } else if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {
-        lines.push(Line::from(format!(
-            "   {venue} deposit bridge phase: {}",
-            describe_bridge_submit_phase(phase)
-        )));
+    }
+}
+
+/// Shows the ids of a Rift leg: the order, the funding transfer, and the two
+/// bridges around the order.
+fn append_rift_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &VenueExecutionState) {
+    let rift = execution.state.get("rift").unwrap_or(&execution.state);
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(order) = rift.get("order").filter(|order| !order.is_null()) {
+        let id = text(order.get("id")).unwrap_or_default();
+        let status = text(order.get("status")).unwrap_or_else(|| "created".to_string());
+        lines.push(Line::from(format!("   Rift order: {id} ({status})")));
+        if let Some(venues) = rift
+            .get("quote_venues")
+            .and_then(Value::as_array)
+            .filter(|venues| !venues.is_empty())
+        {
+            let venues: Vec<&str> = venues.iter().filter_map(Value::as_str).collect();
+            lines.push(Line::from(format!("   Rift venues: {}", venues.join(" > "))));
+        }
+        if let Some(to) = text(order.get("to_address")) {
+            lines.push(Line::from(format!("   Rift pays to: {to}")));
+        }
+        if let Some(payout) = text(order.get("payout_tx")) {
+            lines.push(Line::from(format!("   Rift payout tx: {payout}")));
+        }
+        if let Some(refund) = text(order.get("refund_tx")) {
+            lines.push(Line::from(format!("   Rift refund tx: {refund}")));
+        }
+    }
+    let fields = [
+        ("funding_txid", "funding txid"),
+        ("bridge_out", "deposit bridge id"),
+        ("bridge_in", "return bridge id"),
+    ];
+    for (field, label) in fields {
+        let value = match field {
+            "bridge_out" => text(rift.get(field).and_then(|leg| leg.get("deposit_bridge_id"))),
+            "bridge_in" => text(rift.get(field).and_then(|leg| leg.get("withdraw_bridge_id"))),
+            _ => text(rift.get(field)),
+        };
+        if let Some(value) = value {
+            lines.push(Line::from(format!("   Rift {label}: {value}")));
+        }
+    }
+    for (leg, field, label) in [
+        ("bridge_out", "deposit_bridge_call", "deposit bridge call"),
+        ("bridge_in", "withdraw_bridge_call", "return bridge call"),
+    ] {
+        if let Some(call) = rift
+            .get(leg)
+            .and_then(|leg| leg.get(field))
+            .filter(|call| !call.is_null())
+        {
+            lines.push(Line::from(format!("   Rift {label}: {}", describe_bridge_call(call))));
+        }
     }
 }
 
@@ -580,22 +636,6 @@ fn describe_bridge_call(record: &Value) -> String {
             call.cursor.map_or("none".to_string(), |cursor| cursor.to_string()),
         ),
         Err(_) => phase,
-    }
-}
-
-/// Rows saved before the outbound driver, until the bridge step upgrades them.
-fn describe_bridge_submit_phase(phase: &Value) -> String {
-    match serde_json::from_value::<LegacyBridgeSubmitPhase>(phase.clone()) {
-        Ok(LegacyBridgeSubmitPhase::WaitingFunds) => "waiting for bridge funds".to_string(),
-        Ok(LegacyBridgeSubmitPhase::Submitting(attempt)) => format!(
-            "attempt {} {} -> {} cursor={} called={}",
-            attempt.amount,
-            attempt.asset,
-            attempt.destination,
-            attempt.cursor.map_or("none".to_string(), |cursor| cursor.to_string()),
-            if attempt.called_at_ts.is_some() { "yes" } else { "no" }
-        ),
-        Err(_) => truncate(&phase.to_string(), 80),
     }
 }
 
@@ -923,9 +963,8 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary, describe_bridge_submit_phase,
-        icpswap_account_principal,
-        profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
+        WalProfitSnapshot, append_meta_summary, append_rift_leg_transactions, append_venue_leg_summary,
+        icpswap_account_principal, profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
     };
     use crate::{
         persistance::{ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState, VenueLegStatus},
@@ -1013,17 +1052,7 @@ mod tests {
                         "deposit_bridge_id": "bridge-deposit-456",
                         "withdraw_id": "mexc-withdraw-789",
                         "withdraw_txid": "ic-ledger-withdraw-987",
-                        "withdraw_bridge_id": "bridge-withdraw-654",
-                        "deposit_bridge_submit_phase": {
-                            "Submitting": {
-                                "asset": "ckUSDC",
-                                "destination": "0xabc",
-                                "amount": 33.917291,
-                                "cursor": 1114868,
-                                "started_at_ts": 1,
-                                "called_at_ts": 2
-                            }
-                        }
+                        "withdraw_bridge_id": "bridge-withdraw-654"
                     }
                 }),
             },
@@ -1059,8 +1088,6 @@ mod tests {
                 .any(|line| line == "   MEXC withdraw bridge txid: bridge-withdraw-654")
         );
         assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
-        assert!(text.iter().any(|line| line
-            == "   MEXC deposit bridge phase: attempt 33.917291 ckUSDC -> 0xabc cursor=1114868 called=yes"));
     }
 
     /// A Kraken leg saved its transaction ids under the same keys as MEXC,
@@ -1095,21 +1122,11 @@ mod tests {
             "   Kraken withdraw txid: 0xd81a",
             "   Kraken withdraw bridge txid: 0x6c93",
         ] {
-            assert!(text.iter().any(|line| line == expected), "missing {expected:?} in {text:?}");
+            assert!(
+                text.iter().any(|line| line == expected),
+                "missing {expected:?} in {text:?}"
+            );
         }
-    }
-
-    #[test]
-    fn bridge_phase_line_covers_waits_and_unknown_shapes() {
-        assert_eq!(
-            describe_bridge_submit_phase(&serde_json::json!("WaitingFunds")),
-            "waiting for bridge funds"
-        );
-        assert_eq!(
-            describe_bridge_submit_phase(&serde_json::json!({"Submitting": {"asset": "ckETH", "destination": "0xd", "amount": 0.5, "cursor": null, "started_at_ts": 1, "called_at_ts": null}})),
-            "attempt 0.5 ckETH -> 0xd cursor=none called=no"
-        );
-        assert_eq!(describe_bridge_submit_phase(&serde_json::json!({"Later": 1})), "{\"Later\":1}");
     }
 
     #[test]
@@ -1301,5 +1318,25 @@ mod tests {
         assert!(text.iter().any(|line| line.starts_with("State preview: ")));
         assert!(!text.iter().any(|line| line.starts_with("Bridge deposit txid: ")));
         assert!(!text.iter().any(|line| line.starts_with("Bridge withdraw txid: ")));
+    }
+
+    /// A Rift leg shows the venues of the quote its order came from.
+    #[test]
+    fn a_rift_leg_shows_its_quote_venues() {
+        let execution = VenueExecutionState {
+            venue: "rift".into(),
+            state: serde_json::json!({
+                "rift": {
+                    "quote_venues": ["relay"],
+                    "order": { "id": "order-1", "status": "executing" }
+                }
+            }),
+        };
+        let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+
+        append_rift_leg_transactions(&mut lines, &execution);
+
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(text.iter().any(|line| line == "   Rift venues: relay"), "{text:?}");
     }
 }

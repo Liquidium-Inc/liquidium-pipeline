@@ -70,6 +70,46 @@ Defined in `connectors/src/backend/bridge_backend/mod.rs`:
 - Native reverse submit: preflights ckETH amount + approve fee, approves ckETH, calls minter `withdraw_eth`.
 - ERC-20 reverse submit: reads fee quote, preflights bridge ckETH fee balance, approves ckERC20 + ckETH, calls minter `withdraw_erc20`.
 
+## ckBTC minter backend
+
+`connectors/src/backend/ckbtc_minter.rs` is the minter client: `get_minter_info`,
+`estimate_withdrawal_fee`, `retrieve_btc_with_approval`, `retrieve_btc_status_v2` and
+`retrieve_btc_status_v2_by_account`, with their candid types. The deposit side
+(`get_btc_address`, `update_balance`) comes with the `BTC@BTC -> ckBTC` route.
+
+`connectors/src/backend/bridge_backend/ckbtc_bridge.rs` serves `ckBTC@ICP -> BTC`:
+
+- Source must be the bridge ICP owner account with no subaccount; the destination
+  must be a mainnet Bitcoin address.
+- Fee budget: the ledger approve fee stays on the source; the minter and Bitcoin
+  fees come out of the amount, so the destination receives less than the request.
+- Submit: minter minimum, balance preflight, ICRC-2 approve to the minter, then
+  `retrieve_btc_with_approval`. The handle is `ckbtc-retrieve:<burn index>`.
+- A call without an answer stays open. `find_submissions` reads the account's
+  retrievals (certified) and matches the ledger burn by account and amount.
+- Refusals: `AlreadyProcessing` defers, `AmountTooLow` is below minimum, a bad
+  address or short funds is refused. `TemporarilyUnavailable` and `GenericError`
+  are ambiguous, because the minter's ledger call may have burned.
+- Status: `Submitted` and `Confirmed` complete, because the receiver watches the
+  chain itself and the minter's six confirmations are only its bookkeeping. A
+  reimbursement cancels only once `Reimbursed`, when the ckBTC is back on the
+  account; `WillReimburse` and `AmountTooLow` wait.
+
+The same backend serves `BTC@BTC -> ckBTC`, the deposit side, for a payer that
+pays the minter directly:
+
+- `deposit_address` gives the minter's address for the final ICP account.
+- `track_deposit` with the Bitcoin transaction as the receipt calls
+  `update_balance`: a mint paid by that transaction is `Accepted` under
+  `ckbtc-mint:<block>:<txid>`; a deposit still confirming is `NotYet`; a
+  quarantined or dust deposit is `Held`, which only an operator moves.
+- `get_bridge_status` on a mint handle reads the ledger block and returns
+  `Minted` with the amount and the account.
+- The fee budget's destination fee is the minter's check fee.
+
+`RoutedBridgeBackend` sends `ckBTC@ICP` and `BTC@BTC` requests, and `ckbtc-`
+handles, to this backend.
+
 ## Startup wiring
 
 `pipeline/src/commands/liquidation_loop.rs`

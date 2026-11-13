@@ -3,7 +3,6 @@
 use super::*;
 use crate::bridge::call_sender::{BridgeCall, OpenBridgeCall, prepare_bridge_call};
 use crate::bridge::claims::{BridgeClaims, MockBridgeClaimLookup};
-use crate::bridge::legacy::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
 use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
 use crate::utils::now_ts;
 use liquidium_pipeline_connectors::backend::bridge_backend::BridgeSubmissionCandidate;
@@ -107,20 +106,6 @@ fn completed_withdrawal(cex: &mut MockCexBackend, times: usize) {
         });
 }
 
-/// A row that the bridge journal saved before the outbound driver.
-fn journal_attempt(called_at_ts: Option<i64>, parked: bool) -> LegacyBridgeSubmitPhase {
-    LegacyBridgeSubmitPhase::Submitting(LegacyBridgeSubmitAttempt {
-        id: "mine".into(),
-        asset: "ckUSDC".into(),
-        destination: DESTINATION.into(),
-        amount: 0.92,
-        cursor: Some(100),
-        started_at_ts: now_ts() - 30,
-        called_at_ts,
-        parked_for_operator: parked,
-    })
-}
-
 fn sent_call(at: i64) -> OutboundRecord {
     let call = BridgeCall {
         asset: "ckUSDC".into(),
@@ -136,61 +121,6 @@ fn sent_call(at: i64) -> OutboundRecord {
     let mut record = OutboundRecord::prepared(prepare_bridge_call("mine".into(), &call).unwrap());
     record.phase = OutboundPhase::Submitted { at };
     record
-}
-
-#[tokio::test]
-async fn a_journal_attempt_is_migrated_and_settled_without_a_new_call() {
-    let mut bridge = zero_fee_bridge();
-    bridge.expect_submit_bridge().times(0);
-    bridge
-        .expect_find_submissions()
-        .times(1)
-        .returning(|request, cursor, claimed| {
-            assert_eq!(request.asset, "ckUSDC");
-            assert!((request.amount - 0.92).abs() < 1e-12);
-            assert_eq!(cursor, 100);
-            assert_eq!(claimed, ["ic-withdraw:1:2"]);
-            Ok(vec![candidate(105)])
-        });
-    // The row's own attempt is still in the saved row the registry reads.
-    let LegacyBridgeSubmitPhase::Submitting(own) = journal_attempt(None, false) else {
-        unreachable!()
-    };
-    let finalizer = finalizer(bridge, Some(claims(vec![own.open_call()])));
-    let mut state = funded_state(&finalizer).await;
-    state.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(None, false));
-
-    finalizer.deposit(&mut state).await.expect("the lookup attaches the handle");
-
-    assert_eq!(
-        state.deposit.bridge.deposit_bridge_id.as_deref(),
-        Some("ic-withdraw:recovered:105")
-    );
-    assert!(state.deposit.bridge.deposit_bridge_call.is_none());
-    assert!(state.deposit.bridge.legacy_bridge_submit_phase.is_none());
-    assert_eq!(state.trade.trade_next_amount_in, Some(0.91));
-}
-
-#[tokio::test]
-async fn a_parked_journal_attempt_waits_for_an_operator_answer() {
-    let mut bridge = zero_fee_bridge();
-    bridge.expect_submit_bridge().times(0);
-    bridge.expect_find_submissions().times(2).returning(|_, _, _| Ok(vec![]));
-    let finalizer = finalizer(bridge, Some(claims(vec![])));
-    let mut state = funded_state(&finalizer).await;
-    state.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(Some(now_ts() - 3_600), true));
-
-    let error = finalizer.deposit(&mut state).await.expect_err("only an operator decides");
-    assert!(matches!(error, CexBackendError::Ambiguous(_)), "{error}");
-    assert!(matches!(
-        state.deposit.bridge.deposit_bridge_call.as_ref().unwrap().phase,
-        OutboundPhase::Parked { .. }
-    ));
-
-    // The operator found no record. The provider is searched once more.
-    state.deposit.bridge.deposit_bridge_call.as_mut().unwrap().decide(OperatorDecision::Absent);
-    finalizer.deposit(&mut state).await.expect_err("the absent call is dropped");
-    assert!(state.deposit.bridge.deposit_bridge_call.is_none());
 }
 
 #[tokio::test]

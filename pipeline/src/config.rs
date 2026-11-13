@@ -44,6 +44,8 @@ pub struct Config {
     pub bridge_cketh_minter_canister: Principal,
     pub bridge_cksol_minter_canister: Principal,
     pub bridge_cksol_ledger_canister: Principal,
+    pub bridge_ckbtc_minter_canister: Principal,
+    pub bridge_ckbtc_ledger_canister: Principal,
     pub bridge_ic_proxy_canister: Option<Principal>,
     pub lending_canister: Principal,
     pub export_path: String,
@@ -98,12 +100,19 @@ pub struct Config {
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
-    /// `CEX_MEXC_ROUTE_SELECTION=best-output`: MEXC takes the route with the largest net
-    /// output for the amount. Unset keeps the first executable route, as before.
-    pub cex_mexc_best_output_routing: bool,
     /// Kraken's market allowlist, as `BASE_QUOTE`. Kraken refuses to start
     /// with an empty one, so the setting is required when Kraken is enabled.
     pub cex_kraken_available_pairs: Vec<String>,
+    /// The Rift REST API. Only the simulator points it elsewhere.
+    pub rift_api_url: String,
+    /// Names the integrator to Rift. Lives only in the environment.
+    pub rift_api_key: Option<String>,
+    /// The most one Rift order may carry, in USD at the oracle price. A Rift
+    /// quote has no slippage cap, so this bounds what one order can lose.
+    pub rift_max_order_usd: f64,
+    /// Rift venues that may route an order, and venues that never may.
+    pub rift_venue_allowlist: Vec<String>,
+    pub rift_venue_blocklist: Vec<String>,
     /// Maximum intermediate hops allowed for Kraken route discovery.
     pub cex_kraken_max_hops: u8,
     pub icpswap_factory_canister: Principal,
@@ -336,52 +345,16 @@ impl Config {
         let bridge_btc_address = derive_btc_p2tr_address(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_BTC_INDEX)
             .map_err(|e| format!("could not derive bridge BTC address: {e}"))?;
 
-        let bridge_cketh_minter_canister_text = env::var("BRIDGE_CKETH_MINTER_CANISTER")
-            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string())
-            .trim()
-            .to_string();
-        let bridge_cketh_minter_canister_text = if bridge_cketh_minter_canister_text.is_empty() {
-            DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string()
-        } else {
-            bridge_cketh_minter_canister_text
-        };
-
-        let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
-            format!(
-                "invalid BRIDGE_CKETH_MINTER_CANISTER principal '{}': {e}",
-                bridge_cketh_minter_canister_text
-            )
-        })?;
-        let bridge_cksol_minter_canister_text = env::var("BRIDGE_CKSOL_MINTER_CANISTER")
-            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string())
-            .trim()
-            .to_string();
-        let bridge_cksol_minter_canister_text = if bridge_cksol_minter_canister_text.is_empty() {
-            DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string()
-        } else {
-            bridge_cksol_minter_canister_text
-        };
-        let bridge_cksol_minter_canister = Principal::from_text(&bridge_cksol_minter_canister_text).map_err(|e| {
-            format!(
-                "invalid BRIDGE_CKSOL_MINTER_CANISTER principal '{}': {e}",
-                bridge_cksol_minter_canister_text
-            )
-        })?;
-        let bridge_cksol_ledger_canister_text = env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
-            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string())
-            .trim()
-            .to_string();
-        let bridge_cksol_ledger_canister_text = if bridge_cksol_ledger_canister_text.is_empty() {
-            DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string()
-        } else {
-            bridge_cksol_ledger_canister_text
-        };
-        let bridge_cksol_ledger_canister = Principal::from_text(&bridge_cksol_ledger_canister_text).map_err(|e| {
-            format!(
-                "invalid BRIDGE_CKSOL_LEDGER_CANISTER principal '{}': {e}",
-                bridge_cksol_ledger_canister_text
-            )
-        })?;
+        let bridge_cketh_minter_canister =
+            parse_canister_from_env("BRIDGE_CKETH_MINTER_CANISTER", DEFAULT_BRIDGE_CKETH_MINTER_CANISTER)?;
+        let bridge_cksol_minter_canister =
+            parse_canister_from_env("BRIDGE_CKSOL_MINTER_CANISTER", DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER)?;
+        let bridge_cksol_ledger_canister =
+            parse_canister_from_env("BRIDGE_CKSOL_LEDGER_CANISTER", DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER)?;
+        let bridge_ckbtc_minter_canister =
+            parse_canister_from_env("BRIDGE_CKBTC_MINTER_CANISTER", DEFAULT_BRIDGE_CKBTC_MINTER_CANISTER)?;
+        let bridge_ckbtc_ledger_canister =
+            parse_canister_from_env("BRIDGE_CKBTC_LEDGER_CANISTER", DEFAULT_BRIDGE_CKBTC_LEDGER_CANISTER)?;
         let bridge_ic_proxy_canister = match env::var("BRIDGE_IC_PROXY_CANISTER")
             .or_else(|_| env::var("BRIDGE_IC_WALLET_CANISTER"))
         {
@@ -408,9 +381,16 @@ impl Config {
         let cex_tunables = parse_cex_tunables_from_env();
         let cex_mexc_available_pairs = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
         let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
-        let cex_mexc_best_output_routing = env::var("CEX_MEXC_ROUTE_SELECTION").as_deref() == Ok("best-output");
         let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
+        let rift_api_url = parse_rift_api_url_from_env();
+        let rift_max_order_usd = parse_rift_max_order_usd_from_env()?;
+        let rift_venue_allowlist = parse_name_list_from_env("RIFT_VENUE_ALLOWLIST");
+        let rift_venue_blocklist = parse_name_list_from_env("RIFT_VENUE_BLOCKLIST");
+        let rift_api_key = env::var("RIFT_API_KEY")
+            .ok()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
         let icpswap_test_allocation_usd = parse_test_allocation_usd_from_env("ICPSWAP_TEST_ALLOCATION_USD")?;
@@ -454,6 +434,8 @@ impl Config {
             bridge_cketh_minter_canister,
             bridge_cksol_minter_canister,
             bridge_cksol_ledger_canister,
+            bridge_ckbtc_minter_canister,
+            bridge_ckbtc_ledger_canister,
             bridge_ic_proxy_canister,
             liquidator_identity: Arc::new(liquidator_identity),
             bridge_ic_identity: Arc::new(bridge_ic_identity),
@@ -488,9 +470,13 @@ impl Config {
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
-            cex_mexc_best_output_routing,
             cex_kraken_available_pairs,
             cex_kraken_max_hops,
+            rift_api_url,
+            rift_api_key,
+            rift_max_order_usd,
+            rift_venue_allowlist,
+            rift_venue_blocklist,
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
@@ -610,6 +596,8 @@ const BRIDGE_SOLANA_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
 const DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER: &str = "ljyxk-riaaa-aaaar-qb5mq-cai";
 const DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER: &str = "la34w-haaaa-aaaar-qb5na-cai";
+const DEFAULT_BRIDGE_CKBTC_MINTER_CANISTER: &str = "mqygn-kiaaa-aaaar-qaadq-cai";
+const DEFAULT_BRIDGE_CKBTC_LEDGER_CANISTER: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
@@ -617,9 +605,9 @@ const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 pub(crate) const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
-const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
-/// Venues this release refuses to start with. Remove a venue here to release it.
-const RELEASE_DISABLED_SWAP_VENUES: [&str; 1] = ["kraken"];
+const SUPPORTED_SWAP_VENUES: [&str; 4] = ["icpswap", "mexc", "rift", "kraken"];
+pub(crate) const DEFAULT_RIFT_API_URL: &str = "https://api.rift.trade";
+pub(crate) const DEFAULT_RIFT_MAX_ORDER_USD: f64 = 25_000.0;
 
 fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
     env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
@@ -748,6 +736,48 @@ fn parse_slippage_bps(name: &str, trimmed: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
+/// The simulator's Rift mock replaces the real API when it is configured.
+fn parse_rift_api_url_from_env() -> String {
+    if let Some(url) = crate::simulator::rift_url() {
+        return url;
+    }
+    env::var("RIFT_API_URL").unwrap_or_else(|_| DEFAULT_RIFT_API_URL.to_string())
+}
+
+/// A canister id from `name`; blank or unset means the default.
+fn parse_canister_from_env(name: &str, default: &str) -> Result<Principal, String> {
+    let text = env::var(name).unwrap_or_default();
+    let text = text.trim();
+    let text = if text.is_empty() { default } else { text };
+    Principal::from_text(text).map_err(|e| format!("invalid {name} principal '{text}': {e}"))
+}
+
+/// A comma-separated list of names; blank entries are dropped.
+fn parse_name_list_from_env(name: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// The Rift order cap: the default when unset, a startup error when set to
+/// anything but a positive number. A typo must never change the cap silently.
+fn parse_rift_max_order_usd_from_env() -> Result<f64, String> {
+    let Ok(raw) = env::var("RIFT_MAX_ORDER_USD") else {
+        return Ok(DEFAULT_RIFT_MAX_ORDER_USD);
+    };
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(DEFAULT_RIFT_MAX_ORDER_USD);
+    }
+    text.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| format!("RIFT_MAX_ORDER_USD must be a positive number of USD, got '{text}'"))
+}
+
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
     if crate::simulator::ENABLED {
         return crate::simulator::enabled_swap_venues();
@@ -765,11 +795,6 @@ fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
             return Err(format!(
                 "ENABLED_SWAP_VENUES contains unsupported venue `{venue_id}`; expected one of {}",
                 SUPPORTED_SWAP_VENUES.join(", ")
-            ));
-        }
-        if RELEASE_DISABLED_SWAP_VENUES.contains(&venue_id.as_str()) {
-            return Err(format!(
-                "ENABLED_SWAP_VENUES contains `{venue_id}`, which this release disables; remove it to start"
             ));
         }
         if !seen.insert(venue_id.clone()) {
@@ -1280,6 +1305,23 @@ mod tests {
         }
     }
 
+    /// A typed cap such as `5,000` once became the 25,000 default without a word.
+    #[test]
+    fn the_rift_order_cap_defaults_when_unset_and_refuses_a_malformed_value() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("RIFT_MAX_ORDER_USD") };
+        assert_eq!(parse_rift_max_order_usd_from_env(), Ok(DEFAULT_RIFT_MAX_ORDER_USD));
+
+        unsafe { env::set_var("RIFT_MAX_ORDER_USD", " 15 ") };
+        assert_eq!(parse_rift_max_order_usd_from_env(), Ok(15.0));
+
+        for malformed in ["5,000", "15$", "0", "-1", "NaN"] {
+            unsafe { env::set_var("RIFT_MAX_ORDER_USD", malformed) };
+            assert!(parse_rift_max_order_usd_from_env().is_err(), "{malformed}");
+        }
+        unsafe { env::remove_var("RIFT_MAX_ORDER_USD") };
+    }
+
     #[test]
     fn parse_cex_max_price_impact_defaults_to_200_and_drops_an_unusable_value() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1419,16 +1461,18 @@ mod tests {
         }
     }
 
-    /// This release disables Kraken, so a config that names it does not start.
+    /// Kraken is opt-in: a config that names it starts with it.
     #[cfg(not(feature = "simulator"))]
     #[test]
-    fn kraken_stops_startup_until_it_is_released() {
+    fn kraken_is_enabled_when_the_config_names_it() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc,kraken");
+            env::set_var("ENABLED_SWAP_VENUES", "icpswap,rift,kraken");
         }
-        let error = parse_enabled_swap_venues_from_env().expect_err("Kraken is disabled in this release");
-        assert!(error.contains("`kraken`"), "{error}");
+        assert_eq!(
+            parse_enabled_swap_venues_from_env().unwrap(),
+            vec!["icpswap".to_string(), "rift".to_string(), "kraken".to_string()]
+        );
         unsafe {
             env::remove_var("ENABLED_SWAP_VENUES");
         }
@@ -1498,6 +1542,7 @@ mod tests {
             env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc");
             env::remove_var("SIM_MEXC_URL");
             env::remove_var("SIM_ICPSWAP_FACTORY");
+            env::remove_var("SIM_RIFT_URL");
         }
         assert!(parse_enabled_swap_venues_from_env().unwrap().is_empty());
         unsafe {
