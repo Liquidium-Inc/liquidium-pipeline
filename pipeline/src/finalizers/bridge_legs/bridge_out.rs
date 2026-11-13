@@ -203,7 +203,24 @@ impl Submission<'_> {
             .backend
             .get_source_balance(route.source_asset, route.source_chain, &self.source_address)
             .await?;
-        let required_source_available = requested + fee_budget.source_fee_budget;
+        let mut source_fee = fee_budget.source_fee_budget;
+        // Only the fee is missing: an earlier attempt may have paid it already.
+        if source_available + SOURCE_BALANCE_TOLERANCE >= requested
+            && source_available + SOURCE_BALANCE_TOLERANCE < requested + source_fee
+        {
+            source_fee = self
+                .bridge
+                .backend
+                .source_fee_due(
+                    route.source_asset,
+                    route.source_chain,
+                    route.target_asset,
+                    &self.source_address,
+                    requested,
+                )
+                .await?;
+        }
+        let required_source_available = requested + source_fee;
         if source_available + SOURCE_BALANCE_TOLERANCE < required_source_available {
             debug!(
                 "[bridge] liq_id={} bridged deposit waiting for source funding: available={} expected={} tolerance={} source={} route={}",

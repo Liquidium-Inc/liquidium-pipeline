@@ -1111,7 +1111,7 @@ async fn reverse_bridge_skips_approvals_when_icrc2_allowances_are_sufficient() {
     let ckusdc_ledger_for_fee = ckusdc_ledger;
     let cketh_ledger_for_fee = cketh_ledger;
     // The ckETH approve fee is part of the ckETH budget the withdrawal needs.
-    mock_icp.expect_icrc1_fee().times(2).returning(move |ledger| {
+    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
         if ledger == ckusdc_ledger_for_fee {
             Ok(Nat::from(10_000u64))
         } else if ledger == cketh_ledger_for_fee {
@@ -1246,7 +1246,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
     let ckusdc_ledger_for_fee = ckusdc_ledger;
     let cketh_ledger_for_fee = cketh_ledger;
     // The ckETH approve fee is part of the ckETH budget the withdrawal needs.
-    mock_icp.expect_icrc1_fee().times(2).returning(move |ledger| {
+    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
         if ledger == ckusdc_ledger_for_fee {
             Ok(Nat::from(10_000u64))
         } else if ledger == cketh_ledger_for_fee {
@@ -1494,7 +1494,7 @@ async fn native_reverse_bridge_allows_exact_minimum() {
         });
 
     let mut mock_icp = MockIcpBackend::new();
-    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+    mock_icp.expect_icrc1_fee().times(0).returning(move |ledger| {
         if ledger == cketh_ledger {
             Ok(Nat::from(2_000_000_000_000u64))
         } else {

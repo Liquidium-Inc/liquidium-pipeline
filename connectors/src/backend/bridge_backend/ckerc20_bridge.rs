@@ -41,7 +41,8 @@ use crate::{
         evm_backend::{Broadcast, ERC20_APPROVE_GAS_LIMIT, EvmBackendImpl, SignedEvmTx},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
-            ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
+            MinterBurn, ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_decimals_with_context,
+            icrc1_fee_with_context,
         },
     },
     outbound::evm_prepared_send,
@@ -481,6 +482,17 @@ where
         .await
     }
 
+    /// A burn of `source_account`'s tokens on `ledger` through the minter.
+    fn burn_from(&self, source_account: Account, ledger: Principal) -> MinterBurn<'_, B> {
+        MinterBurn {
+            backend: self.icp_backend.as_ref(),
+            ledger,
+            account: source_account,
+            minter: self.cketh_minter_canister,
+            context: "ckerc20 bridge",
+        }
+    }
+
     fn with_fee_headroom(amount: &Nat) -> Nat {
         // Keep a modest buffer for quote drift between preflight and withdraw burn.
         amount.clone() + (amount.clone() / Nat::from(5u8))
@@ -858,27 +870,6 @@ where
         let ckusdc_decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), ckerc20_ledger_id, "ckerc20 bridge").await?;
         let amount_native = amount_to_nat_units_strict(request.amount, ckusdc_decimals)?;
-        let ckusdc_approve_fee =
-            icrc1_fee_with_context(self.icp_backend.as_ref(), ckerc20_ledger_id, "ckerc20 bridge").await?;
-
-        let ckusdc_required_budget = amount_native.clone() + ckusdc_approve_fee.clone();
-
-        let available_ckusdc = icrc1_balance_with_context(
-            self.icp_backend.as_ref(),
-            ckerc20_ledger_id,
-            &source_account,
-            "ckerc20 bridge",
-        )
-        .await?;
-        if available_ckusdc < ckusdc_required_budget {
-            let available_formatted = nat_units_to_amount_via_core(&available_ckusdc, ckusdc_decimals)?;
-            let required_formatted = nat_units_to_amount_via_core(&ckusdc_required_budget, ckusdc_decimals)?;
-            return Err(format!(
-                "bridge amount preflight failed: ckUSDC balance is below required burn+approve budget (available={} required={} source={})",
-                available_formatted, required_formatted, request.source_address
-            ));
-        }
-
         let cketh_ledger_id = self.cketh_ledger_id().await?;
         let required_fee_budget = match &request.provider_fee_budget_native_units {
             Some(quoted) => quoted.clone(),
@@ -906,8 +897,9 @@ where
             ));
         }
 
-        // Approve ckERC20 amount to burn for withdrawal.
-        self.ensure_minter_allowance(&source_account, ckerc20_ledger_id, amount_native.clone())
+        // The ckERC20 burn: its balance check and its allowance.
+        self.burn_from(source_account, ckerc20_ledger_id)
+            .fund(&amount_native)
             .await?;
         // Approve ckETH fee budget quoted by minter.
         self.ensure_minter_allowance(&source_account, cketh_ledger_id, required_fee_budget)
@@ -971,27 +963,9 @@ where
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
         let amount_native = amount_to_nat_units_strict(request.amount, ETH_DECIMALS)?;
         Self::ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)?;
-        let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
         // The minter burns exactly `amount` and sends `amount - gas`.
-        let required_budget = amount_native.clone() + approve_fee.clone();
-
-        let available_cketh = icrc1_balance_with_context(
-            self.icp_backend.as_ref(),
-            cketh_ledger_id,
-            &source_account,
-            "cketh bridge",
-        )
-        .await?;
-        if available_cketh < required_budget {
-            let available_formatted = nat_units_to_amount_via_core(&available_cketh, ETH_DECIMALS)?;
-            let required_formatted = nat_units_to_amount_via_core(&required_budget, ETH_DECIMALS)?;
-            return Err(format!(
-                "bridge amount preflight failed: ckETH balance is below required withdraw+approve budget (available={} required={} source={})",
-                available_formatted, required_formatted, request.source_address
-            ).into());
-        }
-
-        self.ensure_minter_allowance(&source_account, cketh_ledger_id, amount_native.clone())
+        self.burn_from(source_account, cketh_ledger_id)
+            .fund(&amount_native)
             .await?;
 
         Ok(WithdrawalArg {
@@ -1153,6 +1127,35 @@ where
             "unsupported source route {}@{} for ckETH minter bridge backend",
             asset, chain
         ))
+    }
+
+    async fn source_fee_due(
+        &self,
+        asset: &str,
+        chain: &str,
+        target_asset: &str,
+        source_address: &str,
+        amount: f64,
+    ) -> Result<f64, String> {
+        let burn = resolve_cketh_reverse_route_by_source(asset, chain).filter(|route| {
+            route.target_asset.eq_ignore_ascii_case(target_asset)
+                && matches!(
+                    route.route_kind,
+                    BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+                )
+        });
+        let Some(route) = burn else {
+            return Ok(self.get_fee_budget(asset, chain, target_asset).await?.source_fee_budget);
+        };
+        let source_account = parse_source_icp_account(source_address)?;
+        let ledger_id = parse_ckerc20_ledger_id(route)?;
+        let decimals = icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge").await?;
+        let amount_native = amount_to_nat_units_strict(amount, decimals)?;
+        let fee = self
+            .burn_from(source_account, ledger_id)
+            .approve_fee_due(&amount_native)
+            .await?;
+        nat_units_to_amount_via_core(&fee, decimals)
     }
 
     async fn get_source_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {

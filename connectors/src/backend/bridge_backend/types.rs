@@ -276,6 +276,20 @@ pub trait BridgeBackend: Send + Sync {
         Ok(0.0)
     }
 
+    /// The source-side fee a submission of `amount` from `source_address`
+    /// still has to pay. A fee an earlier attempt paid is not due again.
+    async fn source_fee_due(
+        &self,
+        asset: &str,
+        chain: &str,
+        target_asset: &str,
+        source_address: &str,
+        amount: f64,
+    ) -> Result<f64, String> {
+        let _ = (source_address, amount);
+        Ok(self.get_fee_budget(asset, chain, target_asset).await?.source_fee_budget)
+    }
+
     /// Returns the target-asset amount expected to be deducted before the bridge
     /// credit arrives at the destination.
     async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {

@@ -26,7 +26,7 @@ use crate::{
             UpdateBalanceRet, UtxoStatus, display_txid,
         },
         icp_backend::IcpBackend,
-        icp_backend_helpers::{ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_fee_with_context},
+        icp_backend_helpers::{MinterBurn, icrc1_balance_with_context, icrc1_fee_with_context},
     },
     pipeline_agent::PipelineAgent,
 };
@@ -257,6 +257,17 @@ where
         nat_units_to_amount_via_core(satoshi, BTC_DECIMALS)
     }
 
+    /// A burn of `source`'s ckBTC through the minter.
+    fn burn_from(&self, source: Account) -> MinterBurn<'_, B> {
+        MinterBurn {
+            backend: self.icp_backend.as_ref(),
+            ledger: self.ledger,
+            account: source,
+            minter: self.minter.canister(),
+            context: CONTEXT,
+        }
+    }
+
     /// Checks the request, the minimum and the balance, and sets the
     /// allowance. Nothing here burns, so every failure is a refusal.
     async fn prepare_retrieval(&self, request: &BridgeRequest) -> Result<RetrieveBtcWithApprovalArgs, BridgeError> {
@@ -280,33 +291,10 @@ where
                 "ckBTC retrieval of {amount} satoshi is below the minter minimum {minimum}"
             )));
         }
-        let fee = icrc1_fee_with_context(self.icp_backend.as_ref(), self.ledger, CONTEXT)
+        self.burn_from(source)
+            .fund(&Nat::from(amount))
             .await
             .map_err(BridgeError::Refused)?;
-        let balance = icrc1_balance_with_context(self.icp_backend.as_ref(), self.ledger, &source, CONTEXT)
-            .await
-            .map_err(BridgeError::Refused)?;
-        let required = Nat::from(amount) + fee;
-        if balance < required {
-            return Err(BridgeError::Refused(format!(
-                "bridge amount preflight failed: ckBTC balance {balance} is below the burn and approve budget {required} (source={})",
-                request.source_address
-            )));
-        }
-        let spender = Account {
-            owner: self.minter.canister(),
-            subaccount: None,
-        };
-        ensure_icrc2_allowance(
-            self.icp_backend.as_ref(),
-            self.ledger,
-            &source,
-            spender,
-            Nat::from(amount),
-            CONTEXT,
-        )
-        .await
-        .map_err(BridgeError::Refused)?;
         Ok(RetrieveBtcWithApprovalArgs {
             from_subaccount: None,
             address: address.trim().to_string(),
@@ -377,6 +365,22 @@ where
             provider_fee_budget_native_units: None,
             side_costs: Vec::new(),
         })
+    }
+
+    async fn source_fee_due(
+        &self,
+        asset: &str,
+        chain: &str,
+        target_asset: &str,
+        source_address: &str,
+        amount: f64,
+    ) -> Result<f64, String> {
+        if Self::retrieve_route(asset, chain, target_asset).is_none() {
+            return Ok(0.0);
+        }
+        let source = parse_source_icp_account(source_address)?;
+        let amount = Nat::from(Self::satoshi(amount)?);
+        Self::btc_amount(&self.burn_from(source).approve_fee_due(&amount).await?)
     }
 
     /// Out, the minter's retrieval minimum; in, its deposit minimum, under

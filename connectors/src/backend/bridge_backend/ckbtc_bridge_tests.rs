@@ -150,6 +150,40 @@ async fn an_amount_under_the_minter_minimum_is_refused_before_the_approve() {
     assert!(matches!(error, BridgeError::BelowMinimum(_)), "{error:?}");
 }
 
+/// An earlier attempt paid the approve and did not burn: the balance holds
+/// the burn alone, and no second approve fee is due.
+#[tokio::test]
+async fn a_balance_without_the_approve_fee_burns_when_the_allowance_is_set() {
+    let mut agent = MockPipelineAgent::new();
+    minter_info(&mut agent, 50_000);
+    agent
+        .expect_call_update::<RetrieveBtcWithApprovalRet>()
+        .times(1)
+        .returning(|_, _, _| Ok(RetrieveBtcWithApprovalRet::Ok(RetrieveBtcOk { block_index: 79 })));
+    let mut icp = MockIcpBackend::new();
+    funded_account(&mut icp, 100_000, 100_000);
+    icp.expect_icrc2_approve().times(0);
+
+    let submission = backend(agent, icp).submit_bridge(request(0.001)).await.unwrap();
+
+    assert_eq!(submission.bridge_id, "ckbtc-retrieve:79");
+}
+
+#[tokio::test]
+async fn the_source_fee_due_is_the_approve_fee_until_the_allowance_covers_the_burn() {
+    for (allowance, due) in [(0, 0.000_000_1), (99_999, 0.000_000_1), (100_000, 0.0)] {
+        let mut icp = MockIcpBackend::new();
+        funded_account(&mut icp, 100_000, allowance);
+
+        let fee = backend(MockPipelineAgent::new(), icp)
+            .source_fee_due("ckBTC", "ICP", "BTC", OWNER, 0.001)
+            .await
+            .unwrap();
+
+        assert_eq!(fee, due, "allowance {allowance}");
+    }
+}
+
 #[tokio::test]
 async fn a_short_balance_is_refused_before_the_approve() {
     let mut agent = MockPipelineAgent::new();

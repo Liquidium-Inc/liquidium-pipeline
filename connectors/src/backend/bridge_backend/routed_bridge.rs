@@ -81,6 +81,19 @@ impl BridgeBackend for RoutedBridgeBackend {
         self.source(asset, chain).get_source_fee_budget(asset, chain, target).await
     }
 
+    async fn source_fee_due(
+        &self,
+        asset: &str,
+        chain: &str,
+        target: &str,
+        source_address: &str,
+        amount: f64,
+    ) -> Result<f64, String> {
+        self.source(asset, chain)
+            .source_fee_due(asset, chain, target, source_address, amount)
+            .await
+    }
+
     async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
         self.source(asset, chain).get_destination_fee_budget(asset, chain, target).await
     }

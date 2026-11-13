@@ -507,6 +507,72 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
 }
 
+/// The bridge account holds the amount and no approve fee. `fee_due` is the
+/// backend's answer on whether the fee is still due.
+async fn deposit_with_only_the_fee_missing(fee_due: f64) -> CexState {
+    let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
+    cex.expect_get_balance().returning(|_| Ok(10.0));
+    cex.expect_get_deposit_address().returning(|_, _| {
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ETH".to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
+
+    // The leg bridges 0.98: 1.0 less the funding transfer fee and the approve fee.
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_source_balance().returning(|_, _, _| Ok(0.98));
+    bridge.expect_get_fee_budget().returning(|_, _, _| {
+        Ok(BridgeFeeBudget {
+            source_fee_budget: 0.01,
+            ..BridgeFeeBudget::default()
+        })
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    bridge
+        .expect_source_fee_due()
+        .times(1)
+        .returning(move |asset, chain, target, _source, amount| {
+            assert_eq!((asset, chain, target), ("ckUSDC", "ICP", "USDC"));
+            assert!((amount - 0.98).abs() < 1e-9, "{amount}");
+            Ok(fee_due)
+        });
+    bridge.expect_prepare_submission().returning(|_| Ok(None));
+    bridge.expect_submit_bridge().times(0);
+
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let receipt = make_execution_receipt_with_assets(82, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
+    fund(&finalizer, &mut state).await;
+    finalizer.deposit(&mut state).await.expect("the deposit step should not fail");
+    state
+}
+
+/// An approve that an earlier attempt paid is not asked for again.
+#[tokio::test]
+async fn a_bridge_account_without_the_approve_fee_starts_when_the_fee_is_not_due() {
+    let state = deposit_with_only_the_fee_missing(0.0).await;
+
+    assert!(state.deposit.bridge.deposit_bridge_call.is_some());
+}
+
+#[tokio::test]
+async fn a_bridge_account_without_the_approve_fee_waits_while_the_fee_is_due() {
+    let state = deposit_with_only_the_fee_missing(0.01).await;
+
+    assert!(state.deposit.bridge.deposit_bridge_call.is_none());
+    assert!(matches!(state.step, CexStep::DepositPending));
+}
+
 /// The deposit-side twin of review finding 12: funds in the bridge account
 /// that never start their bridge must not wait forever.
 #[tokio::test]
