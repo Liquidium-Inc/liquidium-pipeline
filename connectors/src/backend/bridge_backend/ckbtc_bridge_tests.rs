@@ -508,7 +508,6 @@ async fn the_status_maps_every_minter_state() {
             RetrieveBtcStatusV2::Submitted { txid: vec![1] },
             BridgeStatus::Completed,
         ),
-        (RetrieveBtcStatusV2::AmountTooLow, BridgeStatus::Pending),
         (RetrieveBtcStatusV2::WillReimburse(reimbursement), BridgeStatus::Pending),
         (
             RetrieveBtcStatusV2::Confirmed { txid: vec![1] },
@@ -531,6 +530,20 @@ async fn the_status_maps_every_minter_state() {
             .unwrap();
         assert_eq!(status, expected, "{minter_status:?}");
     }
+
+    // Final at the minter with the ckBTC burned: an operator decides, no wait and no retry.
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<RetrieveBtcStatusV2>()
+        .returning(|_, _, _| Ok(RetrieveBtcStatusV2::AmountTooLow));
+    let error = backend(agent, MockIcpBackend::new())
+        .get_bridge_status("ckbtc-retrieve:77")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, BridgeError::Ambiguous(ref m) if m.contains("retrieval 77") && m.contains("too low")),
+        "{error}"
+    );
 
     // The ckBTC is back on the account, so the retrieval is over.
     let mut agent = MockPipelineAgent::new();

@@ -605,11 +605,12 @@ where
                 );
                 BridgeStatus::Completed
             }
+            // Final at the minter: the ckBTC is burned and no later poll changes
+            // that. An operator decides, so nothing retries and burns again.
             RetrieveBtcStatusV2::AmountTooLow => {
-                log::warn!(
-                    "[ckbtc bridge] retrieval {block_index} waits: the amount does not cover the current Bitcoin fee"
-                );
-                BridgeStatus::Pending
+                return Err(BridgeError::Ambiguous(format!(
+                    "the minter closed ckBTC retrieval {block_index} as too low for the Bitcoin fee: it sends no Bitcoin and does not reimburse the burned ckBTC"
+                )));
             }
             RetrieveBtcStatusV2::WillReimburse(request) => {
                 log::warn!(

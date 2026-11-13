@@ -61,6 +61,8 @@ struct PlannerAdapter {
     validation_error: Option<String>,
     preview_forbidden: bool,
     minimum_pay: Option<u64>,
+    /// False for a venue that can never carry the pair.
+    carries_pair: bool,
 }
 
 #[async_trait]
@@ -71,6 +73,10 @@ impl MultiVenueAdapter for PlannerAdapter {
 
     fn validate_configuration(&self) -> Result<(), String> {
         self.validation_error.clone().map_or(Ok(()), Err)
+    }
+
+    fn carries(&self, _request: &SwapRequest) -> bool {
+        self.carries_pair
     }
 
     async fn check_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
@@ -376,6 +382,7 @@ where
         validation_error: None,
         preview_forbidden: false,
         minimum_pay: None,
+        carries_pair: true,
     }
 }
 
@@ -527,6 +534,7 @@ fn registry_rejects_an_adapter_with_missing_runtime_configuration() {
         validation_error: Some("token registry is required".to_string()),
         preview_forbidden: true,
         minimum_pay: None,
+        carries_pair: true,
     };
 
     let error = VenueRegistry::new(vec![Arc::new(adapter)])
@@ -1603,6 +1611,82 @@ async fn rift_takes_its_order_cap_and_the_next_venue_takes_the_rest() {
     assert_eq!(legs, vec![(RIFT_VENUE_ID, 40_000_000), (KRAKEN_VENUE_ID, 60_000_000)]);
 }
 
+/// The rest after Rift's cap can be under the next venue's minimum. That venue
+/// then takes the whole amount, or the same split would fail on every retry.
+#[tokio::test]
+async fn a_rest_after_the_cap_below_the_next_venue_minimum_gives_that_venue_the_whole_amount() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let rift = mock_adapter(RIFT_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, RIFT_VENUE_ID, 0.0, 2))
+    });
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken = PlannerAdapter {
+        minimum_pay: Some(70_000_000),
+        ..mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+            Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
+        })
+    };
+    let planner_config = IcpswapFirstPlannerConfig {
+        rift_max_order_usd: 4.0,
+        ..config(0.0)
+    };
+    let planner = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(rift), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid planner");
+
+    let state = planner
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect("Kraken takes the whole amount");
+
+    let legs: Vec<(&str, u64)> = state
+        .legs
+        .iter()
+        .map(|leg| {
+            (
+                leg.venue_id.as_str(),
+                leg.request.pay_amount.value.0.to_u64().expect("fits"),
+            )
+        })
+        .collect();
+    assert_eq!(legs, vec![(KRAKEN_VENUE_ID, TOTAL_PAY)]);
+    assert_eq!(
+        kraken_calls.lock().expect("calls lock").as_slice(),
+        &[60_000_000, TOTAL_PAY],
+        "the rest after the cap, then the whole amount"
+    );
+}
+
+/// A row without a saved price cannot size the cap. Rift then takes nothing,
+/// with no quote, and the next venue carries the amount.
+#[tokio::test]
+async fn rift_takes_no_order_when_its_cap_cannot_be_sized() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let rift_calls = Arc::new(Mutex::new(Vec::new()));
+    let rift = mock_adapter(RIFT_VENUE_ID, rift_calls.clone(), |request| {
+        Ok(proportional_preview(request, RIFT_VENUE_ID, 0.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(rift), Arc::new(kraken)], config(0.0))
+        .expect("valid planner");
+    let mut input = native_icp_to_ckusdc_with_oracle();
+    input.pay_reference_price_usd = None;
+
+    let state = planner.plan(&input, 123).await.expect("Kraken carries the amount");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert!(rift_calls.lock().unwrap().is_empty(), "no Rift quote without a cap");
+}
+
 /// With no venue after it, Rift refuses an amount above its cap without a
 /// quote. The refusal is not permanent: a smaller amount or a raised cap clears it.
 #[tokio::test]
@@ -1720,6 +1804,7 @@ async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,
+        carries_pair: true,
     };
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();
@@ -1750,6 +1835,7 @@ async fn tiny_non_native_collateral_is_rejected_before_mexc_preview() {
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,
+        carries_pair: true,
     };
     let planner = IcpswapFirstPlanner::new(vec![Arc::new(mexc)], config(8.0)).expect("MEXC-only planner");
     let mut input = input_with_pay_token(non_native_icp_token());
@@ -1779,6 +1865,7 @@ async fn tiny_collateral_does_not_preview_mexc_when_icpswap_is_unavailable() {
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,
+        carries_pair: true,
     };
     let planner = planner(icpswap, mexc, config(8.0));
     let mut input = input_with_pay_token(native_icp());
@@ -1809,6 +1896,7 @@ async fn native_icp_to_ckusdt_is_mexc_only_and_never_previews_icpswap() {
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,
+        carries_pair: true,
     };
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();
@@ -2754,6 +2842,60 @@ async fn a_remainder_below_the_next_venue_minimum_gives_that_venue_the_whole_amo
     );
     assert!(rift_calls[0] < 50_000_000, "{rift_calls:?}");
     assert_eq!(rift_calls[1], TOTAL_PAY);
+}
+
+/// A venue that can never carry the pair is no second exchange. The one real
+/// exchange keeps its full quote, as it does when it is enabled alone.
+#[tokio::test]
+async fn a_venue_that_cannot_carry_the_pair_does_not_switch_the_impact_ceiling_on() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 392.0, 2))
+    });
+    let rift_calls = Arc::new(Mutex::new(Vec::new()));
+    let rift = PlannerAdapter {
+        carries_pair: false,
+        ..mock_adapter(RIFT_VENUE_ID, rift_calls.clone(), |_request| {
+            Err("Rift does not carry ICP".to_string())
+        })
+    };
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(rift)], config(0.0)).expect("valid planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
+        .await
+        .expect("MEXC carries the whole amount");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
+    assert!(rift_calls.lock().unwrap().is_empty(), "Rift is not asked for a quote");
+}
+
+/// Its refusal must not hide a real minimum: the amount is a dead end, so the
+/// recovery sweep runs.
+#[tokio::test]
+async fn a_venue_that_cannot_carry_the_pair_does_not_hide_a_minimum_refusal() {
+    let rift = PlannerAdapter {
+        carries_pair: false,
+        ..mock_adapter(RIFT_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+            Err("Rift does not carry ICP".to_string())
+        })
+    };
+    let kraken = PlannerAdapter {
+        minimum_pay: Some(TOTAL_PAY + 1),
+        ..mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+            Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
+        })
+    };
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(rift), Arc::new(kraken)], config(0.0)).expect("valid planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
+        .await
+        .expect_err("no venue can execute the amount");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)), "{error}");
+    assert!(error.to_string().contains("RIFT does not carry this pair"), "{error}");
 }
 
 /// When the venue is under its minimum for the whole amount too, the partial

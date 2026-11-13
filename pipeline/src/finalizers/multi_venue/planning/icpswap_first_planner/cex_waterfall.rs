@@ -61,15 +61,22 @@ impl IcpswapFirstPlanner {
                 .join("; ");
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(summary));
         }
-        let ceiling_applies = self.overflow_venue_ids.len() > 1;
+        // A venue that can never carry the pair is no second exchange: it must
+        // not switch the ceiling on, and it has no quote to give.
+        let (venue_ids, absent): (Vec<&String>, Vec<&String>) = self.overflow_venue_ids.iter().partition(|venue_id| {
+            self.venues
+                .adapter(venue_id)
+                .is_none_or(|adapter| adapter.carries(&input.request_for(venue_id, pay_value.clone())))
+        });
+        let ceiling_applies = venue_ids.len() > 1;
         let mut legs = Vec::new();
         let mut remainder = pay_value;
         let mut refusals = Vec::new();
-        // The pay amount of a thin-book partial that is still the last leg. The
-        // $ floor that kept it ignores each later venue's own minimum.
+        // The pay amount of a thin-book partial or a capped slice that is still the
+        // last leg. The $ floor that kept it ignores each later venue's own minimum.
         let mut open_partial: Option<Nat> = None;
-        for (index, venue_id) in self.overflow_venue_ids.iter().enumerate() {
-            let is_last = index + 1 == self.overflow_venue_ids.len();
+        for (index, venue_id) in venue_ids.iter().copied().enumerate() {
+            let is_last = index + 1 == venue_ids.len();
             let slice = match self.venue_slice(input, venue_id, is_last, &remainder) {
                 Ok(slice) => slice,
                 Err(refusal) => {
@@ -84,8 +91,9 @@ impl IcpswapFirstPlanner {
                     if !capped {
                         return Ok(legs);
                     }
+                    // A capped slice is open too: the rest can be under the next venue's minimum.
+                    open_partial = Some(slice.clone());
                     remainder -= slice;
-                    open_partial = None;
                     continue;
                 }
                 VenuePreviewOutcome::Quoted(preview) => {
@@ -161,29 +169,39 @@ impl IcpswapFirstPlanner {
         }
         let summary = refusals
             .iter()
-            .map(|refusal| refusal.reason.as_str())
+            .map(|refusal| refusal.reason.clone())
+            .chain(
+                absent
+                    .iter()
+                    .map(|venue_id| format!("{} does not carry this pair", venue_id.to_uppercase())),
+            )
             .collect::<Vec<_>>()
             .join("; ");
         // Only an amount every exchange refused as too small is a dead end; an
         // outage or a thin book can clear by the next cycle (audit L17).
-        if legs.is_empty() && refusals.iter().all(|refusal| refusal.permanent) {
+        if legs.is_empty() && !refusals.is_empty() && refusals.iter().all(|refusal| refusal.permanent) {
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(summary));
         }
         Err(IcpswapFirstPlannerError::NoViableRoute(summary))
     }
 
     /// The most one order at this venue may carry, in pay units at the oracle
-    /// price. Only Rift has a cap; without a price the cap cannot be sized.
-    fn venue_order_cap(&self, input: &IcpswapFirstPlanInput, venue_id: &str) -> Option<Nat> {
+    /// price. Only Rift has a cap. Without a price the cap cannot be sized, so
+    /// Rift refuses: an order with no bound is worse than no Rift leg.
+    fn venue_order_cap(&self, input: &IcpswapFirstPlanInput, venue_id: &str) -> Result<Option<Nat>, Refusal> {
         if venue_id != RIFT_VENUE_ID {
-            return None;
+            return Ok(None);
         }
         let cap_usd = self.config.rift_max_order_usd;
-        let price = input.pay_reference_price_usd?;
-        if !(cap_usd.is_finite() && cap_usd > 0.0 && price > 0.0) {
-            return None;
+        match input.pay_reference_price_usd {
+            Some(price) if price.is_finite() && price > 0.0 && cap_usd.is_finite() && cap_usd > 0.0 => Ok(Some(
+                ChainTokenAmount::from_formatted(input.total_pay.token.clone(), cap_usd / price).value,
+            )),
+            _ => Err(Refusal {
+                reason: "RIFT order cap cannot be sized without a reference price".to_string(),
+                permanent: false,
+            }),
         }
-        Some(ChainTokenAmount::from_formatted(input.total_pay.token.clone(), cap_usd / price).value)
     }
 
     /// The amount one venue is asked for: all of `remainder`, or its order cap.
@@ -195,7 +213,7 @@ impl IcpswapFirstPlanner {
         is_last: bool,
         remainder: &Nat,
     ) -> Result<Nat, Refusal> {
-        match self.venue_order_cap(input, venue_id) {
+        match self.venue_order_cap(input, venue_id)? {
             Some(cap) if cap < *remainder => {
                 if is_last {
                     return Err(Refusal {

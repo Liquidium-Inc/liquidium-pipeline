@@ -132,6 +132,29 @@ async fn start(
     if source_available + SOURCE_BALANCE_TOLERANCE < bridge_amount {
         if matches!(route.route_kind, BridgeRouteKind::EthToCkEth) && source_available > SOURCE_BALANCE_TOLERANCE {
             let adjusted_source_available = (source_available - NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN).max(0.0);
+            // The wallet's own gas float covers part of the reserve, so a delivery
+            // reads short by at most one reserve. A larger gap is other ETH, not this delivery.
+            let gas_reserve = bridge
+                .backend
+                .get_source_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+                .await?;
+            if adjusted_source_available + gas_reserve + SOURCE_BALANCE_TOLERANCE < bridge_amount {
+                debug!(
+                    "[bridge] liq_id={} bridged native ETH return waiting for its delivery: available={} expected={} gas_reserve={} source={} route={}",
+                    leg_id,
+                    source_available,
+                    bridge_amount,
+                    gas_reserve,
+                    source_address,
+                    route_label(route),
+                );
+                return wait_within_bound(
+                    leg_id,
+                    &mut inputs.wait,
+                    "bridged withdraw",
+                    "the bridge source holds less than the delivery, by more than the gas reserve",
+                );
+            }
             if adjusted_source_available <= SOURCE_BALANCE_TOLERANCE {
                 debug!(
                     "[bridge] liq_id={} bridged native ETH return waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}",

@@ -362,8 +362,13 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
     );
 }
 
-#[tokio::test]
-async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reserve() {
+/// A native ETH return at `WithdrawPending`, with the exchange's delivery
+/// reported complete and `bridgeable` ETH in the wallet above the gas reserve.
+/// `sends` is how many bridge sends the test allows.
+async fn native_eth_return_at_the_wallet(
+    bridgeable: f64,
+    sends: usize,
+) -> (CexVenueFinalizer<MockCexBackend>, CexState) {
     let mut cex = MockCexBackend::new();
     let mut bridge = MockBridgeBackend::new();
     let transfers = MockTransferActions::new();
@@ -386,7 +391,6 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
         });
 
     cex.expect_get_withdraw_status_snapshot_by_id()
-        .times(1)
         .returning(|coin, withdraw_id| {
             assert_eq!(coin, "ETH");
             assert_eq!(withdraw_id, "withdraw-native-eth");
@@ -399,24 +403,25 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
 
     bridge
         .expect_get_source_balance()
-        .times(1)
-        .returning(|asset, chain, address| {
+        .returning(move |asset, chain, address| {
             assert_eq!(asset, "ETH");
             assert_eq!(chain, "ETH");
             assert_eq!(address, "0x2222222222222222222222222222222222222222");
             // ETH source balance is reported after reserving gas for the bridge transaction.
-            Ok(0.016425721728152685)
+            Ok(bridgeable)
         });
+    // The reserve the wallet keeps for the helper deposit's gas.
+    bridge.expect_get_source_fee_budget().returning(|_, _, _| Ok(0.005));
 
-    bridge.expect_prepare_bridge_send().times(1).returning(|request| {
+    bridge.expect_prepare_bridge_send().times(sends).returning(move |request| {
         assert_eq!(request.asset, "ETH");
         assert_eq!(request.source_chain, "ETH");
         assert_eq!(request.target_asset, "ckETH");
         assert_eq!(request.source_address, "0x2222222222222222222222222222222222222222");
-        assert!((request.amount - 0.016425721728151685).abs() < 1e-18);
+        assert!((request.amount - (bridgeable - 1e-15)).abs() < 1e-18);
         Ok(evm_bridge_send())
     });
-    bridge.expect_track_deposit().times(1).returning(|_, _, _, _, _| {
+    bridge.expect_track_deposit().times(sends).returning(|_, _, _, _, _| {
         Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: "bridge-native-eth".to_string(),
         }))
@@ -431,7 +436,12 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(landing_sender())));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(if sends == 0 {
+        // A leg that waits sends nothing, so any send fails the test.
+        liquidium_pipeline_core::outbound::MockOutboundSender::new()
+    } else {
+        landing_sender()
+    })));
 
     let receipt = make_execution_receipt_with_assets(113, native_icp_token(), cketh_token());
     let mut state = finalizer
@@ -454,6 +464,13 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
     assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-native-eth"));
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 
+    (finalizer, state)
+}
+
+#[tokio::test]
+async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reserve() {
+    let (finalizer, mut state) = native_eth_return_at_the_wallet(0.016425721728152685, 1).await;
+
     finalizer
         .withdraw(&mut state)
         .await
@@ -465,6 +482,22 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
         state.withdraw.bridge.withdraw_bridge_id.as_deref(),
         Some("bridge-native-eth")
     );
+}
+
+/// The wallet's spare ETH is not the delivery. A gap above the gas reserve
+/// means the delivery has not landed, so the leg waits and sends nothing.
+#[tokio::test]
+async fn a_native_eth_return_waits_while_the_wallet_holds_only_other_eth() {
+    let (finalizer, mut state) = native_eth_return_at_the_wallet(0.0049, 0).await;
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("the leg waits for its delivery");
+
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert!(state.withdraw.bridge.withdraw_bridge_funding.is_none(), "no send is saved");
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 }
 
 #[tokio::test]

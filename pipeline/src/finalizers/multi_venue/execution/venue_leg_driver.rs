@@ -113,6 +113,11 @@ pub trait VenueLeg: Send + Sync {
     fn check_configuration(&self) -> Result<(), String> {
         Ok(())
     }
+    /// False when the venue can never carry this pair, whatever the amount.
+    fn carries_pair(&self, request: &SwapRequest) -> bool {
+        let _ = request;
+        true
+    }
     async fn check_leg_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
         let _ = request;
         Ok(())
@@ -288,6 +293,10 @@ impl<V: VenueLeg + 'static> MultiVenueAdapter for V {
 
     fn validate_configuration(&self) -> Result<(), String> {
         self.check_configuration()
+    }
+
+    fn carries(&self, request: &SwapRequest) -> bool {
+        self.carries_pair(request)
     }
 
     async fn check_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
