@@ -25,7 +25,7 @@ use crate::{
         amount_utils::{amount_to_nat_units_strict, nat_units_to_amount_via_core},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
-            ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
+            MinterBurn, icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
         },
         solana_backend::SolanaBackend,
     },
@@ -504,20 +504,15 @@ where
             })
     }
 
-    async fn ensure_minter_allowance(&self, source_account: &Account, required_allowance: Nat) -> Result<(), String> {
-        let spender = Account {
-            owner: self.cksol_minter_canister,
-            subaccount: None,
-        };
-        ensure_icrc2_allowance(
-            self.icp_backend.as_ref(),
-            self.cksol_ledger_canister,
-            source_account,
-            spender,
-            required_allowance,
-            "cksol bridge",
-        )
-        .await
+    /// A burn of `source_account`'s ckSOL through the minter.
+    fn burn_from(&self, source_account: Account) -> MinterBurn<'_, B> {
+        MinterBurn {
+            backend: self.icp_backend.as_ref(),
+            ledger: self.cksol_ledger_canister,
+            account: source_account,
+            minter: self.cksol_minter_canister,
+            context: "cksol bridge",
+        }
     }
 
     /// The minter deposit account for a mint to `destination`. Only the bridge
@@ -767,28 +762,7 @@ where
         let decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
         let amount_native = amount_to_nat_units_strict(request.amount, decimals)?;
-        let approve_fee =
-            icrc1_fee_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
-
-        let required_budget = amount_native.clone() + approve_fee;
-        let available_balance = icrc1_balance_with_context(
-            self.icp_backend.as_ref(),
-            self.cksol_ledger_canister,
-            &source_account,
-            "cksol bridge",
-        )
-        .await?;
-        if available_balance < required_budget {
-            let available_formatted = nat_units_to_amount_via_core(&available_balance, decimals)?;
-            let required_formatted = nat_units_to_amount_via_core(&required_budget, decimals)?;
-            return Err(format!(
-                "bridge amount preflight failed: ckSOL balance is below required burn+approve budget (available={} required={} source={})",
-                available_formatted, required_formatted, request.source_address
-            ));
-        }
-
-        self.ensure_minter_allowance(&source_account, amount_native.clone())
-            .await?;
+        self.burn_from(source_account).fund(&amount_native).await?;
 
         let amount_lamports = amount_native.0.to_u64().ok_or_else(|| {
             format!(
@@ -915,6 +889,26 @@ where
 
     async fn get_source_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
         Ok(self.get_fee_budget(asset, chain, target).await?.source_fee_budget)
+    }
+
+    async fn source_fee_due(
+        &self,
+        asset: &str,
+        chain: &str,
+        target: &str,
+        source_address: &str,
+        amount: f64,
+    ) -> Result<f64, String> {
+        let burn = resolve_route(asset, chain, target).filter(|route| route.route_kind == BridgeRouteKind::IcpToSolana);
+        if burn.is_none() {
+            return self.get_source_fee_budget(asset, chain, target).await;
+        }
+        let source_account = parse_source_icp_account(source_address)?;
+        let decimals =
+            icrc1_decimals_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
+        let amount_native = amount_to_nat_units_strict(amount, decimals)?;
+        let fee = self.burn_from(source_account).approve_fee_due(&amount_native).await?;
+        nat_units_to_amount_via_core(&fee, decimals)
     }
 
     async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
@@ -1940,7 +1934,7 @@ mod tests {
         mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
         mock_icp
             .expect_icrc1_fee()
-            .times(1)
+            .times(0)
             .returning(|_| Ok(Nat::from(10_000u64)));
         mock_icp
             .expect_icrc1_balance()

@@ -66,6 +66,76 @@ pub async fn icrc2_allowance_with_context<B: IcpBackend + ?Sized>(
         .map_err(|e| format!("{context}: icrc2_allowance failed on ledger {ledger}: {e}"))
 }
 
+/// A burn through a minter: the account that burns on one ledger, and the
+/// minter that spends its allowance.
+pub struct MinterBurn<'a, B: IcpBackend + ?Sized> {
+    pub backend: &'a B,
+    pub ledger: Principal,
+    pub account: Account,
+    pub minter: Principal,
+    pub context: &'a str,
+}
+
+impl<B: IcpBackend + ?Sized> MinterBurn<'_, B> {
+    fn spender(&self) -> Account {
+        Account {
+            owner: self.minter,
+            subaccount: None,
+        }
+    }
+
+    async fn allowance(&self) -> Result<Nat, String> {
+        let args = AllowanceArgs {
+            account: self.account,
+            spender: self.spender(),
+        };
+        icrc2_allowance_with_context(self.backend, self.ledger, args, self.context).await
+    }
+
+    /// An allowance that already covers the burn needs no second approve.
+    async fn fee_after(&self, allowance: &Nat, amount: &Nat) -> Result<Nat, String> {
+        if allowance >= amount {
+            return Ok(Nat::from(0u8));
+        }
+        icrc1_fee_with_context(self.backend, self.ledger, self.context).await
+    }
+
+    /// The ledger fee a burn of `amount` still pays for its approve.
+    pub async fn approve_fee_due(&self, amount: &Nat) -> Result<Nat, String> {
+        self.fee_after(&self.allowance().await?, amount).await
+    }
+
+    /// Checks that the balance covers the burn and the approve it still
+    /// needs, then gives the minter the allowance.
+    pub async fn fund(&self, amount: &Nat) -> Result<(), String> {
+        let allowance = self.allowance().await?;
+        let required = amount.clone() + self.fee_after(&allowance, amount).await?;
+        let balance = icrc1_balance_with_context(self.backend, self.ledger, &self.account, self.context).await?;
+        if balance < required {
+            return Err(format!(
+                "bridge amount preflight failed: balance {balance} is below the burn and approve budget {required} (ledger={} source={})",
+                self.ledger, self.account
+            ));
+        }
+        if allowance >= *amount {
+            return Ok(());
+        }
+        let approve = ApproveArgs {
+            from_subaccount: None,
+            spender: self.spender(),
+            amount: amount.clone(),
+            expected_allowance: Some(allowance),
+            expires_at: None,
+            fee: None,
+            memo: None,
+            created_at_time: None,
+        };
+        icrc2_approve_with_context(self.backend, self.ledger, approve, self.context)
+            .await
+            .map(|_| ())
+    }
+}
+
 /// Raises the allowance of `spender` on `account` to `required` when it is
 /// lower. `expected_allowance` makes the ledger refuse the approve when the
 /// allowance changed since it was read, instead of overwriting it.
