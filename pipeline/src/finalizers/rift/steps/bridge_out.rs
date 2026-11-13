@@ -8,7 +8,9 @@ use super::{RiftVenueFinalizer, VenueStepError, decimal_text, leg_routes, rift_a
 use crate::finalizers::rift::preview::{delivered_units, net_of};
 use crate::{
     finalizers::{
-        bridge_legs::{BridgeDestinationProvider, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out},
+        bridge_legs::{
+            Arrival, BridgeDestinationProvider, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out,
+        },
         rift::state::{RiftState, RiftStep},
     },
     utils::now_ts,
@@ -18,8 +20,13 @@ use crate::{
 /// minter pays in minutes, but a parked leg can be released days later.
 const DEADLINE_MARGIN_SECS: i64 = 60 * 60;
 
-/// The order's deposit address. Rift gave it when the order was created.
-struct OrderDepositAddress(String);
+/// The order as the bridge's destination: its deposit address, and Rift's own
+/// word on whether the deposit arrived.
+struct OrderDeposit<'a, R> {
+    backend: &'a R,
+    order_id: String,
+    address: String,
+}
 
 /// Seconds until the deadline, as Rift writes it (RFC 3339).
 fn secs_until(deadline: &str) -> Result<i64, VenueStepError> {
@@ -29,9 +36,17 @@ fn secs_until(deadline: &str) -> Result<i64, VenueStepError> {
 }
 
 #[async_trait]
-impl BridgeDestinationProvider for OrderDepositAddress {
+impl<R: RiftBackend> BridgeDestinationProvider for OrderDeposit<'_, R> {
     async fn destination(&self) -> Result<String, String> {
-        Ok(self.0.clone())
+        Ok(self.address.clone())
+    }
+
+    /// An order past `awaiting_deposit` has the deposit. A failed read says nothing.
+    async fn arrival(&self) -> Arrival {
+        match self.backend.order_state(&self.order_id).await {
+            Ok(order) if order.status.funds_moved() => Arrival::Confirmed,
+            _ => Arrival::NotConfirmed,
+        }
     }
 }
 
@@ -42,7 +57,11 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let order = state.order.as_ref().ok_or("missing Rift order before the bridge out")?;
         let order_id = order.id.clone();
         let ordered = rift_amount(&state.size_in.token, &order.amount_in)?;
-        let destination = OrderDepositAddress(order.deposit_address.clone());
+        let destination = OrderDeposit {
+            backend: self.backend.as_ref(),
+            order_id: order_id.clone(),
+            address: order.deposit_address.clone(),
+        };
         // Until the minter call is saved, the deposit can still go to a new
         // order. Past that, the saved call names this order's address.
         let call_open = state.bridge_out.deposit_bridge_call.is_none() && state.bridge_out.deposit_bridge_id.is_none();

@@ -26,7 +26,7 @@ use crate::{
 
 pub use bridge_in::{BridgeInInputs, advance_bridge_in, awaits_other_deposit, in_route};
 pub use bridge_leg_state::{BridgeInState, BridgeOutState};
-pub use bridge_out::{BridgeDestinationProvider, BridgeOutInputs, FundingSlot, advance_bridge_out, out_route};
+pub use bridge_out::{Arrival, BridgeDestinationProvider, BridgeOutInputs, FundingSlot, advance_bridge_out, out_route};
 #[cfg(test)]
 pub use bridge_sizing::reverse_bridge_source_fee_reserve;
 pub use bridge_sizing::{

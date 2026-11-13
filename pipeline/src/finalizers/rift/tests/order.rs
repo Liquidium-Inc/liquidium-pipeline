@@ -203,3 +203,15 @@ async fn an_order_paying_out_on_bitcoin_names_the_minter_address_of_the_final_ac
     assert_eq!(state.step, RiftStep::BridgeOut);
     assert_eq!(state.order.unwrap().to_address.as_deref(), Some("bc1qminter"));
 }
+
+/// Rift's amounts come over the network. Text that is not a plain decimal is
+/// an error, also when the cut to the token's decimals lands inside a character.
+#[test]
+fn a_rift_amount_that_is_not_a_plain_decimal_is_refused_without_a_panic() {
+    use crate::finalizers::rift::finalizer::rift_amount;
+
+    assert_eq!(rift_amount(&ckusdc(), "1.2345678").unwrap().value, Nat::from(1_234_567u64));
+    for text in ["1.12345é", "1.é", "1,5", "-1", "1e3", "１.５"] {
+        assert!(rift_amount(&ckusdc(), text).is_err(), "{text}");
+    }
+}
