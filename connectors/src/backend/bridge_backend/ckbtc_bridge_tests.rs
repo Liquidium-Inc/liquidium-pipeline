@@ -5,12 +5,14 @@ use std::sync::Arc;
 use candid::{Nat, Principal};
 use icrc_ledger_types::{
     icrc1::{account::Account, transfer::Memo},
+    icrc106::errors::Icrc106Error,
     icrc3::{
         archive::{ArchivedRange, QueryTxArchiveFn},
         transactions::{Burn, GetTransactionsRequest, GetTransactionsResponse, Mint, Transaction, TransactionRange},
     },
 };
 
+use super::super::utils::{AccountTransactions, AccountTransactionsAnswer, IndexedTransaction};
 use super::{
     BridgeBackend, BridgeDestination, BridgeError, BridgeRequest, BridgeStatus, CkBtcBridgeBackend, DepositNotice,
 };
@@ -30,6 +32,7 @@ use crate::{
 const OWNER: &str = "aaaaa-aa";
 const MINTER: &str = "mqygn-kiaaa-aaaar-qaadq-cai";
 const LEDGER: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
+const INDEX: &str = "n5wcd-faaaa-aaaar-qaaea-cai";
 const MAINNET_ADDRESS: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
 const TESTNET_ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
 
@@ -722,84 +725,80 @@ async fn a_receipt_that_is_not_a_transaction_id_is_refused() {
     assert!(error.contains("not a Bitcoin transaction id"), "{error}");
 }
 
-fn known_utxos(agent: &mut MockPipelineAgent, utxos: Vec<Utxo>) {
+fn mint(memo: Vec<u8>) -> Transaction {
+    Transaction {
+        kind: "mint".to_string(),
+        mint: Some(Mint {
+            amount: Nat::from(129_900u64),
+            to: source(),
+            memo: Some(Memo::from(memo)),
+            created_at_time: None,
+        }),
+        burn: None,
+        transfer: None,
+        approve: None,
+        timestamp: 1,
+    }
+}
+
+/// The payout's mint memo, as the minter writes it.
+fn payout_memo() -> Vec<u8> {
+    [
+        vec![0x82, 0x00, 0x83, 0x58, 0x20],
+        payout_outpoint().txid,
+        vec![0x00, 0x18, 0x64],
+    ]
+    .concat()
+}
+
+fn the_ledger_names_its_index(agent: &mut MockPipelineAgent) {
     agent
-        .expect_call_query::<Vec<Utxo>>()
+        .expect_call_query::<Result<Principal, Icrc106Error>>()
         .times(1)
-        .returning(move |_, method, _| {
-            assert_eq!(method, "get_known_utxos");
-            Ok(utxos.clone())
+        .returning(|ledger, method, _| {
+            assert_eq!(ledger.to_text(), LEDGER);
+            assert_eq!(method, "icrc106_get_index_principal");
+            Ok(Ok(Principal::from_text(INDEX).unwrap()))
         });
 }
 
-/// The ckBTC ledger with `length` blocks, whose block 81 mints to the source
-/// account with the payout's transaction in its memo, as the minter writes it.
-fn ledger_with_the_mint(agent: &mut MockPipelineAgent, length: u64) {
+/// The index canister with these transactions for the source account, newest first.
+fn account_history(agent: &mut MockPipelineAgent, history: Vec<(u64, Transaction)>) {
+    the_ledger_names_its_index(agent);
     agent
-        .expect_call_query::<GetTransactionsResponse>()
-        .returning(move |_, method, arg| {
-            assert_eq!(method, "get_transactions");
-            let request: GetTransactionsRequest = candid::decode_one(arg.as_slice()).unwrap();
-            let start: u64 = request.start.0.clone().try_into().unwrap();
-            let count: u64 = request.length.0.clone().try_into().unwrap();
-            let transactions = (start..(start + count).min(length))
-                .map(|index| {
-                    let mint = if index == 81 {
-                        let memo = [
-                            vec![0x82, 0x00, 0x83, 0x58, 0x20],
-                            payout_outpoint().txid,
-                            vec![0x00, 0x18, 0x64],
-                        ]
-                        .concat();
-                        Some(Mint {
-                            amount: Nat::from(129_900u64),
-                            to: source(),
-                            memo: Some(Memo::from(memo)),
-                            created_at_time: None,
-                        })
-                    } else {
-                        Some(Mint {
-                            amount: Nat::from(129_900u64),
-                            to: source(),
-                            memo: Some(Memo::from(vec![index as u8])),
-                            created_at_time: None,
-                        })
-                    };
-                    Transaction {
-                        kind: "mint".to_string(),
-                        mint,
-                        burn: None,
-                        transfer: None,
-                        approve: None,
-                        timestamp: 1,
-                    }
-                })
-                .collect();
-            Ok(GetTransactionsResponse {
-                first_index: Nat::from(start),
-                log_length: Nat::from(length),
-                transactions,
-                archived_transactions: Vec::new(),
-            })
+        .expect_call_query::<AccountTransactionsAnswer>()
+        .times(1)
+        .returning(move |index, method, _| {
+            assert_eq!(index.to_text(), INDEX);
+            assert_eq!(method, "get_account_transactions");
+            Ok(Ok(AccountTransactions {
+                transactions: history
+                    .iter()
+                    .map(|(id, transaction)| IndexedTransaction {
+                        id: Nat::from(*id),
+                        transaction: transaction.clone(),
+                    })
+                    .collect(),
+            }))
         });
+}
+
+fn no_new_utxos() -> UpdateBalanceRet {
+    UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
+        suspended_utxos: None,
+        required_confirmations: 4,
+        pending_utxos: None,
+        current_confirmations: None,
+    })
 }
 
 /// Anyone may run `update_balance` for the account, so a repeat after the
-/// mint sees nothing new. The minter's known UTXOs and the mint memo recover it.
+/// mint sees nothing new. The mint in the account's history recovers it.
 #[tokio::test]
-async fn a_deposit_minted_by_another_call_is_recovered_from_the_known_utxos_and_the_ledger() {
+async fn a_deposit_minted_by_another_call_is_recovered_from_the_accounts_history() {
     let mut agent = MockPipelineAgent::new();
-    update_balance_answer(
-        &mut agent,
-        UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
-            suspended_utxos: None,
-            required_confirmations: 4,
-            pending_utxos: None,
-            current_confirmations: None,
-        }),
-    );
-    known_utxos(&mut agent, vec![utxo(payout_outpoint(), 130_000)]);
-    ledger_with_the_mint(&mut agent, 2_500);
+    update_balance_answer(&mut agent, no_new_utxos());
+    account_history(&mut agent, vec![(90, mint(vec![7])), (81, mint(payout_memo()))]);
 
     let notice = backend(agent, MockIcpBackend::new())
         .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
@@ -812,10 +811,10 @@ async fn a_deposit_minted_by_another_call_is_recovered_from_the_known_utxos_and_
     }
 }
 
-/// A call that minted other deposits says nothing about ours; the known
-/// UTXOs decide whether it is unseen or minted already.
+/// A call that minted other deposits says nothing about ours; the account's
+/// history decides whether it is unseen or minted already.
 #[tokio::test]
-async fn a_call_that_minted_only_other_deposits_is_not_yet_when_ours_is_unknown() {
+async fn a_call_that_minted_only_other_deposits_is_not_yet_when_ours_has_no_mint() {
     let mut agent = MockPipelineAgent::new();
     update_balance_answer(
         &mut agent,
@@ -831,16 +830,7 @@ async fn a_call_that_minted_only_other_deposits_is_not_yet_when_ours_is_unknown(
             ),
         }]),
     );
-    known_utxos(
-        &mut agent,
-        vec![utxo(
-            OutPoint {
-                txid: vec![9; 32],
-                vout: 1,
-            },
-            5_100,
-        )],
-    );
+    account_history(&mut agent, vec![(80, mint(vec![9; 32]))]);
 
     let notice = backend(agent, MockIcpBackend::new())
         .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
@@ -848,7 +838,7 @@ async fn a_call_that_minted_only_other_deposits_is_not_yet_when_ours_is_unknown(
         .unwrap();
 
     assert!(
-        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("does not see")),
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("no mint to")),
         "{notice:?}"
     );
 }
@@ -1065,19 +1055,10 @@ async fn an_update_balance_call_without_an_answer_is_not_yet() {
 /// The search for a mint by another call only reads, so a failed read waits too.
 #[tokio::test]
 async fn a_failed_read_in_the_search_for_an_earlier_mint_is_not_yet() {
-    let no_new_utxos = || {
-        UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
-            suspended_utxos: None,
-            required_confirmations: 4,
-            pending_utxos: None,
-            current_confirmations: None,
-        })
-    };
-
     let mut agent = MockPipelineAgent::new();
     update_balance_answer(&mut agent, no_new_utxos());
     agent
-        .expect_call_query::<Vec<Utxo>>()
+        .expect_call_query::<Result<Principal, Icrc106Error>>()
         .times(1)
         .returning(|_, _, _| Err("transport error".to_string()));
     let notice = backend(agent, MockIcpBackend::new())
@@ -1085,22 +1066,23 @@ async fn a_failed_read_in_the_search_for_an_earlier_mint_is_not_yet() {
         .await
         .unwrap();
     assert!(
-        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("get_known_utxos did not answer")),
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("the ckBTC index did not answer")),
         "{notice:?}"
     );
 
     let mut agent = MockPipelineAgent::new();
     update_balance_answer(&mut agent, no_new_utxos());
-    known_utxos(&mut agent, vec![utxo(payout_outpoint(), 130_000)]);
+    the_ledger_names_its_index(&mut agent);
     agent
-        .expect_call_query::<GetTransactionsResponse>()
+        .expect_call_query::<AccountTransactionsAnswer>()
+        .times(1)
         .returning(|_, _, _| Err("transport error".to_string()));
     let notice = backend(agent, MockIcpBackend::new())
         .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
         .await
         .unwrap();
     assert!(
-        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("the ckBTC ledger did not answer")),
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("the ckBTC index did not answer")),
         "{notice:?}"
     );
 }
