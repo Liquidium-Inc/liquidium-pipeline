@@ -384,7 +384,7 @@ impl Config {
         let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let rift_api_url = parse_rift_api_url_from_env();
-        let rift_max_order_usd = parse_rift_max_order_usd_from_env();
+        let rift_max_order_usd = parse_rift_max_order_usd_from_env()?;
         let rift_venue_allowlist = parse_name_list_from_env("RIFT_VENUE_ALLOWLIST");
         let rift_venue_blocklist = parse_name_list_from_env("RIFT_VENUE_BLOCKLIST");
         let rift_api_key = env::var("RIFT_API_KEY")
@@ -752,8 +752,6 @@ fn parse_canister_from_env(name: &str, default: &str) -> Result<Principal, Strin
     Principal::from_text(text).map_err(|e| format!("invalid {name} principal '{text}': {e}"))
 }
 
-/// A cap must be a positive number; anything else keeps the default, so a
-/// typo never lifts it.
 /// A comma-separated list of names; blank entries are dropped.
 fn parse_name_list_from_env(name: &str) -> Vec<String> {
     env::var(name)
@@ -764,12 +762,20 @@ fn parse_name_list_from_env(name: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_rift_max_order_usd_from_env() -> f64 {
-    env::var("RIFT_MAX_ORDER_USD")
+/// The Rift order cap: the default when unset, a startup error when set to
+/// anything but a positive number. A typo must never change the cap silently.
+fn parse_rift_max_order_usd_from_env() -> Result<f64, String> {
+    let Ok(raw) = env::var("RIFT_MAX_ORDER_USD") else {
+        return Ok(DEFAULT_RIFT_MAX_ORDER_USD);
+    };
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(DEFAULT_RIFT_MAX_ORDER_USD);
+    }
+    text.parse::<f64>()
         .ok()
-        .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(DEFAULT_RIFT_MAX_ORDER_USD)
+        .ok_or_else(|| format!("RIFT_MAX_ORDER_USD must be a positive number of USD, got '{text}'"))
 }
 
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
@@ -1297,6 +1303,23 @@ mod tests {
 
             unsafe { env::remove_var(var) };
         }
+    }
+
+    /// A typed cap such as `5,000` once became the 25,000 default without a word.
+    #[test]
+    fn the_rift_order_cap_defaults_when_unset_and_refuses_a_malformed_value() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("RIFT_MAX_ORDER_USD") };
+        assert_eq!(parse_rift_max_order_usd_from_env(), Ok(DEFAULT_RIFT_MAX_ORDER_USD));
+
+        unsafe { env::set_var("RIFT_MAX_ORDER_USD", " 15 ") };
+        assert_eq!(parse_rift_max_order_usd_from_env(), Ok(15.0));
+
+        for malformed in ["5,000", "15$", "0", "-1", "NaN"] {
+            unsafe { env::set_var("RIFT_MAX_ORDER_USD", malformed) };
+            assert!(parse_rift_max_order_usd_from_env().is_err(), "{malformed}");
+        }
+        unsafe { env::remove_var("RIFT_MAX_ORDER_USD") };
     }
 
     #[test]

@@ -1156,6 +1156,18 @@ where
     }
 
     async fn get_source_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        // A native ETH return keeps its gas reserve in the wallet: the same
+        // reserve `get_source_balance` takes off the bridgeable balance.
+        if let Some(route) = resolve_cketh_forward_route_by_source(asset, chain)
+            && route.route_kind == BridgeRouteKind::EthToCkEth
+            && route.target_asset.eq_ignore_ascii_case(target_asset)
+        {
+            let gas_reserve = self
+                .evm_backend
+                .native_tx_gas_reserve(ETH_FORWARD_HELPER_GAS_LIMIT)
+                .await?;
+            return base_units_to_amount_via_core(gas_reserve, ETH_DECIMALS);
+        }
         let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) else {
             return Ok(0.0);
         };

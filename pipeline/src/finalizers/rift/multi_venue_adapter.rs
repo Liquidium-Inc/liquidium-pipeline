@@ -155,6 +155,12 @@ impl<R: RiftBackend + 'static> VenueLeg for RiftVenueFinalizer<R> {
 
     /// Rift carries only the listed ck assets, and a minter with a minimum
     /// refuses a small one before any quote.
+    /// Rift lists its assets in a fixed table, so the answer never changes between retries.
+    fn carries_pair(&self, request: &SwapRequest) -> bool {
+        self.swap_request_parts(request)
+            .is_ok_and(|(pay_amount, receive_token, _)| leg_routes(&pay_amount.token, &receive_token).is_ok())
+    }
+
     async fn check_leg_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
         let (pay_amount, receive_token, _) = self
             .swap_request_parts(request)
