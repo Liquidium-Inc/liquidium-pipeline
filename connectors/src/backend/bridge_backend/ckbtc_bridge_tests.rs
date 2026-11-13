@@ -989,6 +989,70 @@ async fn a_busy_minter_is_not_yet_and_a_quarantined_deposit_is_held() {
     );
 }
 
+/// A minter call without an answer moves nothing of ours, so the leg waits in
+/// its bound and spends no retry. Row 1759 parked after 20 such network errors.
+#[tokio::test]
+async fn an_update_balance_call_without_an_answer_is_not_yet() {
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update::<UpdateBalanceRet>()
+        .times(1)
+        .returning(|_, _, _| Err("transport error: connection timed out".to_string()));
+
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("update_balance did not answer")),
+        "{notice:?}"
+    );
+}
+
+/// The search for a mint by another call only reads, so a failed read waits too.
+#[tokio::test]
+async fn a_failed_read_in_the_search_for_an_earlier_mint_is_not_yet() {
+    let no_new_utxos = || {
+        UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
+            suspended_utxos: None,
+            required_confirmations: 4,
+            pending_utxos: None,
+            current_confirmations: None,
+        })
+    };
+
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(&mut agent, no_new_utxos());
+    agent
+        .expect_call_query::<Vec<Utxo>>()
+        .times(1)
+        .returning(|_, _, _| Err("transport error".to_string()));
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+    assert!(
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("get_known_utxos did not answer")),
+        "{notice:?}"
+    );
+
+    let mut agent = MockPipelineAgent::new();
+    update_balance_answer(&mut agent, no_new_utxos());
+    known_utxos(&mut agent, vec![utxo(payout_outpoint(), 130_000)]);
+    agent
+        .expect_call_query::<GetTransactionsResponse>()
+        .returning(|_, _, _| Err("transport error".to_string()));
+    let notice = backend(agent, MockIcpBackend::new())
+        .track_deposit("BTC", "BTC", &deposit_to(source()), "", PAYOUT_TX)
+        .await
+        .unwrap();
+    assert!(
+        matches!(notice, DepositNotice::NotYet { ref reason } if reason.contains("the ckBTC ledger did not answer")),
+        "{notice:?}"
+    );
+}
+
 /// The ledger is the proof of the mint: its block names the amount and the account.
 #[tokio::test]
 async fn a_mint_handle_reads_its_receipt_from_the_ledger() {

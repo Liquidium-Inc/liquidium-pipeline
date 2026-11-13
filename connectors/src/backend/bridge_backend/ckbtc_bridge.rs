@@ -173,25 +173,37 @@ where
         }
     }
 
+    /// A call that did not answer moves nothing of ours, and a mint it made
+    /// shows in the known UTXOs on the next notice. So the leg waits in its bound.
+    fn unanswered(call: &str, error: String) -> DepositNotice {
+        DepositNotice::NotYet {
+            reason: format!("{call} did not answer: {error}"),
+        }
+    }
+
     /// Anyone may run `update_balance` for any account, so a deposit this
     /// call did not mint may be minted already. The minter's known UTXOs say
     /// so, and the mint's ledger memo names the block.
     async fn minted_by_another_call(&self, account: &Account, txid: &str) -> Result<DepositNotice, String> {
-        let known = self.minter.get_known_utxos(account).await?;
+        let known = match self.minter.get_known_utxos(account).await {
+            Ok(known) => known,
+            Err(error) => return Ok(Self::unanswered("get_known_utxos", error)),
+        };
         let Some(utxo) = known.into_iter().find(|utxo| display_txid(&utxo.outpoint.txid) == txid) else {
             return Ok(DepositNotice::NotYet {
                 reason: format!("the minter does not see deposit {txid} yet"),
             });
         };
-        let block_index = self
-            .mint_block_of(account, &utxo.outpoint.txid)
-            .await?
-            .ok_or_else(|| {
-                format!(
+        let block_index = match self.mint_block_of(account, &utxo.outpoint.txid).await {
+            Ok(Some(block_index)) => block_index,
+            Ok(None) => {
+                return Err(format!(
                     "the minter minted deposit {txid} ({} satoshi) to {account}, but no mint in the last {MINT_SEARCH_WINDOW} ckBTC ledger blocks names it",
                     utxo.value
-                )
-            })?;
+                ));
+            }
+            Err(error) => return Ok(Self::unanswered("the ckBTC ledger", error)),
+        };
         log::info!(
             "[ckbtc bridge] deposit {txid} ({} satoshi) was minted to {account} by another call, in ckBTC block {block_index}",
             utxo.value
@@ -426,7 +438,11 @@ where
         let account = Self::deposit_account(asset, chain, destination)?;
         let txid = parse_txid(receipt)?;
         let paid_by = |outpoint: &OutPoint| display_txid(&outpoint.txid) == txid;
-        let statuses = match self.minter.update_balance(&account).await? {
+        let answer = match self.minter.update_balance(&account).await {
+            Ok(answer) => answer,
+            Err(error) => return Ok(Self::unanswered("update_balance", error)),
+        };
+        let statuses = match answer {
             UpdateBalanceRet::Ok(statuses) => statuses,
             UpdateBalanceRet::Err(UpdateBalanceError::NoNewUtxos {
                 suspended_utxos,
