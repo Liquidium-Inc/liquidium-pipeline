@@ -121,15 +121,22 @@ impl IcpswapFirstPlanner {
                     }
                 }
                 VenuePreviewOutcome::BelowMinimum(reason) => {
+                    let below = format!("{} amount below minimum ({reason})", venue_id.to_uppercase());
                     // The partial gives way when this venue can take the whole
                     // amount; otherwise it stays for a later venue.
-                    if let Some(partial_value) = open_partial.clone() {
-                        let whole = remainder.clone() + partial_value.clone();
-                        if let Ok(whole_slice) = self.venue_slice(input, venue_id, is_last, &whole)
-                            && let VenuePreviewOutcome::Quoted(preview) =
-                                self.preview_cex(input, venue_id, whole_slice.clone()).await?
-                            && (!ceiling_applies || self.is_safe_cex(&preview))
-                        {
+                    let Some(partial_value) = open_partial.clone() else {
+                        refusals.push(Refusal {
+                            reason: below,
+                            permanent: true,
+                        });
+                        continue;
+                    };
+                    let whole = remainder.clone() + partial_value.clone();
+                    match self
+                        .whole_amount_quote(input, venue_id, is_last, &whole, ceiling_applies)
+                        .await?
+                    {
+                        Ok((whole_slice, preview)) => {
                             let given_back = legs.pop();
                             debug_assert!(
                                 given_back
@@ -150,10 +157,11 @@ impl IcpswapFirstPlanner {
                             remainder = whole - whole_slice;
                             continue;
                         }
-                    }
-                    Refusal {
-                        reason: format!("{} amount below minimum ({reason})", venue_id.to_uppercase()),
-                        permanent: true,
+                        // The reason is kept: without it the row reports only the minimum.
+                        Err(whole_refusal) => Refusal {
+                            reason: format!("{below}; its quote for the whole amount failed: {}", whole_refusal.reason),
+                            permanent: whole_refusal.permanent,
+                        },
                     }
                 }
                 VenuePreviewOutcome::Unavailable(error) => Refusal {
@@ -183,6 +191,38 @@ impl IcpswapFirstPlanner {
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(summary));
         }
         Err(IcpswapFirstPlannerError::NoViableRoute(summary))
+    }
+
+    /// The venue's quote for `whole`, when an earlier partial gives way to it,
+    /// or why the venue cannot take it. Only a minimum is a permanent refusal.
+    async fn whole_amount_quote(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        venue_id: &str,
+        is_last: bool,
+        whole: &Nat,
+        ceiling_applies: bool,
+    ) -> Result<Result<(Nat, VenueRoutePreview), Refusal>, IcpswapFirstPlannerError> {
+        let whole_slice = match self.venue_slice(input, venue_id, is_last, whole) {
+            Ok(whole_slice) => whole_slice,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let (reason, permanent) = match self.preview_cex(input, venue_id, whole_slice.clone()).await? {
+            VenuePreviewOutcome::Quoted(preview) if !ceiling_applies || self.is_safe_cex(&preview) => {
+                return Ok(Ok((whole_slice, preview)));
+            }
+            VenuePreviewOutcome::Quoted(preview) => (
+                format!(
+                    "quote impact {:.2} bps exceeds {:.2} bps",
+                    preview.quote.estimated_price_impact_bps, self.config.max_cex_price_impact_bps
+                ),
+                false,
+            ),
+            VenuePreviewOutcome::BelowMinimum(reason) => (format!("below minimum ({reason})"), true),
+            VenuePreviewOutcome::Unavailable(error) => (format!("unavailable ({error})"), false),
+            VenuePreviewOutcome::Invalid(error) => (format!("quote rejected ({error})"), false),
+        };
+        Ok(Err(Refusal { reason, permanent }))
     }
 
     /// The most one order at this venue may carry, in pay units at the oracle
