@@ -1661,6 +1661,46 @@ async fn a_rest_after_the_cap_below_the_next_venue_minimum_gives_that_venue_the_
     );
 }
 
+/// When the next venue cannot quote the whole amount either, the plan fails
+/// with that reason, not only with the minimum. Seen live on row 1808.
+#[tokio::test]
+async fn a_failed_quote_for_the_whole_amount_is_named_in_the_refusal() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let rift = mock_adapter(RIFT_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, RIFT_VENUE_ID, 0.0, 2))
+    });
+    let kraken = PlannerAdapter {
+        minimum_pay: Some(70_000_000),
+        ..mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+            Err("order book read failed".to_string())
+        })
+    };
+    let planner_config = IcpswapFirstPlannerConfig {
+        rift_max_order_usd: 4.0,
+        ..config(0.0)
+    };
+    let planner = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(rift), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid planner");
+
+    let error = planner
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect_err("Kraken cannot quote the whole amount");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("KRAKEN amount below minimum"), "{message}");
+    assert!(
+        message.contains("its quote for the whole amount failed: unavailable (order book read failed)"),
+        "{message}"
+    );
+}
+
 /// A row without a saved price cannot size the cap. Rift then takes nothing,
 /// with no quote, and the next venue carries the amount.
 #[tokio::test]
