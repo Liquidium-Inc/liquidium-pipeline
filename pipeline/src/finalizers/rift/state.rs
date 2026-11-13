@@ -159,8 +159,8 @@ impl RiftState {
     /// on, a minimum refusal cannot end the leg, because the funds are elsewhere.
     pub fn funds_left_trader_account(&self) -> bool {
         match self.step {
-            RiftStep::Order => false,
-            RiftStep::BridgeOut => self.funding_txid.is_some(),
+            // A reorder returns to `Order` with the funding already in the bridge account.
+            RiftStep::Order | RiftStep::BridgeOut => self.funding_txid.is_some(),
             _ => true,
         }
     }

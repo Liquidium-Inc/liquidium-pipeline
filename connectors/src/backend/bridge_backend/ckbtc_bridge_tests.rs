@@ -380,6 +380,45 @@ async fn a_lost_answer_is_found_from_the_certified_history_and_the_ledger_burn()
     assert_eq!(candidates[0].sequence, 9);
 }
 
+/// The minter's memo for a burn to `address`, shaped as the live ledger shows it.
+fn burn_memo(address: &str) -> Memo {
+    let mut memo = vec![0x82, 0x00, 0x83, 0x78, address.len() as u8];
+    memo.extend_from_slice(address.as_bytes());
+    memo.extend_from_slice(&[0xf6, 0xf6]);
+    Memo::from(memo)
+}
+
+/// Two legs can burn the same amount from the same account. The memo names
+/// the Bitcoin address, so a leg never takes the burn of another leg.
+#[tokio::test]
+async fn a_burn_to_another_address_is_not_this_requests_retrieval() {
+    let mut agent = MockPipelineAgent::new();
+    status_entries(&mut agent, true, vec![9, 12]);
+    agent
+        .expect_call_query::<GetTransactionsResponse>()
+        .times(2)
+        .returning(move |_, _, arg| {
+            let start = block_start(&arg);
+            let mut transaction = burn(source(), 100_000);
+            let address = if start == 9 { "bc1qanotherlegsdepositaddress" } else { MAINNET_ADDRESS };
+            transaction.burn.as_mut().unwrap().memo = Some(burn_memo(address));
+            Ok(GetTransactionsResponse {
+                first_index: Nat::from(start),
+                log_length: Nat::from(20u8),
+                transactions: vec![transaction],
+                archived_transactions: Vec::new(),
+            })
+        });
+
+    let candidates = backend(agent, MockIcpBackend::new())
+        .find_submissions(&request(0.001), 5, &[])
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = candidates.iter().map(|c| c.bridge_id.as_str()).collect();
+    assert_eq!(ids, vec!["ckbtc-retrieve:12"]);
+}
+
 /// An old burn lives in the ledger's archive. It is still the proof.
 #[tokio::test]
 async fn an_archived_burn_is_read_from_the_archive() {

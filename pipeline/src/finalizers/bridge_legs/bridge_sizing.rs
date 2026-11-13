@@ -63,14 +63,14 @@ pub async fn ensure_withdrawal_gas(
     bridge: &BridgeRuntime,
     route: &BridgeRouteSpec,
     budget: &BridgeFeeBudget,
-) -> Result<(), String> {
+) -> Result<(), BridgeLegError> {
     let account = bridge.sources.for_chain(route.source_chain)?;
     let fee = budget.provider_fee_budget_native_units.as_ref();
     match withdrawal_gas_shortfall(bridge, route, fee, &account, GAS_MARGIN).await? {
-        Some((held, needed)) => Err(format!(
+        Some((held, needed)) => Err(BridgeLegError::GasShortfall(format!(
             "bridge account {account} holds {held} {BRIDGE_FEE_TOKEN_SYMBOL}, below the {needed} the {} withdrawal needs for gas",
             route.source_asset
-        )),
+        ))),
         None => Ok(()),
     }
 }

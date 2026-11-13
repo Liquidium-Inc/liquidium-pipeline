@@ -38,6 +38,20 @@ pub struct KrakenRouteCheck {
     pub saved_withdrawal_addresses: Vec<String>,
 }
 
+impl KrakenRouteCheck {
+    /// True when a leg can deposit on `network`, by the rule the route check applies.
+    pub fn deposit_usable(&self, network: &str) -> bool {
+        self.deposit
+            .as_ref()
+            .is_ok_and(|deposit| !needs_memo_on_icp(network, deposit.tag.as_deref()))
+    }
+}
+
+/// An ICP transfer cannot carry Kraken's memo, so such a deposit would not be credited.
+fn needs_memo_on_icp(network: &str, tag: Option<&str>) -> bool {
+    network.eq_ignore_ascii_case("ICP") && tag.is_some_and(|tag| !tag.trim().is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct KrakenDepositCheck {
     pub method: String,
@@ -137,9 +151,7 @@ impl KrakenClient {
         let (method, _, tag) = self
             .resolve_deposit(&route.deposit_asset, &route.deposit_network)
             .await?;
-        // An ICP transfer cannot carry Kraken's memo, so the deposit would not be credited.
-        if route.deposit_network.eq_ignore_ascii_case("ICP") && tag.as_deref().is_some_and(|tag| !tag.trim().is_empty())
-        {
+        if needs_memo_on_icp(&route.deposit_network, tag.as_deref()) {
             return Err(FundingRouteError::Unsupported(format!(
                 "Kraken {} deposit on ICP needs a memo that an ICP transfer cannot carry",
                 route.deposit_asset

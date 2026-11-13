@@ -53,28 +53,46 @@ pub async fn check() -> Result<(), String> {
         ("ETH", "ETH", config.bridge_evm_address.clone()),
         ("SOL", "SOL", bridge_solana),
     ];
-    let mut missing = Vec::new();
+    let mut no_deposit = Vec::new();
+    let mut no_withdrawal = Vec::new();
     for (asset, network, destination) in routes {
         println!("== {asset} on {network}");
         let route = client.route_check(asset, network, &destination).await;
-        if !print_route(&route, &destination) {
-            missing.push(format!("{asset}@{network} -> {destination}"));
+        let usable = print_route(&route, network, &destination);
+        if !usable.deposit {
+            no_deposit.push(format!("{asset}@{network}"));
+        }
+        if !usable.withdrawal {
+            no_withdrawal.push(format!("{asset}@{network} -> {destination}"));
         }
     }
 
-    if missing.is_empty() {
+    if no_deposit.is_empty() && no_withdrawal.is_empty() {
         println!("RESULT: every route has a deposit address and a verified withdrawal address");
-    } else {
+    }
+    if !no_deposit.is_empty() {
+        println!("RESULT: Kraken cannot take these deposits, so no leg can pay with them:");
+        for route in no_deposit {
+            println!("  {route}");
+        }
+    }
+    if !no_withdrawal.is_empty() {
         println!("RESULT: these withdrawals need a verified address in the Kraken account:");
-        for route in missing {
+        for route in no_withdrawal {
             println!("  {route}");
         }
     }
     Ok(())
 }
 
-/// Prints one route; returns whether the destination is a verified withdrawal address.
-fn print_route(route: &KrakenRouteCheck, destination: &str) -> bool {
+/// Which sides of one route a leg can use.
+struct RouteUse {
+    deposit: bool,
+    withdrawal: bool,
+}
+
+/// Prints one route; returns which of its sides a leg can use.
+fn print_route(route: &KrakenRouteCheck, network: &str, destination: &str) -> RouteUse {
     match &route.deposit {
         Ok(deposit) => println!(
             "  deposit:    {} min={} address={} memo={}",
@@ -93,7 +111,7 @@ fn print_route(route: &KrakenRouteCheck, destination: &str) -> bool {
         }
     }
     println!("  saved:      {:?}", route.saved_withdrawal_addresses);
-    match &route.withdrawal {
+    let withdrawal = match &route.withdrawal {
         Ok(withdrawal) => {
             println!(
                 "  withdrawal: {} network={} min={}",
@@ -113,5 +131,9 @@ fn print_route(route: &KrakenRouteCheck, destination: &str) -> bool {
             println!("  listed:     {:?}", route.listed_withdrawal_methods);
             false
         }
+    };
+    RouteUse {
+        deposit: route.deposit_usable(network),
+        withdrawal,
     }
 }

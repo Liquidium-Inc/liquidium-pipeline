@@ -43,6 +43,12 @@ pub const MINT_BRIDGE_ID_PREFIX: &str = "ckbtc-mint:";
 const MINT_SEARCH_WINDOW: u64 = 20_000;
 const MINT_SEARCH_CHUNK: u64 = 1_000;
 
+/// True when a minter memo holds `bytes`. The memo is CBOR with an address
+/// or a transaction id as plain bytes inside, so they are searched directly.
+fn memo_holds(memo: &[u8], bytes: &[u8]) -> bool {
+    !bytes.is_empty() && memo.windows(bytes.len()).any(|window| window == bytes)
+}
+
 /// A Bitcoin transaction id as the caller writes it, in the explorer's form.
 /// A Bitcoin transaction id as explorers print it. Anything else cannot
 /// match a deposit, so it is refused rather than waited on.
@@ -228,7 +234,7 @@ where
                         && mint
                             .memo
                             .as_ref()
-                            .is_some_and(|memo| memo.0.windows(txid.len()).any(|window| window == txid))
+                            .is_some_and(|memo| memo_holds(&memo.0, txid))
                 })
             });
             if let Some((index, _)) = found {
@@ -326,10 +332,12 @@ where
         })
     }
 
-    /// The burn the ckBTC ledger recorded at `block_index`, as `(from, amount)`.
-    async fn ledger_burn(&self, block_index: u64) -> Result<Option<(Account, Nat)>, String> {
+    /// The burn the ckBTC ledger recorded at `block_index`, as `(from, amount, memo)`.
+    async fn ledger_burn(&self, block_index: u64) -> Result<Option<(Account, Nat, Option<Vec<u8>>)>, String> {
         let transaction = ledger_transaction(self.minter.agent(), self.ledger, block_index, "ckBTC").await?;
-        Ok(transaction.burn.map(|burn| (burn.from, burn.amount)))
+        Ok(transaction
+            .burn
+            .map(|burn| (burn.from, burn.amount, burn.memo.map(|memo| memo.0.into_vec()))))
     }
 
     fn retrieval_index(bridge_id: &str) -> Result<u64, String> {
@@ -528,8 +536,8 @@ where
     }
 
     /// The minter lists retrievals by burn index only, so the ledger burn
-    /// proves the account and the amount. The burn carries no address; the
-    /// submit lock keeps one open retrieval per source, so that is enough.
+    /// proves the account, the amount and the address: the minter writes the
+    /// Bitcoin address into the burn memo. A burn without a memo stays a candidate.
     async fn find_submissions(
         &self,
         request: &BridgeRequest,
@@ -539,6 +547,10 @@ where
         Self::route_for_request(request)?;
         let source = self.source_account(request)?;
         let amount = Nat::from(Self::satoshi(request.amount)?);
+        let BridgeDestination::BtcAddress(address) = &request.destination else {
+            return Err("a ckBTC retrieval needs a Bitcoin destination".to_string());
+        };
+        let address = address.trim();
         let claimed: HashSet<u64> = claimed_bridge_ids
             .iter()
             .filter_map(|id| Self::retrieval_index(id).ok())
@@ -548,9 +560,10 @@ where
             if entry.block_index <= cursor || claimed.contains(&entry.block_index) {
                 continue;
             }
-            if let Some((from, burned)) = self.ledger_burn(entry.block_index).await?
+            if let Some((from, burned, memo)) = self.ledger_burn(entry.block_index).await?
                 && from == source
                 && burned == amount
+                && memo.is_none_or(|memo| memo_holds(&memo, address.as_bytes()))
             {
                 candidates.push(BridgeSubmissionCandidate {
                     bridge_id: format!("{RETRIEVE_BRIDGE_ID_PREFIX}{}", entry.block_index),

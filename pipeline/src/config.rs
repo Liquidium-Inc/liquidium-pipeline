@@ -1439,6 +1439,7 @@ mod tests {
     }
 
     /// Kraken is opt-in: a config that names it starts with it.
+    #[cfg(not(feature = "simulator"))]
     #[test]
     fn kraken_is_enabled_when_the_config_names_it() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1518,6 +1519,7 @@ mod tests {
             env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc");
             env::remove_var("SIM_MEXC_URL");
             env::remove_var("SIM_ICPSWAP_FACTORY");
+            env::remove_var("SIM_RIFT_URL");
         }
         assert!(parse_enabled_swap_venues_from_env().unwrap().is_empty());
         unsafe {

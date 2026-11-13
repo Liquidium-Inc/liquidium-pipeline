@@ -1,6 +1,7 @@
 //! The amount-scoped preview: the bridge out sized as execution sizes it, a
 //! Rift quote for what arrives, and the bridge back's costs. Nothing moves.
 use candid::Nat;
+use liquidium_pipeline_connectors::backend::amount_utils::amount_to_nat_units_strict;
 use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, BridgeRouteSpec};
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBackend, RiftQuoteRequest};
 use liquidium_pipeline_core::{
@@ -33,6 +34,13 @@ pub(super) fn order_headroom(out: &BridgeRouteSpec, budget: &BridgeFeeBudget) ->
     } else {
         0.0
     }
+}
+
+/// What the bridge delivers for a decimal amount, in the token's units. The
+/// bridge floors, and an order above the delivery by one unit is refunded.
+pub(super) fn delivered_units(token: &ChainToken, amount: f64) -> ChainTokenAmount {
+    let units = amount_to_nat_units_strict(amount, token.decimals()).unwrap_or_else(|_| Nat::from(0u8));
+    ChainTokenAmount::from_raw(token.clone(), units)
 }
 
 /// `amount` less `taken`, or nothing when that leaves nothing to swap.
@@ -114,7 +122,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             .map_err(|error| error.to_string())?;
         let mut side_costs = arrival.sizing.fee_budget.side_costs.clone();
         let pay_token = &pay_amount.token;
-        let expected = ChainTokenAmount::from_formatted(pay_token.clone(), arrival.expected_amount);
+        let expected = delivered_units(pay_token, arrival.expected_amount);
         let arrival_headroom =
             ChainTokenAmount::from_formatted(pay_token.clone(), order_headroom(out, &arrival.sizing.fee_budget));
         let amount_in = net_of(&expected, &arrival_headroom).ok_or("the bridge fees leave nothing for Rift to swap")?;

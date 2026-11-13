@@ -3,12 +3,6 @@
 use super::*;
 use crate::utils::now_ts;
 
-fn deadline_in(secs: i64) -> String {
-    chrono::DateTime::from_timestamp(now_ts() + secs, 0)
-        .expect("timestamp")
-        .to_rfc3339()
-}
-
 #[tokio::test]
 async fn an_order_near_its_deadline_is_dropped_before_any_funding() {
     let finalizer = finalizer(
@@ -24,6 +18,43 @@ async fn an_order_near_its_deadline_is_dropped_before_any_funding() {
     assert!(state.order.is_none());
     assert!(state.quote_id.is_none());
     assert_eq!(state.step, RiftStep::Order, "the next cycle quotes and orders again");
+}
+
+/// A funding transfer without a result may still land. A new order must not
+/// forget it, or the trader account pays twice.
+#[tokio::test]
+async fn an_unsettled_funding_transfer_settles_before_the_deadline_drops_the_order() {
+    let mut sender = MockOutboundSender::new();
+    sender.expect_settle().times(1).returning(|_| SendOutcome::Landed {
+        receipt: "block-9".into(),
+    });
+    let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), sender);
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.order.as_mut().unwrap().deposit_deadline = deadline_in(30 * 60);
+    state.funding = Some(crate::outbound::driver::OutboundRecord {
+        prepared: liquidium_pipeline_core::outbound::PreparedSend {
+            sender: "icp".into(),
+            identity: "funding-1".into(),
+            payload: "{}".into(),
+            replay_safe: false,
+        },
+        phase: crate::outbound::driver::OutboundPhase::Submitted { at: now_ts() },
+        decision: None,
+    });
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.order.is_some(), "the order stays while the transfer settles");
+    assert_eq!(state.funding_txid.as_deref(), Some("block-9"));
+    assert!(state.funds_left_trader_account());
+
+    // The landed funding stays known through the new order.
+    finalizer.advance_current_step(&mut state).await.unwrap();
+
+    assert!(state.order.is_none());
+    assert_eq!(state.step, RiftStep::Order);
+    assert_eq!(state.funding_txid.as_deref(), Some("block-9"));
+    assert!(state.funds_left_trader_account(), "a minimum refusal cannot end the leg now");
 }
 
 #[tokio::test]

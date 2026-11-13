@@ -37,6 +37,16 @@ pub(super) const REFUND_MINT_ACCOUNT: &str = "aaaaa-aa";
 pub(super) const REFUND_BTC_ADDRESS: &str = "bc1qrefundminter";
 pub(super) const DEPOSIT_ADDRESS: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
 
+/// Rift gives an order a week to be funded.
+const ORDER_DEADLINE_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// A deadline relative to now, so no test expires with the calendar.
+pub(super) fn deadline_in(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(crate::utils::now_ts() + secs, 0)
+        .expect("timestamp")
+        .to_rfc3339()
+}
+
 pub(super) fn ckusdc() -> ChainToken {
     ChainToken::Icp {
         ledger: Principal::anonymous(),
@@ -187,7 +197,7 @@ pub(super) fn order(amount_in: &str) -> RiftOrder {
         quote_id: "quote-1".to_string(),
         deposit_address: DEPOSIT_ADDRESS.to_string(),
         amount_in: amount_in.to_string(),
-        deposit_deadline: "2026-11-16T12:00:00Z".to_string(),
+        deposit_deadline: deadline_in(ORDER_DEADLINE_SECS),
         status: RiftOrderStatus::AwaitingDeposit,
     }
 }
@@ -269,7 +279,7 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
             quote_id: "quote-1".to_string(),
             deposit_address: DEPOSIT_ADDRESS.to_string(),
             amount_in: "100".to_string(),
-            deposit_deadline: "2026-11-16T12:00:00Z".to_string(),
+            deposit_deadline: deadline_in(ORDER_DEADLINE_SECS),
             status: None,
             amount_out: None,
             payout_tx: None,

@@ -4,10 +4,8 @@ use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::rift_backend::RiftBackend;
 use log::warn;
 
-use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
-
 use super::{RiftVenueFinalizer, VenueStepError, decimal_text, leg_routes, rift_amount};
-use crate::finalizers::rift::preview::net_of;
+use crate::finalizers::rift::preview::{delivered_units, net_of};
 use crate::{
     finalizers::{
         bridge_legs::{BridgeDestinationProvider, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out},
@@ -48,7 +46,10 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         // Until the minter call is saved, the deposit can still go to a new
         // order. Past that, the saved call names this order's address.
         let call_open = state.bridge_out.deposit_bridge_call.is_none() && state.bridge_out.deposit_bridge_id.is_none();
-        if call_open && secs_until(&order.deposit_deadline)? < DEADLINE_MARGIN_SECS {
+        // A funding transfer without a result may still land. Dropping its
+        // record would send a second one, so it settles before any new order.
+        let funding_unsettled = state.funding.is_some() && state.funding_txid.is_none();
+        if call_open && !funding_unsettled && secs_until(&order.deposit_deadline)? < DEADLINE_MARGIN_SECS {
             warn!(
                 "[rift] liq_id={} order {} deposit deadline {} is too close; a new order follows",
                 state.liq_id, order_id, order.deposit_deadline
@@ -88,7 +89,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 // order is taken for what the bridge delivers now.
                 if funding_phase
                     && let Some(expected) = state.bridge_out.deposit_bridge_expected_amount
-                    && let expected = ChainTokenAmount::from_formatted(state.size_in.token.clone(), expected)
+                    && let expected = delivered_units(&state.size_in.token, expected)
                     && let Some(asks) = net_of(&expected, &state.arrival_headroom)
                     && asks.value != ordered.value
                 {
