@@ -34,11 +34,26 @@ use crate::{
     utils::now_ts,
 };
 
+/// What the receiver itself says about a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// The receiver has the funds.
+    Confirmed,
+    /// The receiver has not seen them, or cannot say.
+    NotConfirmed,
+}
+
 /// Where the bridge delivers. An exchange looks its deposit address up when the
 /// call is saved; Rift knows it from the order.
 #[async_trait]
 pub trait BridgeDestinationProvider: Send + Sync {
     async fn destination(&self) -> Result<String, String>;
+
+    /// The receiver's own word on the delivery. A minter keeps a finished
+    /// withdrawal for a short time only, so a leg that asks late needs a second witness.
+    async fn arrival(&self) -> Arrival {
+        Arrival::NotConfirmed
+    }
 
     /// Refuses, before the funding transfer, an arrival the destination would
     /// not credit. Rift takes any amount its order names.
@@ -110,7 +125,7 @@ pub async fn advance_bridge_out(
         return advance_submission(bridge, state, funding.sent_at_ts, &inputs).await;
     }
 
-    poll(bridge, state, inputs.leg_id).await
+    poll(bridge, state, inputs.leg_id, inputs.destination).await
 }
 
 /// Sizes the funding transfer and saves the bridge amounts it implies. It runs
@@ -390,6 +405,7 @@ async fn poll(
     bridge: &BridgeRuntime,
     state: &mut BridgeOutState,
     leg_id: &str,
+    destination: &dyn BridgeDestinationProvider,
 ) -> Result<BridgeLegOutcome, BridgeLegError> {
     state.deposit_bridge_polled_at_ts = Some(now_ts());
     let bridge_id = state
@@ -400,6 +416,15 @@ async fn poll(
     match status {
         BridgeStatus::Completed => Ok(BridgeLegOutcome::Completed { receipt: None }),
         BridgeStatus::Minted(receipt) => Ok(BridgeLegOutcome::Completed { receipt: Some(receipt) }),
+        // The provider has no record: it never had one, or it dropped a finished
+        // one. The receiver's word settles which.
+        BridgeStatus::Unknown if destination.arrival().await == Arrival::Confirmed => {
+            info!(
+                "[bridge] liq_id={} bridge {} is unknown to the provider and the receiver confirms the delivery",
+                leg_id, bridge_id
+            );
+            Ok(BridgeLegOutcome::Completed { receipt: None })
+        }
         BridgeStatus::Pending | BridgeStatus::Unknown => {
             let stalled = note_bridge_wait(
                 leg_id,

@@ -158,3 +158,47 @@ async fn a_bridge_out_still_pending_past_the_delivery_bound_errors() {
         assert_eq!(state.step, RiftStep::BridgeOut);
     }
 }
+
+/// A leg at the bridge poll whose withdrawal the provider no longer lists,
+/// with Rift reporting the order as `rift_status`.
+async fn poll_a_withdrawal_the_provider_forgot(rift_status: RiftOrderStatus) -> RiftState {
+    use liquidium_pipeline_connectors::backend::bridge_backend::BridgeStatus;
+
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_get_bridge_status()
+        .times(1)
+        .returning(|_| Ok(BridgeStatus::Unknown));
+    let mut rift = MockRiftBackend::new();
+    rift.expect_order_state()
+        .times(1)
+        .returning(move |_| Ok(order_state(rift_status.clone(), None)));
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.funding_txid = Some("block-9".to_string());
+    state.bridge_out.deposit_bridge_id = Some("ckbtc-retrieve:77".to_string());
+    state.bridge_out.deposit_bridge_submitted_at_ts = Some(now_ts() - 60);
+
+    finalizer.advance_current_step(&mut state).await.unwrap();
+    state
+}
+
+/// Live on 2026-11-13: the ckBTC minter read `Unknown` for a withdrawal it
+/// had sent 22 hours before. Rift has the deposit, so the leg moves on.
+#[tokio::test]
+async fn a_withdrawal_the_provider_forgot_completes_when_rift_has_the_deposit() {
+    for status in [RiftOrderStatus::Funded, RiftOrderStatus::Executing, RiftOrderStatus::Delivered] {
+        let state = poll_a_withdrawal_the_provider_forgot(status.clone()).await;
+
+        assert_eq!(state.step, RiftStep::Swap, "{status:?}");
+        assert!(state.order.unwrap().wait_since_ts.is_some());
+    }
+}
+
+/// Without Rift's word the provider's silence proves nothing, so the leg waits as before.
+#[tokio::test]
+async fn a_withdrawal_the_provider_forgot_waits_while_rift_awaits_the_deposit() {
+    let state = poll_a_withdrawal_the_provider_forgot(RiftOrderStatus::AwaitingDeposit).await;
+
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}

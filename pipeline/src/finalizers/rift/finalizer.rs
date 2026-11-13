@@ -62,9 +62,15 @@ pub(super) fn rift_amount(token: &ChainToken, text: &str) -> Result<ChainTokenAm
     let text = text.trim();
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
     let decimals = usize::from(token.decimals());
+    // Checked before the cut: a cut inside a multi-byte character panics.
+    if !whole.bytes().chain(fraction.bytes()).all(|byte| byte.is_ascii_digit()) {
+        return Err(VenueStepError::Other(format!(
+            "Rift amount `{text}` is not a plain decimal"
+        )));
+    }
     let fraction = &fraction[..fraction.len().min(decimals)];
     let digits = format!("{whole}{fraction:0<decimals$}");
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+    if digits.is_empty() {
         return Err(VenueStepError::Other(format!(
             "Rift amount `{text}` is not a plain decimal"
         )));
