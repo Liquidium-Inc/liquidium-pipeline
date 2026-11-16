@@ -66,6 +66,42 @@ async fn a_quote_under_the_planned_floor_is_refused_and_nothing_is_saved() {
 }
 
 #[tokio::test]
+async fn a_quote_that_falls_under_the_floor_after_the_return_fee_is_refused() {
+    let mut rift = MockRiftBackend::new();
+    // 99.2 is above the 99.0 floor; less the 0.3 return fee it is 98.9.
+    rift.expect_quote()
+        .returning(|request| Ok(quote(&request.amount_in, "99.2")));
+    rift.expect_create_order().times(0);
+    let finalizer = finalizer(rift, minter_bridge("USDT", 0.0, 0.3, 0.0), MockOutboundSender::new());
+    let mut state = fresh_state();
+
+    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
+
+    assert!(
+        matches!(error, VenueStepError::Other(ref m) if m.contains("under the planned floor")),
+        "{error}"
+    );
+    assert!(state.quote_id.is_none());
+    assert!(!state.send_saved);
+}
+
+#[tokio::test]
+async fn a_quote_under_the_return_deposit_minimum_is_refused_as_below_minimum() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote()
+        .returning(|request| Ok(quote(&request.amount_in, "99.5")));
+    rift.expect_create_order().times(0);
+    let finalizer = finalizer(rift, minter_bridge("USDT", 0.0, 0.0, 150.0), MockOutboundSender::new());
+    let mut state = fresh_state();
+
+    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, VenueStepError::BelowMinimum(_)), "{error}");
+    assert!(state.quote_id.is_none());
+    assert!(!state.send_saved);
+}
+
+#[tokio::test]
 async fn an_expired_quote_is_dropped_so_the_next_cycle_quotes_again() {
     let mut rift = MockRiftBackend::new();
     rift.expect_create_order()

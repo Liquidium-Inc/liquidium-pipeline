@@ -93,6 +93,22 @@ async fn a_sized_amount_that_drifts_from_the_order_takes_a_new_order_instead_of_
     assert!(!state.send_saved);
 }
 
+#[tokio::test]
+async fn an_arrival_that_leaves_nothing_above_the_headroom_sends_nothing() {
+    let finalizer = finalizer(MockRiftBackend::new(), free_bridge(), landing_sender());
+    let mut state = state_at(RiftStep::BridgeOut);
+    // The bridge sizes 100 today, and the saved headroom is as large.
+    state.arrival_headroom = ChainTokenAmount::from_formatted(ckusdc(), 100.0);
+
+    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, VenueStepError::Other(_)), "{error}");
+    assert!(state.funding.is_none(), "the unsent transfer is dropped");
+    assert!(!state.send_saved);
+    assert!(state.order.is_some(), "the order stays for the next sizing");
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}
+
 /// The headroom is by design, not a drift: the order asks for less than the
 /// bridge delivers.
 #[tokio::test]

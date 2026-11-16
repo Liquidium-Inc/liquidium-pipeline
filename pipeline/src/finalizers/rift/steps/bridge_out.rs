@@ -106,24 +106,33 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 // The funding was just sized. Rift refunds a deposit under the
                 // order amount, so the unsent transfer is dropped and a new
                 // order is taken for what the bridge delivers now.
-                if funding_phase
-                    && let Some(expected) = state.bridge_out.deposit_bridge_expected_amount
-                    && let expected = delivered_units(&state.size_in.token, expected)
-                    && let Some(asks) = net_of(&expected, &state.arrival_headroom)
-                    && asks.value != ordered.value
-                {
-                    warn!(
-                        "[rift] liq_id={} the bridge would deliver {} {} with {} headroom, but order {} expects {}; a new order follows",
-                        state.liq_id,
-                        decimal_text(&expected),
-                        state.pay_symbol,
-                        decimal_text(&state.arrival_headroom),
-                        order_id,
-                        order.amount_in
-                    );
-                    state.amount_in = asks;
-                    state.reorder();
-                    return Ok(());
+                if funding_phase && let Some(expected) = state.bridge_out.deposit_bridge_expected_amount {
+                    let expected = delivered_units(&state.size_in.token, expected);
+                    let Some(asks) = net_of(&expected, &state.arrival_headroom) else {
+                        // A fee spike took the whole arrival. The unsent transfer is
+                        // dropped, and the next cycle sizes the bridge again.
+                        state.funding = None;
+                        return Err(VenueStepError::Other(format!(
+                            "the bridge would deliver {} {}, which leaves nothing above the {} headroom; nothing was sent",
+                            decimal_text(&expected),
+                            state.pay_symbol,
+                            decimal_text(&state.arrival_headroom)
+                        )));
+                    };
+                    if asks.value != ordered.value {
+                        warn!(
+                            "[rift] liq_id={} the bridge would deliver {} {} with {} headroom, but order {} expects {}; a new order follows",
+                            state.liq_id,
+                            decimal_text(&expected),
+                            state.pay_symbol,
+                            decimal_text(&state.arrival_headroom),
+                            order_id,
+                            order.amount_in
+                        );
+                        state.amount_in = asks;
+                        state.reorder();
+                        return Ok(());
+                    }
                 }
                 state.record_side_costs(&side_costs);
                 state.send_saved = true;

@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     finalizers::{
-        bridge_legs::{bridged_deposit_arrival, ensure_return_gas},
+        bridge_legs::{BridgeLegError, bridge_minimum_shortfall, bridged_deposit_arrival, ensure_return_gas},
         multi_venue::RIFT_VENUE_ID,
     },
     swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, amount_after_bps_haircut},
@@ -52,6 +52,45 @@ pub(super) fn net_of(amount: &ChainTokenAmount, taken: &ChainTokenAmount) -> Opt
         amount.token.clone(),
         amount.value.clone() - taken.value.clone(),
     ))
+}
+
+impl<R: RiftBackend> RiftVenueFinalizer<R> {
+    /// What the trader receives for a Rift payout of `delivered`, with the fee
+    /// budget of the leg back. The plan and the order both hold a quote to this.
+    pub(super) async fn net_after_return(
+        &self,
+        back: &BridgeRouteSpec,
+        delivered: &ChainTokenAmount,
+    ) -> Result<(ChainTokenAmount, BridgeFeeBudget), BridgeLegError> {
+        // A payout under the provider's deposit minimum never mints, and Rift
+        // would already have been paid.
+        if let Some((_, minimum)) = bridge_minimum_shortfall(&self.bridge, back, delivered)
+            .await
+            .map_err(BridgeLegError::Other)?
+        {
+            return Err(BridgeLegError::BelowMinimum(format!(
+                "Rift delivers {} {}, under the {minimum} deposit minimum of the leg back",
+                decimal_text(delivered),
+                back.source_asset
+            )));
+        }
+        let budget = self
+            .bridge
+            .backend
+            .get_fee_budget(back.source_asset, back.source_chain, back.target_asset)
+            .await
+            .map_err(|error| BridgeLegError::Other(error.to_string()))?;
+        // The leg back's provider may take a fee out of the payout before it mints.
+        let return_fee =
+            ChainTokenAmount::from_formatted(delivered.token.clone(), budget.destination_fee_budget.max(0.0));
+        let net = net_of(delivered, &return_fee).ok_or_else(|| {
+            BridgeLegError::Other(format!(
+                "the return fee eats what Rift delivers in {}",
+                back.source_asset
+            ))
+        })?;
+        Ok((net, budget))
+    }
 }
 
 /// The one leg of a Rift route: the whole allocation for what Rift pays out.
@@ -141,33 +180,12 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         if delivered.value == 0u8 {
             return Err(format!("Rift quotes nothing for {} {pair}", decimal_text(&amount_in)));
         }
-        // A payout under the provider's deposit minimum never mints, and Rift
-        // would already have been paid.
-        let minimum = self
-            .bridge
-            .backend
-            .get_minimum_bridge_amount(back.source_asset, back.source_chain, back.target_asset)
-            .await
-            .map_err(|error| error.to_string())?;
-        if delivered.to_f64() < minimum {
-            return Err(format!(
-                "Rift delivers {} {}, under the {minimum} deposit minimum of the leg back",
-                decimal_text(&delivered),
-                back.source_asset
-            ));
-        }
-        let budget = self
-            .bridge
-            .backend
-            .get_fee_budget(back.source_asset, back.source_chain, back.target_asset)
+        let (receive_amount, budget) = self
+            .net_after_return(back, &delivered)
             .await
             .map_err(|error| error.to_string())?;
         ensure_return_gas(&self.bridge, back, &budget).await?;
         side_costs.extend(budget.side_costs);
-        // The leg back's provider may take a fee out of the payout before it mints.
-        let return_fee = ChainTokenAmount::from_formatted(final_asset.clone(), budget.destination_fee_budget.max(0.0));
-        let receive_amount = net_of(&delivered, &return_fee)
-            .ok_or_else(|| format!("the return fee eats what Rift delivers for {pair}"))?;
 
         // Rift reports no impact and no fees inside the quote, so its price is
         // the only price: the plan's oracle guard judges it.

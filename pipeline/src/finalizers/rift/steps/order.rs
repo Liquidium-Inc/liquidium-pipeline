@@ -4,7 +4,10 @@ use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBacken
 use log::info;
 
 use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
-use crate::finalizers::rift::state::{RiftOrderRecord, RiftState, RiftStep};
+use crate::finalizers::rift::{
+    finalizer::leg_routes,
+    state::{RiftOrderRecord, RiftState, RiftStep},
+};
 
 impl<R: RiftBackend> RiftVenueFinalizer<R> {
     /// What to quote: the amount the bridge delivers, in Rift's names.
@@ -27,13 +30,16 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let Some(quote_id) = state.quote_id.clone() else {
             let quote = self.backend.quote(&self.quote_request(state)).await?;
             let amount_out = rift_amount(&state.final_asset, &quote.estimated_amount_out)?;
-            // The plan committed to the conservative output. A thinner quote
-            // now would make the leg pay more than the plan allowed.
-            if amount_out.value < state.min_amount_out.value {
+            // The planned floor is what the trader receives after the leg back,
+            // so the fresh quote is held to it after today's return fee.
+            let (_, back) = leg_routes(&state.size_in.token, &state.final_asset)?;
+            let (net_out, _) = self.net_after_return(back, &amount_out).await?;
+            // A thinner quote now would make the leg pay more than the plan allowed.
+            if net_out.value < state.min_amount_out.value {
                 return Err(VenueStepError::Other(format!(
-                    "Rift quote {} pays {} {}, under the planned floor {}",
+                    "Rift quote {} pays {} {} after the return fee, under the planned floor {}",
                     quote.id,
-                    decimal_text(&amount_out),
+                    decimal_text(&net_out),
                     state.receive_symbol,
                     decimal_text(&state.min_amount_out)
                 )));

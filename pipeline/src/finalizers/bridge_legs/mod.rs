@@ -30,8 +30,8 @@ pub use bridge_out::{Arrival, BridgeDestinationProvider, BridgeOutInputs, Fundin
 #[cfg(test)]
 pub use bridge_sizing::reverse_bridge_source_fee_reserve;
 pub use bridge_sizing::{
-    bridged_deposit_arrival, check_bridged_minimum, ensure_return_gas, fee_adjusted_transfer, net_of_withdraw_fee,
-    solana_repayment_bridge_amount,
+    bridge_minimum_shortfall, bridged_deposit_arrival, check_bridged_minimum, ensure_return_gas, fee_adjusted_transfer,
+    net_of_withdraw_fee, solana_repayment_bridge_amount,
 };
 
 /// The asset the ckERC20 and ckETH routes pay their provider fee in.
