@@ -470,15 +470,10 @@ async fn mexc_trade_uses_configured_hop_route_when_direct_unavailable() {
 }
 
 #[tokio::test]
-async fn mexc_trade_reuses_persisted_route_without_reprobing_direct_markets() {
+async fn mexc_trade_never_probes_an_unlisted_direct_market_and_reuses_the_persisted_route() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
 
-    let empty = OrderBook {
-        bids: vec![],
-        asks: vec![],
-        taker_fee_bps: 10.0,
-    };
     let liquid = OrderBook {
         bids: vec![OrderBookLevel {
             price: 1.0,
@@ -491,22 +486,11 @@ async fn mexc_trade_reuses_persisted_route_without_reprobing_direct_markets() {
         taker_fee_bps: 10.0,
     };
 
+    // The direct markets are not in the pair list, so they are never probed.
     backend
         .expect_get_orderbook()
-        .withf(|market, _| market == "BTC_CKUSDT")
-        .times(1)
-        .returning({
-            let empty = empty.clone();
-            move |_, _| Ok(empty.clone())
-        });
-    backend
-        .expect_get_orderbook()
-        .withf(|market, _| market == "CKUSDT_BTC")
-        .times(1)
-        .returning({
-            let empty = empty.clone();
-            move |_, _| Ok(empty.clone())
-        });
+        .withf(|market, _| market == "BTC_CKUSDT" || market == "CKUSDT_BTC")
+        .times(0);
     backend
         .expect_get_orderbook()
         .withf(|market, _| market != "BTC_CKUSDT" && market != "CKUSDT_BTC")

@@ -382,7 +382,7 @@ How config controls this risk:
 For each `deposit_symbol -> withdraw_symbol`, route selection is deterministic:
 
 1. Legacy special override (`CKBTC <-> CKUSDT`) when applicable.
-2. Direct market probe (`A_B` sell, then `B_A` buy fallback).
+2. Direct market probe (`A_B` sell, then `B_A` buy fallback), only for a market in the pair list.
 3. Configured hop search over `CEX_MEXC_AVAILABLE_PAIRS` up to `CEX_MEXC_MAX_HOPS`.
 
 Resolved legs are persisted in CEX state and reused across retries.

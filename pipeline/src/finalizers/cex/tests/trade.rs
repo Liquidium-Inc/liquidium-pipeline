@@ -1440,7 +1440,9 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         .returning(move |_market, _limit| Ok(empty_book.clone()));
     backend.expect_execute_swap_detailed_with_options().times(0);
 
-    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
+    // Both direct markets are listed, so both are probed; their books are empty.
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
+        .with_route_config(vec!["BTC_ETH".to_string(), "ETH_BTC".to_string()], 3);
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");

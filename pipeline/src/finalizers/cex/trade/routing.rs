@@ -39,40 +39,26 @@ where
         let buy_market = format!("{}_{}", withdraw, deposit);
         let mut errors: Vec<String> = Vec::new();
 
-        // Preferred direct path: sell deposit asset into withdraw asset.
-        match self
-            .backend
-            .get_orderbook(&sell_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
-            Ok(orderbook) => {
-                if !orderbook.bids.is_empty() {
-                    return Ok(TradeLeg {
-                        market: sell_market,
-                        side: "sell".to_string(),
-                    });
-                }
-                errors.push(format!("{} has no bids", sell_market));
+        // Sell the deposit asset first; then buy the withdraw asset on the inverse market.
+        for (market, side, book_side) in [(sell_market, "sell", "bids"), (buy_market, "buy", "asks")] {
+            // The pair list is the gate: a market left out of it may not be tradable by API.
+            if !self.is_configured_market(&market) {
+                errors.push(format!("{market} is not a configured pair"));
+                continue;
             }
-            Err(err) => errors.push(format!("{}: {}", sell_market, err)),
-        }
-
-        // Fallback direct path: buy withdraw asset with deposit asset on the inverse market.
-        match self
-            .backend
-            .get_orderbook(&buy_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
-            Ok(orderbook) => {
-                if !orderbook.asks.is_empty() {
-                    return Ok(TradeLeg {
-                        market: buy_market,
-                        side: "buy".to_string(),
-                    });
+            match self.backend.get_orderbook(&market, Some(DEFAULT_ORDERBOOK_LIMIT)).await {
+                Ok(orderbook) => {
+                    let levels = if side == "sell" { &orderbook.bids } else { &orderbook.asks };
+                    if !levels.is_empty() {
+                        return Ok(TradeLeg {
+                            market,
+                            side: side.to_string(),
+                        });
+                    }
+                    errors.push(format!("{market} has no {book_side}"));
                 }
-                errors.push(format!("{} has no asks", buy_market));
+                Err(err) => errors.push(format!("{market}: {err}")),
             }
-            Err(err) => errors.push(format!("{}: {}", buy_market, err)),
         }
 
         Err(format!(
@@ -81,6 +67,20 @@ where
             withdraw,
             errors.join(" | ")
         ))
+    }
+
+    /// Whether the pair list carries `market`. An empty list sets no limit.
+    fn is_configured_market(&self, market: &str) -> bool {
+        self.available_pairs.is_empty() || self.available_pairs.iter().any(|pair| pair == market)
+    }
+
+    /// Shortest route first, then by signature. The fixed order stops the route from churning.
+    fn sort_routes(routes: &mut [Vec<TradeLeg>]) {
+        routes.sort_by(|left, right| {
+            left.len()
+                .cmp(&right.len())
+                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
+        });
     }
 
     fn route_signature(legs: &[TradeLeg]) -> String {
@@ -327,11 +327,7 @@ where
             ));
         }
 
-        candidates.sort_by(|left, right| {
-            left.len()
-                .cmp(&right.len())
-                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
-        });
+        Self::sort_routes(&mut candidates);
 
         let mut errors = Vec::new();
         for candidate in candidates {
@@ -397,11 +393,7 @@ where
         let mut candidates = self.discover_hop_candidates(&deposit, &withdraw, self.max_hops);
         candidates.push(baseline);
         // A stable order breaks ties the same way each time, so the route does not churn.
-        candidates.sort_by(|left, right| {
-            left.len()
-                .cmp(&right.len())
-                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
-        });
+        Self::sort_routes(&mut candidates);
         candidates.dedup_by(|left, right| Self::route_signature(left) == Self::route_signature(right));
         let mut best: Option<(f64, Vec<TradeLeg>)> = None;
         let mut baseline_failure = None;
@@ -511,11 +503,7 @@ where
             ));
         }
 
-        candidates.sort_by(|left, right| {
-            left.len()
-                .cmp(&right.len())
-                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
-        });
+        Self::sort_routes(&mut candidates);
 
         let mut errors = Vec::new();
         for candidate in candidates {
