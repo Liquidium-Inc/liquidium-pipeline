@@ -146,6 +146,24 @@ async fn a_cketh_leg_quotes_ethereum_with_headroom_under_the_expected_arrival() 
     assert_eq!(saved.arrival_headroom.to_f64(), 0.001);
 }
 
+/// The oracle guard judges Rift's price. The fixed return fee is charged
+/// once, in the net quote, and is not also read as a worse price.
+#[tokio::test]
+async fn the_market_output_leaves_the_fixed_return_fee_out() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote()
+        .times(1)
+        .returning(|request| Ok(quote(&request.amount_in, "99.5")));
+    let finalizer = finalizer(rift, minter_bridge("USDT", 0.0, 0.3, 0.0), MockOutboundSender::new());
+
+    let preview = finalizer.preview(&context(), &request(100_010_000)).await.unwrap();
+
+    // 99.5 from Rift less the 0.3 return fee.
+    assert_eq!(preview.quote.receive_amount, Nat::from(99_200_000u64));
+    // The whole 100.01 allocation at Rift's own price of 0.995.
+    assert_eq!(preview.market_receive, Some(Nat::from(99_509_950u64)));
+}
+
 /// Only a minter that takes its fee out of the amount asks for headroom.
 #[test]
 fn only_routes_whose_minter_deducts_its_fee_ask_for_headroom() {

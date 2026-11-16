@@ -190,9 +190,11 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         side_costs.extend(budget.side_costs);
 
         // Rift reports no impact and no fees inside the quote, so its price is
-        // the only price: the plan's oracle guard judges it.
+        // the only price: the plan's oracle guard judges it, before the fixed return fee.
+        let market_price = delivered.to_f64() / amount_in.to_f64();
+        let market_receive =
+            ChainTokenAmount::from_formatted(final_asset.clone(), pay_amount.to_f64() * market_price).value;
         let price = receive_amount.to_f64() / amount_in.to_f64();
-        let market_receive = ChainTokenAmount::from_formatted(final_asset.clone(), pay_amount.to_f64() * price).value;
         let haircut_bps = self
             .quote_route_fee_bps
             .checked_add(self.quote_delay_buffer_bps)
