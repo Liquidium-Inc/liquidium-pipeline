@@ -612,9 +612,8 @@ where
             .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
             .await
             .map_err(PreviewFailure::Venue)?;
-        ensure_return_gas(bridge, route, &budget)
-            .await
-            .map_err(PreviewFailure::Transport)?;
+        // A shortfall refuses this transport; a failed balance read refuses the venue.
+        ensure_return_gas(bridge, route, &budget).await?;
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
             net = solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)

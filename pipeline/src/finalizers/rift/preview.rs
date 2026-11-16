@@ -184,7 +184,9 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             .net_after_return(back, &delivered)
             .await
             .map_err(|error| error.to_string())?;
-        ensure_return_gas(&self.bridge, back, &budget).await?;
+        ensure_return_gas(&self.bridge, back, &budget)
+            .await
+            .map_err(|error| error.to_string())?;
         side_costs.extend(budget.side_costs);
 
         // Rift reports no impact and no fees inside the quote, so its price is

@@ -27,12 +27,13 @@ const GAS_DECIMALS: u8 = 18;
 const GAS_MARGIN: f64 = 1.25;
 
 /// Checks that the bridge wallet holds the gas the return route pays, with a
-/// margin, before any funds commit to it. The send checks again at its price.
+/// margin, before any funds commit to it. Only a real shortfall is
+/// `GasShortfall`; a failed read is `Other`, so an outage refuses no route.
 pub async fn ensure_return_gas(
     bridge: &BridgeRuntime,
     route: &BridgeRouteSpec,
     budget: &BridgeFeeBudget,
-) -> Result<(), String> {
+) -> Result<(), BridgeLegError> {
     if route.route_kind != BridgeRouteKind::CkEthErc20Forward {
         return Ok(());
     }
@@ -48,10 +49,10 @@ pub async fn ensure_return_gas(
     let wallet = bridge.sources.for_chain(route.source_chain)?;
     let held = bridge.backend.get_gas_balance(route.source_chain, &wallet).await?;
     if held < needed {
-        return Err(format!(
+        return Err(BridgeLegError::GasShortfall(format!(
             "bridge wallet {wallet} holds {held} ETH, below the {needed} ETH of gas the {} return needs",
             route.source_asset
-        ));
+        )));
     }
     Ok(())
 }
