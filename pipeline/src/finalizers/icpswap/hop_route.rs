@@ -271,9 +271,11 @@ impl PathQuote {
     /// One quote for the whole path, in the shape the planner reads.
     fn quote(&self, request: &SwapRequest) -> SwapQuote {
         let receive = self.net_output().clone();
-        let pay = request.pay_amount.value.0.to_f64().unwrap_or(0.0);
+        let output_token = self.path.last().expect("a quoted path has an output token").clone();
+        // Human units on both sides: the two tokens can have different decimals.
+        let pay = request.pay_amount.to_f64();
         let exec_price = if pay > 0.0 {
-            receive.0.to_f64().unwrap_or(0.0) / pay
+            ChainTokenAmount::from_raw(output_token, receive.clone()).to_f64() / pay
         } else {
             0.0
         };

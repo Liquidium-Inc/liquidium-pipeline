@@ -288,7 +288,7 @@ MULTI_VENUE_MIN_NET_EDGE_BPS=150
 # Normal-settlement floor after liquidation; -150 allows up to 1.5% shortfall (the default)
 MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
 # Reject a venue quote this far below the oracle-implied output (bps)
-MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
+MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=500
 # How long a price recorded on a receipt may stand in for a live oracle read (seconds)
 MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS=300
 # Additional latency-risk haircut applied to projected edge (bps)

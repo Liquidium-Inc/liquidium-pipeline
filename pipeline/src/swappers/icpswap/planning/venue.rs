@@ -450,10 +450,11 @@ fn common_quote(
     let pay_symbol = plan.amount_in.token.symbol();
     let expected_output = plan.net_expected_output();
     let receive_symbol = expected_output.token.symbol();
-    let all_in_pay = request.pay_amount.value.0.to_f64().unwrap_or(0.0);
-    let pool_pay = plan.amount_in.value.0.to_f64().unwrap_or(0.0);
-    let spot_receive = spot_output.0.to_f64().unwrap_or(0.0);
-    let forwarded_receive = expected_output.value.0.to_f64().unwrap_or(0.0);
+    // Human units on both sides: the two tokens can have different decimals.
+    let all_in_pay = request.pay_amount.to_f64();
+    let pool_pay = plan.amount_in.to_f64();
+    let spot_receive = ChainTokenAmount::from_raw(expected_output.token.clone(), spot_output.clone()).to_f64();
+    let forwarded_receive = expected_output.to_f64();
     let mid_price = if pool_pay > 0.0 { spot_receive / pool_pay } else { 0.0 };
     let exec_price = if all_in_pay > 0.0 {
         forwarded_receive / all_in_pay

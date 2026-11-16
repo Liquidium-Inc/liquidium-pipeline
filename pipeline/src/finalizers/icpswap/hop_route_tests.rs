@@ -363,6 +363,25 @@ async fn a_thin_direct_pool_gives_way_to_the_route_through_icp() {
 }
 
 #[tokio::test]
+async fn the_quoted_price_is_in_human_units_when_decimals_differ() {
+    let harness = harness(thin_direct_pools());
+    let six_decimal_ckbtc = ChainToken::Icp {
+        ledger: ledger(CKBTC_LEDGER_PRINCIPAL),
+        symbol: "ckBTC".to_string(),
+        decimals: 6,
+        fee: Nat::from(LEDGER_FEE),
+    };
+    // PAY is 1.0 of a 6-decimal token; the output token has 8 decimals.
+    let request = request(&six_decimal_ckbtc, &ckusdc());
+
+    let preview = preview(&harness, &request).await;
+
+    let received = ChainTokenAmount::from_raw(ckusdc(), preview.quote.receive_amount.clone()).to_f64();
+    assert!(received < 0.02, "about 0.01 of the output token: {received}");
+    assert!((preview.quote.exec_price - received).abs() < 1e-12);
+}
+
+#[tokio::test]
 async fn a_direct_pool_inside_its_limit_wins_when_it_pays_more() {
     let workflow = ScriptedWorkflow::with_pools(&[
         (&ckbtc(), &ckusdc(), pool(1, 1, 50.0)),
