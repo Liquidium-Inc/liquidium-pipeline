@@ -178,6 +178,10 @@ async fn a_bridge_out_still_pending_past_the_delivery_bound_errors() {
 /// A leg at the bridge poll whose withdrawal the provider no longer lists,
 /// with Rift reporting the order as `rift_status`.
 async fn poll_a_withdrawal_the_provider_forgot(rift_status: RiftOrderStatus) -> RiftState {
+    poll_a_forgotten_withdrawal_with(order_state(rift_status, None)).await
+}
+
+async fn poll_a_forgotten_withdrawal_with(rift_answer: RiftOrderState) -> RiftState {
     use liquidium_pipeline_connectors::backend::bridge_backend::BridgeStatus;
 
     let mut bridge = MockBridgeBackend::new();
@@ -188,7 +192,7 @@ async fn poll_a_withdrawal_the_provider_forgot(rift_status: RiftOrderStatus) -> 
     let mut rift = MockRiftBackend::new();
     rift.expect_order_state()
         .times(1)
-        .returning(move |_| Ok(order_state(rift_status.clone(), None)));
+        .returning(move |_| Ok(rift_answer.clone()));
     let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
     let mut state = state_at(RiftStep::BridgeOut);
     state.funding_txid = Some("block-9".to_string());
@@ -215,6 +219,18 @@ async fn a_withdrawal_the_provider_forgot_completes_when_rift_has_the_deposit() 
 #[tokio::test]
 async fn a_withdrawal_the_provider_forgot_waits_while_rift_awaits_the_deposit() {
     let state = poll_a_withdrawal_the_provider_forgot(RiftOrderStatus::AwaitingDeposit).await;
+
+    assert_eq!(state.step, RiftStep::BridgeOut);
+}
+
+/// The deposit of another order is no proof for this one.
+#[tokio::test]
+async fn a_withdrawal_the_provider_forgot_waits_when_rift_answers_for_another_order() {
+    let state = poll_a_forgotten_withdrawal_with(RiftOrderState {
+        id: "order-2".to_string(),
+        ..order_state(RiftOrderStatus::Funded, None)
+    })
+    .await;
 
     assert_eq!(state.step, RiftStep::BridgeOut);
 }

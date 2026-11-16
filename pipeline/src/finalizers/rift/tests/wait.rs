@@ -24,6 +24,31 @@ async fn wait_with(
 }
 
 #[tokio::test]
+async fn a_status_of_another_order_is_not_saved() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_order_state().times(1).returning(|_| {
+        Ok(RiftOrderState {
+            id: "order-2".to_string(),
+            ..order_state(RiftOrderStatus::Delivered, Some("99.5"))
+        })
+    });
+    let finalizer = finalizer(rift, MockBridgeBackend::new(), MockOutboundSender::new());
+    let mut state = waiting_state(60);
+    let status_before = state.order.as_ref().unwrap().status.clone();
+
+    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
+
+    assert!(
+        matches!(error, VenueStepError::Other(ref m) if m.contains("order-2")),
+        "{error}"
+    );
+    let order = state.order.as_ref().unwrap();
+    assert_eq!(order.status, status_before);
+    assert!(order.amount_out.is_none());
+    assert_eq!(state.step, RiftStep::Swap);
+}
+
+#[tokio::test]
 async fn an_order_that_awaits_its_deposit_waits_within_the_bound() {
     let mut state = waiting_state(60);
     wait_with(RiftOrderStatus::AwaitingDeposit, None, &mut state)

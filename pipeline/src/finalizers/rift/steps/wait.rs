@@ -18,6 +18,13 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let liq_id = state.liq_id.clone();
         let order = state.order.as_mut().ok_or("missing Rift order while waiting")?;
         let answer = self.backend.order_state(&order.id).await?;
+        // A status of another order says nothing about this one, so it is not saved.
+        if answer.id != order.id {
+            return Err(VenueStepError::Other(format!(
+                "Rift answered for order {} when asked for order {}",
+                answer.id, order.id
+            )));
+        }
         order.polled_at_ts = Some(now_ts());
         order.status = Some(answer.status.as_api());
         let waited = waited_secs(&mut order.wait_since_ts);

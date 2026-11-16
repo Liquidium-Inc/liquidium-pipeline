@@ -28,7 +28,22 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             return Ok(());
         }
         let Some(quote_id) = state.quote_id.clone() else {
-            let quote = self.backend.quote(&self.quote_request(state)).await?;
+            let request = self.quote_request(state);
+            let quote = self.backend.quote(&request).await?;
+            // A quote for another pair or amount is not ours. Nothing is saved.
+            let quoted_in = rift_amount(&state.size_in.token, &quote.amount_in)?;
+            if quote.from != request.from || quote.to != request.to || quoted_in.value != state.amount_in.value {
+                return Err(VenueStepError::Other(format!(
+                    "Rift quote {} is for {} {} -> {}, but the request was {} {} -> {}",
+                    quote.id,
+                    quote.amount_in,
+                    quote.from.as_str(),
+                    quote.to.as_str(),
+                    request.amount_in,
+                    request.from.as_str(),
+                    request.to.as_str()
+                )));
+            }
             let amount_out = rift_amount(&state.final_asset, &quote.estimated_amount_out)?;
             // The planned floor is what the trader receives after the leg back,
             // so the fresh quote is held to it after today's return fee.
@@ -77,7 +92,14 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             }
             Err(error) => return Err(error.into()),
         };
-        // The order is never saved, so nothing funds it; it expires unfunded.
+        // An order from another quote, or with no address to pay, is not ours.
+        // It is never saved, so nothing funds it; it expires unfunded.
+        if order.quote_id != quote_id || order.deposit_address.trim().is_empty() {
+            return Err(VenueStepError::Other(format!(
+                "Rift order {} answers quote `{}` with deposit address `{}`, but the request was quote {quote_id}",
+                order.id, order.quote_id, order.deposit_address
+            )));
+        }
         let amount_in = rift_amount(&state.size_in.token, &order.amount_in)?;
         if amount_in.value != state.amount_in.value {
             return Err(VenueStepError::Other(format!(
