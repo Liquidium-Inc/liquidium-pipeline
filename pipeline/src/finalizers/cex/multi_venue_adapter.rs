@@ -23,7 +23,7 @@ use crate::{
     outbound::driver::OperatorDecision,
     persistance::{VenueLegFailure, VenueLegState},
     swappers::model::{SwapExecution, SwapRequest},
-    utils::now_ts,
+    utils::{now_ts, restart_wait},
 };
 
 /// How long a leg keeps re-offering an order that the exchange rejects as not
@@ -237,6 +237,16 @@ where
             ));
         }
         Ok(())
+    }
+
+    /// A release starts every running wait again, or the leg would park again
+    /// at once. A new timed wait in a step must be added here.
+    fn after_release(&self, state: &mut CexState) {
+        restart_wait(&mut state.deposit.deposit_sent_at_ts);
+        restart_wait(&mut state.deposit.bridge.deposit_bridge_submitted_at_ts);
+        restart_wait(&mut state.deposit.deposit_credit_since_ts);
+        restart_wait(&mut state.trade.trade_settlement_waiting_since_ts);
+        restart_wait(&mut state.withdraw.withdraw_accepted_at_ts);
     }
 
     fn questions(&self, state: &CexState) -> Vec<OperatorQuestion> {

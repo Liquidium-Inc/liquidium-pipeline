@@ -70,7 +70,7 @@ async fn mexc_direct_withdraw_parks_when_delivery_never_arrives() {
             internal_id: Some("never-delivered".to_string()),
         })
     });
-    cex.expect_get_withdraw_status_snapshot_by_id().times(2).returning(|_, _| {
+    cex.expect_get_withdraw_status_snapshot_by_id().times(3).returning(|_, _| {
         Ok(WithdrawStatusSnapshot {
             status: WithdrawStatus::Pending,
             txid: None,
@@ -96,6 +96,13 @@ async fn mexc_direct_withdraw_parks_when_delivery_never_arrives() {
     let error = finalizer.withdraw(&mut state).await.unwrap_err();
     assert!(error.to_string().contains("not delivered"), "{error}");
     assert!(matches!(state.step, CexStep::WithdrawPending));
+
+    // An operator release starts the window again. A wait that never started stays unset.
+    use crate::finalizers::multi_venue::VenueLeg;
+    assert!(state.deposit.deposit_credit_since_ts.is_none());
+    finalizer.after_release(&mut state);
+    finalizer.withdraw(&mut state).await.expect("a released row waits again");
+    assert!(state.deposit.deposit_credit_since_ts.is_none());
 }
 
 /// Review finding 8: the exchange returned the funds of a failed or canceled

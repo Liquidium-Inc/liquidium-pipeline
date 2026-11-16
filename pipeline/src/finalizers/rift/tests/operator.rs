@@ -150,22 +150,32 @@ async fn a_refunded_order_takes_its_refund_transaction_and_ends_the_leg() {
 }
 
 #[test]
-fn a_release_while_waiting_for_rift_starts_the_wait_again() {
+fn a_release_starts_every_running_wait_again() {
     let finalizer = finalizer(
         MockRiftBackend::new(),
         MockBridgeBackend::new(),
         MockOutboundSender::new(),
     );
-    let mut state = state_at(RiftStep::Swap);
-    state.order.as_mut().unwrap().wait_since_ts = Some(now_ts() - 7 * 60 * 60);
+    let long_ago = now_ts() - 7 * 60 * 60;
+    let mut state = state_at(RiftStep::BridgeOut);
+    state.funding_sent_at_ts = Some(long_ago);
+    state.bridge_out.deposit_bridge_submitted_at_ts = Some(long_ago);
+    let order = state.order.as_mut().unwrap();
+    order.wait_since_ts = Some(long_ago);
+    // Rift has not delivered, so this wait has not started.
+    order.delivered_at_ts = None;
     let leg = leg_with(&state, true);
 
     let released = finalizer.operator_release(&leg, None).unwrap();
 
-    let since = released
-        .state
-        .pointer("/rift/order/wait_since_ts")
-        .and_then(|v| v.as_i64())
-        .unwrap();
-    assert!(now_ts() - since < 5, "the bounds count from the release");
+    let at = |path: &str| released.state.pointer(path).and_then(|v| v.as_i64());
+    for path in [
+        "/rift/funding_sent_at_ts",
+        "/rift/bridge_out/deposit_bridge_submitted_at_ts",
+        "/rift/order/wait_since_ts",
+    ] {
+        let since = at(path).unwrap_or_else(|| panic!("{path} is saved"));
+        assert!(now_ts() - since < 5, "{path}: the bound counts from the release");
+    }
+    assert_eq!(at("/rift/order/delivered_at_ts"), None, "an unset wait stays unset");
 }

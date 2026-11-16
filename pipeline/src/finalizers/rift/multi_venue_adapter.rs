@@ -20,7 +20,7 @@ use crate::{
     outbound::driver::OperatorDecision,
     persistance::{VenueLegFailure, VenueLegState},
     swappers::model::{SwapExecution, SwapRequest},
-    utils::now_ts,
+    utils::{now_ts, restart_wait},
 };
 
 /// The leg's state plus the persistence gate.
@@ -129,12 +129,14 @@ impl<R: RiftBackend + 'static> VenueLeg for RiftVenueFinalizer<R> {
         self.finish_state(state)
     }
 
-    /// A release while waiting for Rift starts the wait bounds again.
+    /// A release starts every running wait again, or the leg would park again
+    /// at once. A new timed wait in a step must be added here.
     fn after_release(&self, state: &mut RiftState) {
-        if state.step == RiftStep::Swap
-            && let Some(order) = state.order.as_mut()
-        {
-            order.wait_since_ts = Some(now_ts());
+        restart_wait(&mut state.funding_sent_at_ts);
+        restart_wait(&mut state.bridge_out.deposit_bridge_submitted_at_ts);
+        if let Some(order) = state.order.as_mut() {
+            restart_wait(&mut order.wait_since_ts);
+            restart_wait(&mut order.delivered_at_ts);
         }
     }
 
