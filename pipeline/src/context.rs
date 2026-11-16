@@ -32,7 +32,7 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
-use crate::finalizers::icpswap::finalizer::IcpswapFinalizer;
+use crate::finalizers::icpswap::{IcpswapRouteLimits, finalizer::IcpswapFinalizer};
 use crate::finalizers::multi_venue::ICPSWAP_VENUE_ID;
 use crate::swappers::icpswap::{
     client::IcpswapClient, session::IcpswapAgentSessionFactory, types::IcpswapTokenMetadata, venue::IcpswapVenue,
@@ -323,6 +323,8 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 })
                 .collect();
 
+            let route_tokens: Vec<ChainToken> = icpswap_tokens.iter().map(|metadata| metadata.token.clone()).collect();
+
             let icpswap_client = Arc::new(IcpswapClient::new(
                 icp_backend_trader.agent.clone(),
                 icp_backend_trader.clone(),
@@ -352,6 +354,13 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                         subaccount: None,
                     },
                     icpswap_sessions,
+                )
+                .with_routes(
+                    route_tokens,
+                    IcpswapRouteLimits {
+                        direct_bps: config.icpswap_max_price_impact_bps,
+                        route_bps: config.icpswap_max_route_cost_bps,
+                    },
                 )
                 .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
             ))
@@ -559,6 +568,7 @@ mod tests {
                 .expect("principal"),
             icpswap_fee_tiers: vec![candid::Nat::from(500u32), candid::Nat::from(3000u32)],
             icpswap_max_price_impact_bps: 100.0,
+            icpswap_max_route_cost_bps: 300.0,
             icpswap_max_search_iterations: 16,
             icpswap_dust_fallback_max_price_impact_bps: 150.0,
             cex_max_price_impact_bps: 200.0,

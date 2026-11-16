@@ -493,6 +493,8 @@ fn persisted_venue_step(leg: &VenueLegState) -> Option<String> {
         .execution
         .state
         .get("step")
+        // An ICPSwap route over several pools: the step of the swap that runs now.
+        .or_else(|| leg.execution.state.pointer("/current/state/step"))
         .or_else(|| leg.execution.state.pointer("/cex/step"))
         .or_else(|| leg.execution.state.pointer("/rift/step"))?
         .as_str()?;

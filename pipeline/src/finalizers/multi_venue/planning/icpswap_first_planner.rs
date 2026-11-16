@@ -48,6 +48,8 @@ const ORACLE_GUARD_MIN_TEST_ALLOCATION_USD: f64 = 10.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct IcpswapFirstPlannerConfig {
     pub max_price_impact_bps: f64,
+    /// Highest total cost of an ICPSwap route over several pools, in bps.
+    pub max_route_cost_bps: f64,
     pub max_search_iterations: u8,
     pub dust_fallback_max_price_impact_bps: f64,
     /// Highest price impact a CEX leg may carry while another CEX can take the
@@ -109,6 +111,15 @@ impl IcpswapFirstPlannerConfig {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "maximum ICPSwap price impact must be finite and positive".to_string(),
             ));
+        }
+        if !self.max_route_cost_bps.is_finite()
+            || self.max_route_cost_bps < self.max_price_impact_bps
+            || self.max_route_cost_bps > f64::from(BPS_DENOMINATOR)
+        {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "maximum ICPSwap route cost must be between {:.2} and {} bps",
+                self.max_price_impact_bps, BPS_DENOMINATOR
+            )));
         }
         if self.max_search_iterations == 0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
@@ -172,6 +183,7 @@ impl IcpswapFirstPlannerConfig {
         for (cap_name, cap_bps) in [
             ("dust fallback", self.dust_fallback_max_price_impact_bps),
             ("CEX", self.max_cex_price_impact_bps),
+            ("ICPSwap route", self.max_route_cost_bps),
         ] {
             if f64::from(self.max_oracle_discount_bps) <= cap_bps {
                 return Err(IcpswapFirstPlannerError::InvalidInput(format!(
@@ -664,7 +676,8 @@ impl IcpswapFirstPlanner {
         if !self.is_safe_icpswap(&icpswap) {
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
                 "test ICPSwap allocation impact {:.2} bps is not below {:.2} bps",
-                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
+                icpswap.quote.estimated_price_impact_bps,
+                self.icpswap_limit_bps(&icpswap)
             )));
         }
         let mut previews = vec![icpswap];
@@ -712,7 +725,8 @@ impl IcpswapFirstPlanner {
             (_, Err(error)) => format!("{ICPSWAP_VENUE_ID} could not quote the remainder ({error})"),
             (Ok(_), Ok(icpswap)) if !self.is_safe_icpswap(&icpswap) => format!(
                 "{ICPSWAP_VENUE_ID} remainder impact {:.2} bps is not below {:.2} bps",
-                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
+                icpswap.quote.estimated_price_impact_bps,
+                self.icpswap_limit_bps(&icpswap)
             ),
             (Ok(mexc), Ok(icpswap)) => match self.build_state(
                 input,
@@ -942,7 +956,8 @@ impl IcpswapFirstPlanner {
             // report that failure instead of taking the fallback.
             let error = IcpswapFirstPlannerError::NoViableRoute(format!(
                 "exact ICPSwap allocation impact {:.2} bps is not below {:.2} bps",
-                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
+                icpswap.quote.estimated_price_impact_bps,
+                self.icpswap_limit_bps(&icpswap)
             ));
             return self
                 .plan_full_overflow_after_icpswap_failure(input, quoted_at, &error)
@@ -1018,14 +1033,28 @@ impl IcpswapFirstPlanner {
     }
 
     // The threshold is strict: exactly 100 bps is not below a 100 bps limit.
+    /// The limit a quote answers to. A route over several pools has its own,
+    /// because every pool on the way adds its fee and its slippage.
+    fn icpswap_limit_bps(&self, preview: &VenueRoutePreview) -> f64 {
+        if preview.quote.legs.len() > 1 {
+            self.config.max_route_cost_bps
+        } else {
+            self.config.max_price_impact_bps
+        }
+    }
+
     fn is_safe_icpswap(&self, preview: &VenueRoutePreview) -> bool {
-        preview.quote.estimated_price_impact_bps < self.config.max_price_impact_bps
+        preview.quote.estimated_price_impact_bps < self.icpswap_limit_bps(preview)
     }
 
     // This relaxed cap applies only when the overflow remainder cannot meet
     // its venue minimum. "Up to" is inclusive at exactly the configured cap.
     fn is_safe_dust_fallback_icpswap(&self, preview: &VenueRoutePreview) -> bool {
-        preview.quote.estimated_price_impact_bps <= self.config.dust_fallback_max_price_impact_bps
+        preview.quote.estimated_price_impact_bps
+            <= self
+                .config
+                .dust_fallback_max_price_impact_bps
+                .max(self.icpswap_limit_bps(preview))
     }
 
     // Re-quotes one venue for an exact allocation and verifies that its state,

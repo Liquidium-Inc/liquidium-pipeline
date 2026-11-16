@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use super::{
     finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step},
+    hop_route::{IcpswapLegState, release_route, route_questions},
     operator,
 };
 use crate::{
@@ -12,9 +13,8 @@ use crate::{
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::{
         icpswap::{
-            VENUE_ID, ensure_supported_pair,
+            VENUE_ID,
             execution::IcpswapExecutionStateStore,
-            plan::net_forwarded_output,
             types::{IcpswapExecutionState, IcpswapStep},
         },
         model::SwapExecution,
@@ -26,13 +26,16 @@ use async_trait::async_trait;
 /// parent envelope, allowing `advance_loaded` to drive the whole workflow.
 struct CheckpointedLegStateStore<'a> {
     state: Mutex<IcpswapExecutionState>,
+    /// The leg this execution belongs to. A route is saved whole on every persist.
+    leg: IcpswapLegState,
     checkpoint: &'a dyn VenueLegCheckpoint,
 }
 
 impl<'a> CheckpointedLegStateStore<'a> {
-    fn new(state: IcpswapExecutionState, checkpoint: &'a dyn VenueLegCheckpoint) -> Self {
+    fn new(leg: IcpswapLegState, checkpoint: &'a dyn VenueLegCheckpoint) -> Self {
         Self {
-            state: Mutex::new(state),
+            state: Mutex::new(leg.current().clone()),
+            leg,
             checkpoint,
         }
     }
@@ -84,8 +87,10 @@ impl IcpswapExecutionStateStore for CheckpointedLegStateStore<'_> {
         // terminal parent leg without its required aggregate result. If the
         // process crashes first, the preceding pending checkpoint is resumed
         // and reconciled safely.
+        let leg = self.leg.with_current(state.clone());
+        let status = leg.status();
         if matches!(
-            leg_status(state.step),
+            status,
             VenueLegStatus::Completed
                 | VenueLegStatus::Recovered
                 | VenueLegStatus::OperatorRequired
@@ -94,61 +99,52 @@ impl IcpswapExecutionStateStore for CheckpointedLegStateStore<'_> {
             return Ok(());
         }
 
-        self.checkpoint
-            .checkpoint(VenueLegProgress {
-                execution: VenueExecutionState::new(VENUE_ID, state)?,
-                status: leg_status(state.step),
-                result: None,
-                last_error: state.last_error.clone(),
-                retryable_error: None,
-                failure: None,
-            })
-            .await
+        self.checkpoint.checkpoint(running_progress(&leg)?).await
     }
 }
 
-/// Projects ICPSwap's detailed state machine onto the generic leg lifecycle.
-fn leg_status(step: IcpswapStep) -> VenueLegStatus {
-    match step {
-        IcpswapStep::Completed => VenueLegStatus::Completed,
-        IcpswapStep::Refunded => VenueLegStatus::Recovered,
-        // Each execution has its own signer and pool account. Ambiguous custody
-        // can therefore remain parked for an operator without blocking later
-        // ICPSwap liquidations.
-        IcpswapStep::OperatorRequired => VenueLegStatus::OperatorRequired,
-        IcpswapStep::Failed => VenueLegStatus::FailedPermanent,
-        _ => VenueLegStatus::Running,
-    }
+/// The checkpoint of a leg that still runs: its state, with no result yet.
+fn running_progress(leg: &IcpswapLegState) -> Result<VenueLegProgress, String> {
+    Ok(VenueLegProgress {
+        execution: leg.encode()?,
+        status: leg.status(),
+        result: None,
+        last_error: leg.current().last_error.clone(),
+        retryable_error: None,
+        failure: None,
+    })
 }
 
 impl IcpswapFinalizer {
     /// Decodes only this leg and rejects accidental cross-venue dispatch.
-    fn decode_leg_state(&self, leg: &VenueLegState) -> Result<IcpswapExecutionState, String> {
+    fn decode_leg_state(&self, leg: &VenueLegState) -> Result<IcpswapLegState, String> {
         if leg.venue_id != VENUE_ID {
             return Err(format!("ICPSwap adapter cannot advance venue `{}`", leg.venue_id));
         }
-        leg.execution
-            .decode::<IcpswapExecutionState>(VENUE_ID)?
-            .ok_or_else(|| "ICPSwap leg execution state decoded to the wrong venue".to_string())
+        IcpswapLegState::decode(&leg.execution)
     }
 
-    /// Packages the updated ICPSwap state for parent persistence and creates a
-    /// result only after the leg itself has reached `Completed`.
+    /// Packages the updated leg for parent persistence and creates a result
+    /// only after the leg itself has reached `Completed`.
     async fn progress_for(
         &self,
         leg: &VenueLegState,
-        state: IcpswapExecutionState,
+        state: IcpswapLegState,
         advance_error: Option<String>,
     ) -> Result<VenueLegProgress, String> {
-        let status = leg_status(state.step);
-        let result: Option<SwapExecution> = if state.step == IcpswapStep::Completed {
-            Some(self.workflow.finish(&leg.request, &state, (self.clock)()).await?)
+        let status = state.status();
+        let result: Option<SwapExecution> = if status == VenueLegStatus::Completed {
+            let now_nanos = (self.clock)();
+            Some(match &state {
+                IcpswapLegState::Single(single) => self.workflow.finish(&leg.request, single, now_nanos).await?,
+                IcpswapLegState::Route(route) => self.route_result(&leg.request, route, now_nanos).await?,
+            })
         } else {
             None
         };
-        let last_error = advance_error.clone().or_else(|| state.last_error.clone());
+        let last_error = advance_error.clone().or_else(|| state.last_error());
         Ok(VenueLegProgress {
-            execution: VenueExecutionState::new(VENUE_ID, &state)?,
+            execution: state.encode()?,
             status,
             result,
             last_error,
@@ -157,26 +153,26 @@ impl IcpswapFinalizer {
         })
     }
 
-    /// Drives this leg through all immediately runnable ICPSwap phases. The
-    /// workflow persists prepared intent state through the narrow checkpoint
-    /// before every external side effect and stops on delay, error, or terminal
-    /// state so the next daemon tick can resume safely.
-    async fn advance_leg(
+    /// Drives the leg's current execution through all immediately runnable
+    /// ICPSwap phases. The workflow persists prepared intent state through the
+    /// narrow checkpoint before every external side effect and stops on delay,
+    /// error, or terminal state so the next daemon tick can resume safely.
+    async fn advance_current(
         &self,
-        leg: &VenueLegState,
+        leg: IcpswapLegState,
         checkpoint: &dyn VenueLegCheckpoint,
-    ) -> Result<VenueLegProgress, String> {
-        let mut state = self.decode_leg_state(leg)?;
+    ) -> Result<(IcpswapLegState, Option<String>), String> {
+        let mut state = leg.current().clone();
         let execution_id = state.execution_id.clone();
 
         let now_nanos = (self.clock)();
-        if state.next_attempt_at_nanos.is_some_and(|ready_at| now_nanos < ready_at) {
+        if is_terminal_step(state.step) || state.next_attempt_at_nanos.is_some_and(|ready_at| now_nanos < ready_at) {
             self.notify_operator_required(&execution_id, &state).await;
-            return self.progress_for(leg, state, None).await;
+            return Ok((leg, None));
         }
 
         state.next_attempt_at_nanos = None;
-        let store = CheckpointedLegStateStore::new(state.clone(), checkpoint);
+        let store = CheckpointedLegStateStore::new(leg.with_current(state.clone()), checkpoint);
         // Opening the session re-derives the signer from the configured
         // mnemonic and verifies it against the persisted descriptor before any
         // identity-bound ICPSwap call is made.
@@ -192,7 +188,40 @@ impl IcpswapFinalizer {
             store.persist(&execution_id, &state).await?;
         }
         self.notify_operator_required(&execution_id, &state).await;
-        self.progress_for(leg, state, advance_error).await
+        Ok((leg.with_current(state), advance_error))
+    }
+
+    /// Advances the leg. A route also plans each next step as soon as the
+    /// step before it has paid, so one call can cross several pools.
+    async fn advance_leg(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        let mut state = self.decode_leg_state(leg)?;
+        loop {
+            if let IcpswapLegState::Route(route) = &state
+                && route.parked.is_some()
+            {
+                self.notify_route_parked(route).await;
+                return self.progress_for(leg, state, None).await;
+            }
+            let (advanced, advance_error) = self.advance_current(state, checkpoint).await?;
+            state = advanced;
+            let IcpswapLegState::Route(route) = &mut state else {
+                return self.progress_for(leg, state, advance_error).await;
+            };
+            let step_paid = advance_error.is_none() && route.current.state.step == IcpswapStep::Completed;
+            if !step_paid || route.is_last_step() {
+                return self.progress_for(leg, state, advance_error).await;
+            }
+            if !self.plan_next_step(route, (self.clock)()).await {
+                self.notify_route_parked(route).await;
+                return self.progress_for(leg, state, None).await;
+            }
+            // Save the new step before its first side effect.
+            checkpoint.checkpoint(running_progress(&state)?).await?;
+        }
     }
 }
 
@@ -209,35 +238,10 @@ impl MultiVenueAdapter for IcpswapFinalizer {
     ) -> Result<VenueRoutePreview, String> {
         // Re-checked at the execution adapter boundary so a future planner or
         // forced-venue caller cannot bypass the venue policy.
-        ensure_supported_pair(request)?;
         if self.trader.subaccount.is_some() {
             return Err("ICPSwap requires the trader's default ledger account".to_string());
         }
-        let preview = self
-            .workflow
-            .preview_route(request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let conservative_value = net_forwarded_output(
-            &preview.route.amount_out_minimum.value,
-            &preview.route.output_ledger_fee.value,
-        )
-        .map_err(|error| error.to_string())?;
-        let conservative_receive = liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount::from_raw(
-            preview.route.gross_quoted_out.token.clone(),
-            conservative_value,
-        );
-        // The selected preview is persisted before execution, so its generated
-        // ID becomes the durable idempotency key used for every later advance.
-        let execution_id = crate::utils::new_venue_execution_id(VENUE_ID);
-        let state = self.prepare_execution_state(&execution_id, &context.liquidation_id, request, preview.route)?;
-        Ok(VenueRoutePreview::new(
-            VENUE_ID,
-            request.clone(),
-            preview.quote,
-            conservative_receive,
-            VenueExecutionState::new(VENUE_ID, &state)?,
-        ))
+        self.preview_paths(context, request).await
     }
 
     async fn advance(
@@ -249,7 +253,13 @@ impl MultiVenueAdapter for IcpswapFinalizer {
     }
 
     fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
-        operator::operator_questions(&self.decode_leg_state(leg)?)
+        let state = self.decode_leg_state(leg)?;
+        if let IcpswapLegState::Route(route) = &state
+            && let Some(questions) = route_questions(route)
+        {
+            return Ok(questions);
+        }
+        operator::operator_questions(state.current())
     }
 
     fn operator_release(
@@ -258,8 +268,12 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         answer: Option<&OperatorDecision>,
     ) -> Result<VenueExecutionState, String> {
         let mut state = self.decode_leg_state(leg)?;
-        operator::release(&mut state, answer)?;
-        VenueExecutionState::new(VENUE_ID, &state)
+        match &mut state {
+            IcpswapLegState::Route(route) if route.parked.is_some() => release_route(route, answer)?,
+            IcpswapLegState::Route(route) => operator::release(&mut route.current.state, answer)?,
+            IcpswapLegState::Single(single) => operator::release(single, answer)?,
+        }
+        state.encode()
     }
 
     async fn recover(
@@ -268,15 +282,16 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
         let state = self.decode_leg_state(leg)?;
+        let step = state.current().step;
         if !matches!(
-            state.step,
+            step,
             IcpswapStep::Recover
                 | IcpswapStep::RecoverPending
                 | IcpswapStep::OperatorRequired
                 | IcpswapStep::Refunded
                 | IcpswapStep::Failed
         ) {
-            return Err(format!("ICPSwap leg at {:?} is not in recovery", state.step));
+            return Err(format!("ICPSwap leg at {step:?} is not in recovery"));
         }
         self.advance_leg(leg, checkpoint).await
     }

@@ -238,6 +238,10 @@ ICPSWAP_TEST_ALLOCATION_USD=1
 MEXC_TEST_ALLOCATION_USD=10
 # Allow full ICPSwap up to 1.5% impact only when the CEX remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
+# Highest total cost (slippage plus pool fees) of an ICPSwap route over several
+# pools. One pool keeps ICPSWAP_MAX_PRICE_IMPACT_BPS. Must stay below
+# MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS. Default 300 = 3%.
+ICPSWAP_MAX_ROUTE_COST_BPS=300
 # A CEX transport above this impact is not sound: a listed asset then moves
 # through the bridge instead of its direct ck market. With Kraken enabled, a
 # MEXC leg above it also overflows to Kraken.
@@ -413,7 +417,7 @@ Route summary metrics are updated from slice notional, and weighted slippage is 
 
 **Supported venues:**
 
-- `icpswap` — native ICP input only.
+- `icpswap` — ICP, ckUSDC, ckUSDT, ckBTC and ckETH. A swap uses one pool, or a route of up to three pools through ICP and ckUSDC when that pays more or the direct pool is thin. The pool list is `SUPPORTED_PAIRS` in `swappers/icpswap/planning/venue_policy.rs`; ckUSDT/ckBTC and ckUSDT/ckETH have no usable pool and trade only along a route.
 - `mexc` — requires `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET` when enabled.
 - Venue IDs are ordered, comma-separated, and validated at startup. `SWAPPER` is obsolete and ignored.
 

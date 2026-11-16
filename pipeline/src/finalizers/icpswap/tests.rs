@@ -60,8 +60,8 @@ impl VenueLegCheckpoint for NoopCheckpoint {
 }
 
 #[derive(Clone, Default)]
-struct RecordingCheckpoint {
-    progresses: Arc<Mutex<Vec<VenueLegProgress>>>,
+pub(super) struct RecordingCheckpoint {
+    pub(super) progresses: Arc<Mutex<Vec<VenueLegProgress>>>,
 }
 
 #[async_trait]
@@ -76,24 +76,24 @@ fn p(id: u8) -> Principal {
     Principal::from_slice(&[id])
 }
 
-fn trader() -> Account {
+pub(super) fn trader() -> Account {
     Account {
         owner: p(4),
         subaccount: None,
     }
 }
 
-fn receiver() -> Account {
+pub(super) fn receiver() -> Account {
     Account {
         owner: p(5),
         subaccount: None,
     }
 }
 
-const TEST_MNEMONIC: &str =
+pub(super) const TEST_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
-fn planning_context() -> VenuePlanningContext {
+pub(super) fn planning_context() -> VenuePlanningContext {
     VenuePlanningContext {
         liquidation_id: "42".to_string(),
     }
@@ -207,9 +207,9 @@ fn receipt() -> ExecutionReceipt {
     }
 }
 
-struct TestIcpswapClient {
-    manual: MockIcpswapManualClient,
-    preview: Option<IcpswapRoutePreview>,
+pub(super) struct TestIcpswapClient {
+    pub(super) manual: MockIcpswapManualClient,
+    pub(super) preview: Option<IcpswapRoutePreview>,
 }
 
 #[derive(Default)]
@@ -337,8 +337,8 @@ impl IcpBackend for TestIcpswapClient {
     }
 }
 
-struct TestSessionFactory {
-    client: Arc<TestIcpswapClient>,
+pub(super) struct TestSessionFactory {
+    pub(super) client: Arc<TestIcpswapClient>,
 }
 
 impl IcpswapExecutionSessionFactory for TestSessionFactory {
@@ -511,7 +511,7 @@ async fn multi_venue_preview_rejects_unsupported_pair_at_adapter_boundary() {
         .await
         .expect_err("unsupported IC token pair must be rejected");
 
-    assert!(error.contains("only supports canonical ICP <-> ckUSDC"));
+    assert!(error.contains("ICPSwap does not list the pair"));
 }
 
 #[tokio::test]
@@ -672,7 +672,7 @@ async fn multi_venue_preview_rejects_non_icp_chain_tokens_at_adapter_boundary() 
         .await
         .expect_err("a non-ICP chain token must be rejected before any client call");
 
-    assert!(error.contains("only supports canonical ICP <-> ckUSDC"));
+    assert!(error.contains("ICPSwap does not list the pair"));
 }
 
 #[tokio::test]

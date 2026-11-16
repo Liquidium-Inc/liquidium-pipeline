@@ -8,7 +8,7 @@ use liquidium_pipeline_core::tokens::{
 };
 use num_traits::ToPrimitive;
 
-use crate::swappers::icpswap::supports_pair;
+use crate::swappers::icpswap::ensure_direct_pair;
 use crate::swappers::{
     model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, adverse_price_impact_bps},
     venue::SwapVenue,
@@ -204,7 +204,7 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             return Err(IcpswapQuoteError::PayAssetMismatch);
         }
 
-        validate_supported_pair(request)?;
+        ensure_direct_pair(request)?;
 
         let input = self
             .tokens
@@ -515,17 +515,6 @@ fn quoted_price_impact_bps(spot_output: &Nat, gross_quote: &Nat) -> f64 {
         spot_output.0.to_f64().unwrap_or(f64::INFINITY),
         gross_quote.0.to_f64().unwrap_or(0.0),
     )
-}
-
-fn validate_supported_pair(request: &SwapRequest) -> Result<(), IcpswapQuoteError> {
-    if supports_pair(&request.pay_amount.token, &request.receive_asset) {
-        Ok(())
-    } else {
-        Err(IcpswapQuoteError::UnsupportedPair {
-            pay_asset: request.pay_asset.to_string(),
-            receive_asset: request.receive_asset.to_string(),
-        })
-    }
 }
 
 /// Converts the total allocation into the amount sent through the pool after

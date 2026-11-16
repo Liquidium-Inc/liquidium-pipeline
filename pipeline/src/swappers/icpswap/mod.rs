@@ -28,7 +28,7 @@ pub mod venue;
 mod venue_policy;
 
 pub use venue_policy::VENUE_ID;
-pub(crate) use venue_policy::{ensure_supported_pair, supports_pair};
+pub(crate) use venue_policy::{ensure_direct_pair, listed_paths, supports_pair, unsupported_pair};
 
 #[cfg(test)]
 #[path = "tests/ledger_transfers.rs"]

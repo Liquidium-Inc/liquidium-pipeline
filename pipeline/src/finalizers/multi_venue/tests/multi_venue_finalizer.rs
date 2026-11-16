@@ -746,6 +746,7 @@ fn execution_for(leg: &VenueLegState) -> SwapExecution {
 fn planner_config() -> IcpswapFirstPlannerConfig {
     IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
+        max_route_cost_bps: 200.0,
         max_search_iterations: 16,
         dust_fallback_max_price_impact_bps: 150.0,
         max_cex_price_impact_bps: 200.0,

@@ -1004,6 +1004,7 @@ mod tests {
                 .expect("principal"),
             icpswap_fee_tiers: vec![Nat::from(500u32), Nat::from(3000u32)],
             icpswap_max_price_impact_bps: 100.0,
+            icpswap_max_route_cost_bps: 300.0,
             icpswap_max_search_iterations: 16,
             icpswap_dust_fallback_max_price_impact_bps: 150.0,
             cex_max_price_impact_bps: 200.0,
