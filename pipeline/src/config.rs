@@ -383,7 +383,7 @@ impl Config {
         let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
         let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
-        let rift_api_url = parse_rift_api_url_from_env();
+        let rift_api_url = parse_rift_api_url_from_env()?;
         let rift_max_order_usd = parse_rift_max_order_usd_from_env()?;
         let rift_venue_allowlist = parse_name_list_from_env("RIFT_VENUE_ALLOWLIST");
         let rift_venue_blocklist = parse_name_list_from_env("RIFT_VENUE_BLOCKLIST");
@@ -737,11 +737,11 @@ fn parse_slippage_bps(name: &str, trimmed: &str) -> Result<u32, String> {
 }
 
 /// The simulator's Rift mock replaces the real API when it is configured.
-fn parse_rift_api_url_from_env() -> String {
-    if let Some(url) = crate::simulator::rift_url() {
-        return url;
+fn parse_rift_api_url_from_env() -> Result<String, String> {
+    if let Some(url) = crate::simulator::rift_url()? {
+        return Ok(url);
     }
-    env::var("RIFT_API_URL").unwrap_or_else(|_| DEFAULT_RIFT_API_URL.to_string())
+    Ok(env::var("RIFT_API_URL").unwrap_or_else(|_| DEFAULT_RIFT_API_URL.to_string()))
 }
 
 /// A canister id from `name`; blank or unset means the default.

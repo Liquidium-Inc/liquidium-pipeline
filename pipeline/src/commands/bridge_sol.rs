@@ -519,9 +519,13 @@ pub async fn submit(
     // A SOL transfer that the minter has not queued is never swept.
     if let Some(signature) = cksol_transfer_without_deposit_id(&submission.bridge_id) {
         match notify_until_queued(&backend, &destination, &signature, DEPOSIT_NOTICE_DELAY).await {
-            Some(queued) => submission = queued,
-            None => println!(
+            Ok(queued) => submission = queued,
+            Err(NotQueued::NoAnswer) => println!(
                 "SOL transfer {signature} landed, but the minter did not queue it; call deposit_sol for {destination:?} before another transfer"
+            ),
+            // Another notice cannot clear a hold. Only the minter's operators can.
+            Err(NotQueued::Held(reason)) => println!(
+                "SOL transfer {signature} landed, and the minter holds the deposit: {reason}. Do not send another transfer; the hold must be cleared at the minter"
             ),
         }
     }
@@ -542,28 +546,34 @@ pub async fn submit(
     Ok(())
 }
 
+/// Why the minter did not queue a deposit that landed.
+#[derive(Debug)]
+enum NotQueued {
+    /// The minter holds the deposit. A new notice does not change that.
+    Held(String),
+    /// Every notice was refused or lost. A later notice can still work.
+    NoAnswer,
+}
+
 /// Sends the ckSOL deposit notice again until the minter queues the deposit.
 async fn notify_until_queued(
     backend: &impl BridgeBackend,
     destination: &BridgeDestination,
     signature: &str,
     delay: Duration,
-) -> Option<BridgeSubmission> {
+) -> Result<BridgeSubmission, NotQueued> {
     for attempt in 1..=DEPOSIT_NOTICE_ATTEMPTS {
         tokio::time::sleep(delay).await;
         match backend.track_deposit("SOL", "SOL", destination, "", signature).await {
-            Ok(DepositNotice::Accepted(submission)) => return Some(submission),
+            Ok(DepositNotice::Accepted(submission)) => return Ok(submission),
             Ok(DepositNotice::NotYet { reason }) => {
                 println!("Deposit not queued yet ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {reason}")
             }
-            Ok(DepositNotice::Held { reason }) => {
-                println!("Deposit held by the minter: {reason}");
-                return None;
-            }
+            Ok(DepositNotice::Held { reason }) => return Err(NotQueued::Held(reason)),
             Err(error) => println!("Deposit notice failed ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {error}"),
         }
     }
-    None
+    Err(NotQueued::NoAnswer)
 }
 
 pub async fn status(bridge_id: &str) -> Result<(), String> {
@@ -792,8 +802,33 @@ mod tests {
         let queued = super::notify_until_queued(&backend, &destination, "sig-1", super::Duration::ZERO).await;
 
         assert_eq!(
-            queued.map(|submission| submission.bridge_id),
+            queued.ok().map(|submission| submission.bridge_id),
             Some("queued".to_string())
+        );
+    }
+
+    /// A hold is not a missing notice: one answer ends the notices.
+    #[tokio::test]
+    async fn a_held_deposit_stops_the_notices_and_is_named_as_held() {
+        use liquidium_pipeline_connectors::backend::bridge_backend::{
+            BridgeDestination, DepositNotice, MockBridgeBackend,
+        };
+        let mut backend = MockBridgeBackend::new();
+        backend.expect_track_deposit().times(1).returning(|_, _, _, _, _| {
+            Ok(DepositNotice::Held {
+                reason: "quarantined".into(),
+            })
+        });
+        let destination = BridgeDestination::IcpAccount(icrc_ledger_types::icrc1::account::Account {
+            owner: Principal::anonymous(),
+            subaccount: None,
+        });
+
+        let held = super::notify_until_queued(&backend, &destination, "sig-1", super::Duration::ZERO).await;
+
+        assert!(
+            matches!(held, Err(super::NotQueued::Held(ref reason)) if reason == "quarantined"),
+            "{held:?}"
         );
     }
     #[test]

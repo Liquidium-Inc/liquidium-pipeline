@@ -24,6 +24,36 @@ use crate::{
 /// Bridges take minutes and Rift serves one request a second without a key.
 const CYCLE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Failed cycles in a row before the run stops. The daemon's retry budget
+/// does not run here, so without a bound a broken step would loop for ever.
+const MAX_FAILED_CYCLES: u32 = 20;
+
+/// One run for each leg file. Two runs on one file could each send the funds.
+struct RunLock(PathBuf);
+
+impl RunLock {
+    fn acquire(leg_path: &std::path::Path) -> Result<Self, String> {
+        let path = leg_path.with_extension("lock");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "{} exists or cannot be made ({error}): another run holds this leg. Delete it only if no run is active",
+                    path.display()
+                )
+            })?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// The leg on disk. Every cycle and every saved send rewrites it.
 struct LegFile {
     path: PathBuf,
@@ -31,9 +61,19 @@ struct LegFile {
 }
 
 impl LegFile {
+    /// Writes a new file and renames it over the old one, so a crash during
+    /// the write never leaves half a leg.
     fn save(path: &PathBuf, leg: &VenueLegState) -> Result<(), String> {
+        use std::io::Write;
         let json = serde_json::to_string_pretty(leg).map_err(|error| error.to_string())?;
-        std::fs::write(path, json).map_err(|error| format!("could not write {}: {error}", path.display()))
+        let temporary = path.with_extension("tmp");
+        let write = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)
+        };
+        write().map_err(|error| format!("could not write {}: {error}", path.display()))
     }
 
     fn load(path: &PathBuf) -> Result<VenueLegState, String> {
@@ -154,8 +194,9 @@ pub async fn check(
     let finalizer = build_rift_finalizer(&ctx, bridge)?;
     let answer = answer.as_deref().map(parse_answer).transpose()?;
 
-    let (path, leg) = match resume {
+    let (path, leg, _lock) = match resume {
         Some(path) => {
+            let lock = RunLock::acquire(&path)?;
             let mut leg = LegFile::load(&path)?;
             println!("resumed {}: {}", path.display(), describe(&leg));
             if leg.status == VenueLegStatus::OperatorRequired {
@@ -169,7 +210,7 @@ pub async fn check(
                 LegFile::save(&path, &leg)?;
                 println!("released");
             }
-            (path, leg)
+            (path, leg, lock)
         }
         None => {
             let pay = pay.ok_or("--pay is required to start a leg")?;
@@ -241,13 +282,14 @@ pub async fn check(
                 failure: None,
             };
             let path = PathBuf::from(format!("{id}.json"));
+            let lock = RunLock::acquire(&path)?;
             LegFile::save(&path, &leg)?;
             println!(
                 "leg saved to {}; resume with --resume {}",
                 path.display(),
                 path.display()
             );
-            (path, leg)
+            (path, leg, lock)
         }
     };
 
@@ -258,10 +300,16 @@ pub async fn check(
     let started = now_ts();
     // When each step began, for the summary. A resumed run times from here.
     let mut timeline: Vec<(String, i64)> = vec![(step_of(&*file.leg.lock().await), started)];
+    let mut failed_cycles = 0;
     loop {
         let leg = file.leg.lock().await.clone();
         let progress = finalizer.advance(&leg, &file).await?;
         file.apply(&progress).await?;
+        failed_cycles = if progress.retryable_error.is_some() {
+            failed_cycles + 1
+        } else {
+            0
+        };
         let leg = file.leg.lock().await.clone();
         let now = now_ts();
         let step = step_of(&leg);
@@ -300,6 +348,13 @@ pub async fn check(
                     file.path.display()
                 ));
             }
+            _ if failed_cycles >= MAX_FAILED_CYCLES => {
+                return Err(format!(
+                    "the step failed {failed_cycles} times in a row: {}. The leg is saved; rerun with --resume {}",
+                    progress.retryable_error.unwrap_or_default(),
+                    file.path.display()
+                ));
+            }
             _ => tokio::time::sleep(CYCLE_INTERVAL).await,
         }
     }
@@ -308,6 +363,19 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::parse_answer;
+
+    #[test]
+    fn a_second_run_on_the_same_leg_file_is_refused_until_the_first_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let leg_path = dir.path().join("rift-check-1.json");
+
+        let first = super::RunLock::acquire(&leg_path).unwrap();
+        let error = super::RunLock::acquire(&leg_path).err().expect("the leg is held");
+        assert!(error.contains("another run holds this leg"), "{error}");
+
+        drop(first);
+        super::RunLock::acquire(&leg_path).expect("the lock is free after the first run");
+    }
     use crate::outbound::driver::OperatorDecision;
 
     #[test]

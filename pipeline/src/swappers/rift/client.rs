@@ -58,14 +58,16 @@ impl RiftClient {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok());
-        let body = response
-            .text()
-            .await
-            .map_err(|error| RiftError::Malformed(format!("Rift answer could not be read: {error}")))?;
+        let body = response.text().await;
         if status.is_success() {
-            return Ok(body);
+            return body.map_err(|error| RiftError::Malformed(format!("Rift answer could not be read: {error}")));
         }
-        Err(classify_failure(status.as_u16(), retry_after_secs, &body))
+        // The status already decides a failed answer, so a lost body does not hide it.
+        Err(classify_failure(
+            status.as_u16(),
+            retry_after_secs,
+            &body.unwrap_or_default(),
+        ))
     }
 }
 

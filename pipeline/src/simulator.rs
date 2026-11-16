@@ -35,20 +35,20 @@ pub fn mexc_api_base() -> Result<Option<String>, String> {
         return Ok(None);
     }
     let raw = env::var("SIM_MEXC_URL").map_err(|_| "simulator MEXC requires SIM_MEXC_URL".to_string())?;
-    local_origin(&raw).map(Some)
+    local_origin("SIM_MEXC_URL", &raw).map(Some)
 }
 
 /// `raw` as a bare loopback HTTP origin. Signed calls and metadata reads must both
 /// stay local, or route discovery would mix real and simulated books.
-fn local_origin(raw: &str) -> Result<String, String> {
-    let url = reqwest::Url::parse(raw).map_err(|error| format!("SIM_MEXC_URL: {error}"))?;
+fn local_origin(name: &str, raw: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(raw).map_err(|error| format!("{name}: {error}"))?;
     let bare = url.username().is_empty()
         && url.password().is_none()
         && url.path() == "/"
         && url.query().is_none()
         && url.fragment().is_none();
     if !is_loopback_http(&url) || !bare {
-        return Err("SIM_MEXC_URL must be a loopback HTTP origin".to_string());
+        return Err(format!("{name} must be a loopback HTTP origin"));
     }
     Ok(raw.trim_end_matches('/').to_string())
 }
@@ -69,22 +69,26 @@ pub fn enabled_swap_venues() -> Result<Vec<String>, String> {
     if env::var_os("SIM_MEXC_URL").is_some() {
         venues.push(MEXC_VENUE_ID.to_string());
     }
-    if env::var_os("SIM_RIFT_URL").is_some() {
+    if rift_url()?.is_some() {
         venues.push(RIFT_VENUE_ID.to_string());
     }
     Ok(venues)
 }
 
-/// The local MEXC holds ck assets itself, so it skips the production bridge
-/// unless `SIM_MEXC_BRIDGE` asks for the local one.
-/// The Rift mock's URL, when the workbench runs one.
-pub fn rift_url() -> Option<String> {
+/// The Rift mock's origin from `SIM_RIFT_URL`, when the workbench runs one.
+/// A value that is set must be local, so a simulator build never calls the real Rift.
+pub fn rift_url() -> Result<Option<String>, String> {
     if !ENABLED {
-        return None;
+        return Ok(None);
     }
-    env::var("SIM_RIFT_URL").ok().filter(|url| !url.trim().is_empty())
+    match env::var("SIM_RIFT_URL") {
+        Ok(raw) => local_origin("SIM_RIFT_URL", &raw).map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
+/// The local MEXC holds ck assets itself, so it skips the production bridge
+/// unless `SIM_MEXC_BRIDGE` asks for the local one.
 pub fn mexc_uses_bridge() -> bool {
     !ENABLED || env::var_os("SIM_MEXC_BRIDGE").is_some()
 }
@@ -109,7 +113,7 @@ mod tests {
     #[test]
     fn the_local_mexc_must_be_a_bare_loopback_origin() {
         assert_eq!(
-            local_origin("http://127.0.0.1:23009/").unwrap(),
+            local_origin("SIM_MEXC_URL", "http://127.0.0.1:23009/").unwrap(),
             "http://127.0.0.1:23009"
         );
         for url in [
@@ -118,8 +122,12 @@ mod tests {
             "http://127.0.0.1:23009/api",
             "http://127.0.0.1:23009/?x=1",
             "http://user@127.0.0.1:23009",
+            // A blank value must not fall back to the real service.
+            "",
+            "  ",
         ] {
-            assert!(local_origin(url).is_err(), "{url}");
+            let error = local_origin("SIM_RIFT_URL", url).unwrap_err();
+            assert!(error.contains("SIM_RIFT_URL"), "{url}: {error}");
         }
     }
 }
