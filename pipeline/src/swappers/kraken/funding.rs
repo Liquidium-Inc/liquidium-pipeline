@@ -19,6 +19,17 @@ pub(super) const WITHDRAWAL_RECENT_PAGE: i64 = 20;
 /// The most Kraken returns for one status request, over 90 days.
 pub(super) const WITHDRAWAL_HISTORY_MAX: i64 = 500;
 
+/// The amount a fee question asks about. Kraken refuses an amount under the
+/// current minimum ("EFunding:Invalid arguments"), and a gas-priced minimum
+/// can rise between the two reads, so the question asks for twice the minimum.
+pub(super) fn fee_probe_amount(minimum: Decimal) -> Decimal {
+    if minimum > Decimal::ZERO {
+        minimum * Decimal::TWO
+    } else {
+        Decimal::ONE
+    }
+}
+
 fn unavailable(error: KrakenApiError) -> FundingRouteError {
     FundingRouteError::Unavailable(error.to_string())
 }
@@ -68,7 +79,7 @@ pub struct KrakenWithdrawalCheck {
     /// Whether `destination` is a verified address for this method; a leg can
     /// only withdraw there.
     pub destination_verified: bool,
-    /// Kraken's fee for a withdrawal of the minimum, once the address is verified.
+    /// Kraken's fee for a withdrawal of twice the minimum, once the address is verified.
     pub fee_at_minimum: Option<Result<Decimal, String>>,
 }
 
@@ -184,7 +195,7 @@ impl KrakenClient {
     }
 
     /// The method minimum, and the fee Kraken quotes for it. The fee is fixed
-    /// per method, so any verified address and the minimum amount read it.
+    /// per method, so any verified address and any amount above the minimum read it.
     pub(super) async fn withdraw_terms(&self, asset: &str, network: &str) -> Result<WithdrawTerms, String> {
         let (method, verified) = self
             .withdrawal_method_and_addresses(asset, network)
@@ -195,16 +206,12 @@ impl KrakenClient {
                 "Kraken has no verified {asset} withdrawal address for network {network}"
             ));
         };
-        let probe = if method.minimum > Decimal::ZERO {
-            method.minimum
-        } else {
-            Decimal::ONE
-        };
+        let probe = fee_probe_amount(method.minimum);
         let fee = self
             .api
             .withdrawal_fee(&api_asset(asset), key, probe)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("Kraken {asset} withdrawal fee for {probe}: {error}"))?;
         Ok(WithdrawTerms {
             fee: decimal_f64(fee, "withdrawal fee")?,
             minimum: decimal_f64(method.minimum, "withdrawal minimum")?,
@@ -233,7 +240,7 @@ impl KrakenClient {
                 let fee_at_minimum = match &key {
                     Some(key) => Some(
                         self.api
-                            .withdrawal_fee(&api_asset(asset), key, method.minimum)
+                            .withdrawal_fee(&api_asset(asset), key, fee_probe_amount(method.minimum))
                             .await
                             .map_err(|error| error.to_string()),
                     ),

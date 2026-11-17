@@ -59,6 +59,11 @@ pub async fn check() -> Result<(), String> {
         println!("== {asset} on {network}");
         let route = client.route_check(asset, network, &destination).await;
         let usable = print_route(&route, network, &destination);
+        // The exact read a plan makes, so a check reproduces a plan's refusal.
+        match client.get_withdraw_terms(asset, network).await {
+            Ok(terms) => println!("  plan terms: fee {} minimum {}", terms.fee, terms.minimum),
+            Err(error) => println!("  plan terms: FAILED: {error}"),
+        }
         if !usable.deposit {
             no_deposit.push(format!("{asset}@{network}"));
         }
@@ -120,7 +125,7 @@ fn print_route(route: &KrakenRouteCheck, network: &str, destination: &str) -> Ro
                 withdrawal.minimum
             );
             match &withdrawal.fee_at_minimum {
-                Some(Ok(fee)) => println!("  target:     {destination} is verified; fee at the minimum {fee}"),
+                Some(Ok(fee)) => println!("  target:     {destination} is verified; fee {fee}"),
                 Some(Err(error)) => println!("  target:     {destination} is verified; fee read failed: {error}"),
                 None => println!("  target:     {destination} is NOT a verified withdrawal address"),
             }
