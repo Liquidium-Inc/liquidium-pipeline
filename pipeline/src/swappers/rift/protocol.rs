@@ -1,8 +1,9 @@
 //! Rift's wire format, read into the connector types. Amounts stay decimal
 //! text; Rift sends them as text in `formatted` mode, and a number is accepted too.
 use liquidium_pipeline_connectors::backend::rift_backend::{
-    RiftAsset, RiftError, RiftOrder, RiftOrderState, RiftOrderStatus, RiftQuote,
+    RiftAsset, RiftError, RiftOrder, RiftOrderState, RiftOrderStatus, RiftQuote, RiftQuoteRequest,
 };
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 /// A decimal amount as Rift may send it: text in `formatted` mode, or a number.
@@ -154,4 +155,51 @@ pub(super) fn classify_failure(status: u16, retry_after_secs: Option<u64>, body:
         500..=599 => RiftError::Unreachable(format!("Rift could not serve the request ({status}): {message}")),
         other => RiftError::Malformed(format!("Rift answered with an unexpected status {other}: {message}")),
     }
+}
+
+/// True when two decimal texts are the same number, for example `1.5` and `1.50`.
+fn same_amount(left: &str, right: &str) -> bool {
+    match (left.trim().parse::<Decimal>(), right.trim().parse::<Decimal>()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Returns the quote only if it is for the pair and the amount that we asked for.
+pub(super) fn matched_quote(request: &RiftQuoteRequest, quote: RiftQuote) -> Result<RiftQuote, RiftError> {
+    if quote.from != request.from || quote.to != request.to || !same_amount(&quote.amount_in, &request.amount_in) {
+        return Err(RiftError::Malformed(format!(
+            "Rift quote {} is for {} {} -> {}, but the request was {} {} -> {}",
+            quote.id,
+            quote.amount_in,
+            quote.from.as_str(),
+            quote.to.as_str(),
+            request.amount_in,
+            request.from.as_str(),
+            request.to.as_str()
+        )));
+    }
+    Ok(quote)
+}
+
+/// Returns the order only if it belongs to our quote and has a deposit address.
+pub(super) fn matched_order(quote_id: &str, order: RiftOrder) -> Result<RiftOrder, RiftError> {
+    if order.quote_id != quote_id || order.deposit_address.trim().is_empty() {
+        return Err(RiftError::Malformed(format!(
+            "Rift order {} answers quote `{}` with deposit address `{}`, but the request was quote {quote_id}",
+            order.id, order.quote_id, order.deposit_address
+        )));
+    }
+    Ok(order)
+}
+
+/// Returns the status only if it is for the order that we asked about.
+pub(super) fn matched_order_state(order_id: &str, state: RiftOrderState) -> Result<RiftOrderState, RiftError> {
+    if state.id != order_id {
+        return Err(RiftError::Malformed(format!(
+            "Rift answered for order {} when asked for order {order_id}",
+            state.id
+        )));
+    }
+    Ok(state)
 }

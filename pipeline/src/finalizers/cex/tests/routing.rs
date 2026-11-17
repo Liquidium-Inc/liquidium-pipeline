@@ -936,3 +936,35 @@ async fn best_output_routing_uses_any_configured_sol_market() {
         .unwrap();
     assert_eq!(markets(&legs), vec!["SOL_USDC", "USDC_USDT"]);
 }
+
+/// A price read trades nothing, so it may use a market outside the pair list.
+/// A trade on the same market stays refused.
+#[tokio::test]
+async fn an_unlisted_market_values_an_amount_but_never_carries_a_trade() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|market, _| match market {
+        "BTC_USDT" => Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 60_000.0,
+                quantity: 10.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 60_100.0,
+                quantity: 10.0,
+            }],
+            taker_fee_bps: 10.0,
+        }),
+        other => Err(format!("no market {other}")),
+    });
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
+        .with_route_config(vec!["ICP_BTC".to_string()], 2);
+
+    let usd = finalizer.amount_symbol_to_usd("BTC", 0.5).await.expect("valued on BTC_USDT");
+    assert!((usd - 30_000.0).abs() < 100.0, "{usd}");
+
+    let error = finalizer
+        .resolve_trade_legs_for_symbols("BTC", "USDT")
+        .await
+        .expect_err("BTC_USDT is not in the pair list");
+    assert!(error.contains("BTC_USDT is not a configured pair"), "{error}");
+}

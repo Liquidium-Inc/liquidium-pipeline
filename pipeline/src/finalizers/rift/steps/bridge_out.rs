@@ -41,11 +41,10 @@ impl<R: RiftBackend> BridgeDestinationProvider for OrderDeposit<'_, R> {
         Ok(self.address.clone())
     }
 
-    /// An order past `awaiting_deposit` has the deposit. A failed read, or an
-    /// answer for another order, says nothing.
+    /// An order past `awaiting_deposit` has the deposit. A failed read says nothing.
     async fn arrival(&self) -> Arrival {
         match self.backend.order_state(&self.order_id).await {
-            Ok(order) if order.id == self.order_id && order.status.funds_moved() => Arrival::Confirmed,
+            Ok(order) if order.status.funds_moved() => Arrival::Confirmed,
             _ => Arrival::NotConfirmed,
         }
     }

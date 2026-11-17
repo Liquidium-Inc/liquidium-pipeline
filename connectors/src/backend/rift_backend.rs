@@ -170,6 +170,8 @@ pub enum RiftError {
     Malformed(String),
 }
 
+/// Each answer must belong to its request: a quote to the pair and amount, an order to the
+/// quote, a status to the order. If it does not, the call returns `Malformed`.
 #[mockall::automock]
 #[async_trait]
 pub trait RiftBackend: Send + Sync {

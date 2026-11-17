@@ -3,7 +3,7 @@
 use liquidium_pipeline_connectors::backend::rift_backend::{RiftBackend, RiftOrderStatus};
 use log::{debug, info, warn};
 
-use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
+use super::{RiftVenueFinalizer, VenueStepError, decimal_text, leg_routes, rift_amount};
 use crate::{
     finalizers::rift::state::{RiftState, RiftStep},
     utils::{now_ts, waited_secs},
@@ -18,13 +18,6 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         let liq_id = state.liq_id.clone();
         let order = state.order.as_mut().ok_or("missing Rift order while waiting")?;
         let answer = self.backend.order_state(&order.id).await?;
-        // A status of another order says nothing about this one, so it is not saved.
-        if answer.id != order.id {
-            return Err(VenueStepError::Other(format!(
-                "Rift answered for order {} when asked for order {}",
-                answer.id, order.id
-            )));
-        }
         order.polled_at_ts = Some(now_ts());
         order.status = Some(answer.status.as_api());
         let waited = waited_secs(&mut order.wait_since_ts);
@@ -66,15 +59,25 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                         order.id, state.receive_symbol
                     )));
                 }
+                // The floor counts the return fee, so the fee comes off the delivery before the
+                // two are compared. If the fee cannot be read, the delivery is compared as it is.
+                let received = match leg_routes(&state.size_in.token, &state.final_asset) {
+                    Ok((_, back)) => match self.net_after_return(back, &delivered).await {
+                        Ok((net, _)) => net,
+                        Err(_) => delivered.clone(),
+                    },
+                    Err(_) => delivered.clone(),
+                };
                 // The money is already at the wallet, so the leg brings it
                 // back. The shortfall is visible here and in the leg's result.
-                if delivered.value < state.min_amount_out.value {
+                if received.value < state.min_amount_out.value {
                     warn!(
-                        "[rift] liq_id={} order {} delivered {} {}, under the planned floor {}",
+                        "[rift] liq_id={} order {} delivered {} {}, which is {} after the return fee, under the planned floor {}",
                         liq_id,
                         order.id,
                         decimal_text(&delivered),
                         state.receive_symbol,
+                        decimal_text(&received),
                         decimal_text(&state.min_amount_out)
                     );
                 }

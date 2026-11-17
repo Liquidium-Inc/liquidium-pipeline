@@ -4,7 +4,9 @@ use liquidium_pipeline_connectors::backend::rift_backend::{
 };
 
 use super::client::quote_body;
-use super::protocol::{classify_failure, parse_order, parse_order_state, parse_quote};
+use super::protocol::{
+    classify_failure, matched_order, matched_order_state, matched_quote, parse_order, parse_order_state, parse_quote,
+};
 
 /// A live quote from 2026-11-09, trimmed to the fields the client reads plus the ones it ignores.
 const QUOTE: &str = r#"{
@@ -173,4 +175,58 @@ fn a_plain_text_body_is_kept_short_in_the_message() {
 fn the_client_needs_a_parsable_base_url() {
     assert!(super::RiftClient::new("not a url", None).is_err());
     assert!(super::RiftClient::new("https://api.rift.trade/", Some(" ".to_string())).is_ok());
+}
+
+fn btc_to_usdt(amount_in: &str) -> RiftQuoteRequest {
+    RiftQuoteRequest {
+        from: RiftAsset::new("bitcoin", "btc"),
+        to: RiftAsset::new("ethereum", "usdt"),
+        amount_in: amount_in.to_string(),
+        venues: RiftVenueLists::default(),
+    }
+}
+
+/// The client returns an answer only when it belongs to the request. An answer
+/// for another quote or order must not reach the plan or the steps.
+#[test]
+fn a_quote_for_another_pair_or_amount_is_malformed() {
+    let quote = || parse_quote(QUOTE).expect("quote");
+    // Trailing zeros are the same amount.
+    assert!(matched_quote(&btc_to_usdt("0.05"), quote()).is_ok());
+    assert!(matched_quote(&btc_to_usdt("0.0500"), quote()).is_ok());
+
+    let other_amount = matched_quote(&btc_to_usdt("0.06"), quote()).unwrap_err();
+    assert!(matches!(other_amount, RiftError::Malformed(_)), "{other_amount}");
+    let mut other_pair = btc_to_usdt("0.05");
+    other_pair.to = RiftAsset::new("ethereum", "usdc");
+    assert!(matches!(matched_quote(&other_pair, quote()), Err(RiftError::Malformed(_))));
+    assert!(matches!(
+        matched_quote(&btc_to_usdt("not a number"), quote()),
+        Err(RiftError::Malformed(_))
+    ));
+}
+
+#[test]
+fn an_order_from_another_quote_or_with_no_address_is_malformed() {
+    let order = |quote_id: &str, address: &str| {
+        parse_order(&format!(
+            r#"{{"id":"o1","quote_id":"{quote_id}","deposit_address":"{address}","amount_in":"1",
+                "deposit_deadline":"2026-11-16T07:40:36Z","status":"awaiting_deposit"}}"#
+        ))
+        .expect("order")
+    };
+    assert!(matched_order("q1", order("q1", "0xdeposit")).is_ok());
+    assert!(matches!(
+        matched_order("q1", order("q2", "0xdeposit")),
+        Err(RiftError::Malformed(_))
+    ));
+    assert!(matches!(matched_order("q1", order("q1", " ")), Err(RiftError::Malformed(_))));
+}
+
+#[test]
+fn a_status_of_another_order_is_malformed() {
+    let state = || parse_order_state(r#"{"id":"o1","status":"delivered","payout_tx":"0xpayout"}"#).expect("state");
+    assert!(matched_order_state("o1", state()).is_ok());
+    let other = matched_order_state("o2", state()).unwrap_err();
+    assert!(matches!(other, RiftError::Malformed(ref text) if text.contains("o1") && text.contains("o2")), "{other}");
 }

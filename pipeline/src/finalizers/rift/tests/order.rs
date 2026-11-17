@@ -102,60 +102,6 @@ async fn a_quote_under_the_return_deposit_minimum_is_refused_as_below_minimum() 
 }
 
 #[tokio::test]
-async fn a_quote_for_another_amount_or_pair_is_refused_and_nothing_is_saved() {
-    for other in [
-        quote("250", "248"),
-        RiftQuote {
-            to: RiftAsset::new("bitcoin", "BTC"),
-            ..quote("100", "99.5")
-        },
-    ] {
-        let mut rift = MockRiftBackend::new();
-        rift.expect_quote().returning(move |_| Ok(other.clone()));
-        rift.expect_create_order().times(0);
-        let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
-        let mut state = fresh_state();
-
-        let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
-
-        assert!(
-            matches!(error, VenueStepError::Other(ref m) if m.contains("but the request was")),
-            "{error}"
-        );
-        assert!(state.quote_id.is_none());
-        assert!(!state.send_saved);
-    }
-}
-
-#[tokio::test]
-async fn an_order_from_another_quote_or_with_no_address_is_never_saved() {
-    for other in [
-        RiftOrder {
-            quote_id: "quote-2".to_string(),
-            ..order("100")
-        },
-        RiftOrder {
-            deposit_address: " ".to_string(),
-            ..order("100")
-        },
-    ] {
-        let mut rift = MockRiftBackend::new();
-        rift.expect_create_order().returning(move |_, _, _| Ok(other.clone()));
-        let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
-        let mut state = fresh_state();
-        state.quote_id = Some("quote-1".to_string());
-
-        let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
-
-        assert!(
-            matches!(error, VenueStepError::Other(ref m) if m.contains("but the request was quote quote-1")),
-            "{error}"
-        );
-        assert!(state.order.is_none());
-    }
-}
-
-#[tokio::test]
 async fn an_expired_quote_is_dropped_so_the_next_cycle_quotes_again() {
     let mut rift = MockRiftBackend::new();
     rift.expect_create_order()

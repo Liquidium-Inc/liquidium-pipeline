@@ -8,7 +8,9 @@ use liquidium_pipeline_connectors::backend::rift_backend::{
 };
 use serde_json::json;
 
-use super::protocol::{classify_failure, parse_order, parse_order_state, parse_quote};
+use super::protocol::{
+    classify_failure, matched_order, matched_order_state, matched_quote, parse_order, parse_order_state, parse_quote,
+};
 
 /// Rift answers quotes in one to ten seconds; this bounds a hung connection.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,7 +98,7 @@ impl RiftBackend for RiftClient {
         let answer = self
             .send(self.request(reqwest::Method::POST, "/quote").json(&quote_body(request)))
             .await?;
-        parse_quote(&answer)
+        matched_quote(request, parse_quote(&answer)?)
     }
 
     async fn create_order(
@@ -112,13 +114,13 @@ impl RiftBackend for RiftClient {
         let answer = self
             .send(self.request(reqwest::Method::POST, "/order").json(&body))
             .await?;
-        parse_order(&answer)
+        matched_order(quote_id, parse_order(&answer)?)
     }
 
     async fn order_state(&self, order_id: &str) -> Result<RiftOrderState, RiftError> {
         let answer = self
             .send(self.request(reqwest::Method::GET, &format!("/order/{order_id}")))
             .await?;
-        parse_order_state(&answer)
+        matched_order_state(order_id, parse_order_state(&answer)?)
     }
 }
