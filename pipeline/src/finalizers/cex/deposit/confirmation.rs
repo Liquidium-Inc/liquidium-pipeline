@@ -62,6 +62,8 @@ where
     }
 
     /// Phase-B deposit confirmation by balance delta against the captured baseline.
+    /// Known limit: bots that share one exchange account can take each other's
+    /// credit, so a row can wait or park when another bot's deposit is slow; amounts stay correct.
     pub(super) async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
         let symbol = <Self as BridgePlanner>::planned_deposit_asset(state);
         let current_balance = self.backend.get_balance(&symbol).await?;

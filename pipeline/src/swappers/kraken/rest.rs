@@ -113,6 +113,8 @@ impl KrakenRestApi {
             key: api_key,
             secret: api_secret,
         })));
+        // Known limit: the nonce is this machine's clock, so bots that share one key need the
+        // key's nonce window in Kraken, or Kraken refuses some requests (nothing moves; the step retries).
         let nonce: Box<Arc<Mutex<dyn NonceProvider>>> = Box::new(Arc::new(Mutex::new(IncreasingNonceProvider::new())));
         Self {
             client: Mutex::new(Client::new(secrets, nonce)),
