@@ -128,6 +128,13 @@ impl<C> CexVenueFinalizer<C>
 where
     C: CexBackend,
 {
+    /// The first group of the liquidator principal. Bots that share one exchange
+    /// account number their rows apart, so every order id carries it.
+    pub(super) fn order_id_scope(&self) -> String {
+        let text = self.liquidator_principal.to_text();
+        text.split('-').next().unwrap_or_default().to_string()
+    }
+
     pub fn with_route_config(mut self, available_pairs: Vec<String>, max_hops: usize) -> Self {
         self.available_pairs = Self::normalize_market_pairs(available_pairs);
         self.max_hops = max_hops.min(MAX_HOPS_CAP);
