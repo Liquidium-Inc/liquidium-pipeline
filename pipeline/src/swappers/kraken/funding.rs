@@ -11,7 +11,7 @@ use liquidium_pipeline_connectors::backend::cex_backend::{
 };
 use rust_decimal::Decimal;
 
-use super::api::{KrakenApiError, KrakenFundingMethod, KrakenTransferStatus};
+use super::api::{KrakenApiError, KrakenDeposit, KrakenFundingMethod, KrakenTransferStatus};
 use super::client::{KrakenClient, api_asset, decimal_f64, exactly_one, to_decimal};
 
 /// Withdrawals read per status poll before the whole history is read.
@@ -220,6 +220,14 @@ impl KrakenClient {
 
     /// The deposit and withdrawal side of one route, as the leg would resolve
     /// them. Only reads: no address is created and nothing is sent.
+    /// The most recent deposits of `asset`, for an operator check.
+    pub async fn recent_deposits(&self, asset: &str, limit: i64) -> Result<Vec<KrakenDeposit>, String> {
+        self.api
+            .deposits(&api_asset(asset), limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn route_check(&self, asset: &str, network: &str, destination: &str) -> KrakenRouteCheck {
         let deposit = self
             .resolve_deposit(asset, network)

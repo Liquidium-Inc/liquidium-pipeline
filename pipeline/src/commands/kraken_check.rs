@@ -72,6 +72,28 @@ pub async fn check() -> Result<(), String> {
         }
     }
 
+    // How Kraken names each credited deposit, so a leg can find its own.
+    println!("== recent deposits");
+    for asset in ["ICP", "ETH", "USDC", "SOL"] {
+        match client.recent_deposits(asset, 5).await {
+            Ok(deposits) if deposits.is_empty() => println!("  {asset:<5} none"),
+            Ok(deposits) => {
+                for deposit in deposits {
+                    println!(
+                        "  {asset:<5} {} {:?} amount={} time={} tx={} to={}",
+                        deposit.ref_id,
+                        deposit.status,
+                        deposit.amount,
+                        deposit.time,
+                        deposit.tx_id.as_deref().unwrap_or("-"),
+                        deposit.info
+                    );
+                }
+            }
+            Err(error) => println!("  {asset:<5} read failed: {error}"),
+        }
+    }
+
     if no_deposit.is_empty() && no_withdrawal.is_empty() {
         println!("RESULT: every route has a deposit address and a verified withdrawal address");
     }
