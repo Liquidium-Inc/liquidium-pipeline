@@ -23,9 +23,7 @@ use kraken_async_rs::{
         OrderbookRequest, StatusOfDepositWithdrawRequest, StringCSV, TimeInForce, TradableAssetPairsRequest,
         WithdrawFundsRequest, WithdrawalAddressesRequest, WithdrawalInfoRequest, WithdrawalMethodsRequest,
     },
-    response_types::{
-        BuySell, DepositWithdrawResponse, OrderFlag, OrderStatus, OrderType, TradableAssetStatus, TransferStatus,
-    },
+    response_types::{BuySell, OrderFlag, OrderStatus, OrderType, TradableAssetStatus, TransferStatus},
     secrets::secrets_provider::{Secrets, SecretsProvider},
 };
 use rust_decimal::Decimal;
@@ -33,7 +31,7 @@ use tokio::sync::Mutex;
 
 use super::api::{
     KrakenApi, KrakenApiError, KrakenBook, KrakenBookLevel, KrakenDepositAddress, KrakenFundingMethod, KrakenOrder,
-    KrakenDeposit, KrakenOrderRequest, KrakenOrderStatus, KrakenPair, KrakenSide, KrakenTransferStatus, KrakenWithdrawal,
+    KrakenOrderRequest, KrakenOrderStatus, KrakenPair, KrakenSide, KrakenTransferStatus, KrakenWithdrawal,
     KrakenWithdrawalAddress,
 };
 use super::client::canonical_symbol;
@@ -393,33 +391,6 @@ impl KrakenApi for KrakenRestApi {
                 tx_id: withdrawal.tx_id.filter(|tx_id| !tx_id.trim().is_empty()),
                 fee: withdrawal.fee,
                 status: transfer_status(withdrawal.status),
-            })
-            .collect())
-    }
-
-    async fn deposits(&self, asset: &str, limit: i64) -> Result<Vec<KrakenDeposit>, KrakenApiError> {
-        let request = StatusOfDepositWithdrawRequest::builder()
-            .asset(asset.to_string())
-            .limit(limit)
-            .build();
-        let response = self
-            .call(async |client| client.get_status_of_recent_deposits(&request).await)
-            .await?;
-        // Without a cursor in the request, Kraken answers with a plain list.
-        let DepositWithdrawResponse::Response(deposits) = response else {
-            return Err(KrakenApiError::Transport(
-                "Kraken answered the deposit list with a cursor page".to_string(),
-            ));
-        };
-        Ok(deposits
-            .into_iter()
-            .map(|deposit| KrakenDeposit {
-                ref_id: deposit.ref_id,
-                tx_id: deposit.tx_id.filter(|tx_id| !tx_id.trim().is_empty()),
-                info: deposit.info,
-                amount: deposit.amount,
-                time: deposit.time,
-                status: transfer_status(deposit.status),
             })
             .collect())
     }

@@ -104,18 +104,6 @@ pub struct KrakenWithdrawal {
     pub status: KrakenTransferStatus,
 }
 
-/// One deposit as Kraken lists it. `tx_id` is the chain transaction, once Kraken has seen it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct KrakenDeposit {
-    pub ref_id: String,
-    pub tx_id: Option<String>,
-    /// The deposit address the transfer credited.
-    pub info: String,
-    pub amount: Decimal,
-    pub time: i64,
-    pub status: KrakenTransferStatus,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum KrakenApiError {
     /// Kraken answered with an error, so it did not act on the request.
@@ -151,6 +139,4 @@ pub trait KrakenApi: Send + Sync {
     /// The newest `limit` withdrawals of `asset`. Kraken caps this at 500 over
     /// 90 days and returns no cursor.
     async fn withdrawals(&self, asset: &str, limit: i64) -> Result<Vec<KrakenWithdrawal>, KrakenApiError>;
-    /// The most recent deposits of `asset`, newest first.
-    async fn deposits(&self, asset: &str, limit: i64) -> Result<Vec<KrakenDeposit>, KrakenApiError>;
 }

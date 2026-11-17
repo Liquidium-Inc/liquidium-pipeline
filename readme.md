@@ -909,7 +909,6 @@ Kraken is opt-in. Before you enable it:
 1. Create an API key with balance and funding reads, order create and query, and withdrawal access only. Use an IP allowlist.
 2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address. For a Solana deposit, create a permanent deposit address; the pipeline reads it and never creates one.
 3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a narrow `CEX_KRAKEN_AVAILABLE_PAIRS`.
-4. Run `liquidator kraken-check`. It reads the balances, the allowed markets and their minimums, and for each route the deposit address and whether our destination is a verified withdrawal address. It moves nothing. Fix each route it lists, then add `kraken` to `ENABLED_SWAP_VENUES`.
 
 Checked on 2026-11-11: ICP, USDC and ETH deposit and withdraw. The account offers no USDT deposit method, so ckUSDT cannot reach Kraken; USDT can still be withdrawn.
 
@@ -930,23 +929,6 @@ A Rift leg takes these steps, each saved before it acts:
 5. The ckERC20 bridge brings an Ethereum payout back to ICP as its ck form. A Bitcoin payout goes to the ckBTC minter's address for the final account, so the minter mints ckBTC straight into it once the deposit has four confirmations; the leg only asks the minter until it does. The minter takes its check fee out of the deposit, and the preview takes it off the receive.
 
 Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
-
-### Checking Rift without a liquidation
-
-`rift-swap-check` runs one Rift leg from the trader account, the way the daemon
-would run it inside a liquidation: the quote, the order, the bridge out, the
-wait for Rift, the bridge back. Without `--confirm` it only prints the preview.
-
-```bash
-liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20
-liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20 --confirm
-```
-
-The leg is saved to `rift-check-<ts>.json` in the working directory after every
-cycle. A stopped run continues with `--resume <file>`. A parked leg prints its
-open question; answer it on the resume with `--answer absent` or
-`--answer landed:<receipt>`. The trader account pays the amount plus one ledger
-fee, and the proceeds mint to the liquidator account.
 
 ## Native Simulator
 
