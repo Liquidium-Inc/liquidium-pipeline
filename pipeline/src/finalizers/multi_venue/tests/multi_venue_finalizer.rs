@@ -2454,3 +2454,185 @@ async fn a_committed_plan_drops_the_route_search_strikes() {
     wal.update_row(ROW_ID, |row| strikes = row.error_count);
     assert_eq!(strikes, 1, "only the error after the commit counts");
 }
+
+mod share_row_reconcile {
+    use super::*;
+    use crate::operator::{ReconcileAction, ReconcileRequest};
+    use crate::outbound::driver::OperatorDecision;
+    use crate::persistance::{OpenWithdraw, ShareHolding};
+
+    fn parked(wrapper: LiqMetaWrapper) -> TestWal {
+        let wal = TestWal::with_wrapper(wrapper);
+        {
+            let mut guard = wal.row.lock().expect("WAL lock");
+            let row = guard.as_mut().expect("WAL row");
+            row.status = ResultStatus::OperatorRequired;
+            row.last_error = Some("parked".to_string());
+        }
+        wal
+    }
+
+    fn status(wal: &TestWal) -> ResultStatus {
+        wal.row.lock().expect("WAL lock").as_ref().expect("WAL row").status
+    }
+
+    fn request(receipt: &ExecutionReceipt, action: ReconcileAction) -> ReconcileRequest {
+        ReconcileRequest {
+            liq_id: liq_id_from_receipt(receipt).expect("liquidation id"),
+            leg_id: None,
+            action,
+        }
+    }
+
+    fn one_venue_finalizer() -> MultiVenueFinalizer {
+        finalizer(vec![Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()))])
+    }
+
+    fn share_request_receipt() -> ExecutionReceipt {
+        let mut receipt = receipt();
+        receipt.request.liquidation.collateral_as_shares = Some(true);
+        receipt
+    }
+
+    fn unknown_withdraw() -> OpenWithdraw {
+        OpenWithdraw::Submitting {
+            amount: Nat::from(40_000u64),
+            shares_before: Nat::from(777u64),
+            after_index: 5,
+            at: 1,
+        }
+    }
+
+    fn parked_holding(open: Option<OpenWithdraw>) -> (ExecutionReceipt, TestWal) {
+        let receipt = share_request_receipt();
+        let mut holding = ShareHolding::new(Principal::anonymous(), Principal::anonymous(), Nat::from(TOTAL_PAY), 1);
+        holding.open = open;
+        holding.next_try_at = i64::MAX;
+        let wal = parked(LiqMetaWrapper {
+            share_holding: Some(holding),
+            ..LiqMetaWrapper::new(receipt.clone())
+        });
+        (receipt, wal)
+    }
+
+    #[tokio::test]
+    async fn a_release_puts_held_shares_back_to_the_withdraw_step() {
+        let (receipt, wal) = parked_holding(None);
+        let finalizer = one_venue_finalizer();
+
+        let report = finalizer
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Show))
+            .await
+            .expect("show");
+        assert!(report.contains("held as shares"), "{report}");
+        assert_eq!(status(&wal), ResultStatus::OperatorRequired, "show changes nothing");
+
+        finalizer
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .expect("release");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert_eq!(wal.wrapper().share_holding.expect("share holding").next_try_at, 0);
+    }
+
+    /// A plain release would let the bot withdraw again, but the first withdraw possibly ran.
+    #[tokio::test]
+    async fn a_withdraw_with_an_unknown_outcome_needs_an_answer() {
+        let (receipt, wal) = parked_holding(Some(unknown_withdraw()));
+        let error = one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .unwrap_err();
+        assert!(error.contains("--landed"), "{error}");
+        assert_eq!(status(&wal), ResultStatus::OperatorRequired);
+        assert_eq!(
+            wal.wrapper().share_holding.expect("share holding").open,
+            Some(unknown_withdraw())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_absent_drops_the_withdraw_and_keeps_the_whole_amount_held() {
+        let (receipt, wal) = parked_holding(Some(unknown_withdraw()));
+        one_venue_finalizer()
+            .reconcile(
+                &wal,
+                &request(&receipt, ReconcileAction::Answer(OperatorDecision::Absent)),
+            )
+            .await
+            .expect("absent");
+        let holding = wal.wrapper().share_holding.expect("share holding");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert_eq!(holding.open, None);
+        assert_eq!(holding.remaining(), Nat::from(TOTAL_PAY));
+    }
+
+    #[tokio::test]
+    async fn the_answer_landed_counts_the_withdraw_and_waits_for_its_payout() {
+        let (receipt, wal) = parked_holding(Some(unknown_withdraw()));
+        let answer = ReconcileAction::Answer(OperatorDecision::Landed {
+            receipt: "withdraw_9".to_string(),
+        });
+        one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, answer))
+            .await
+            .expect("landed");
+        let holding = wal.wrapper().share_holding.expect("share holding");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert_eq!(holding.withdrawn, Nat::from(40_000u64));
+        assert!(matches!(
+            holding.open,
+            Some(OpenWithdraw::Accepted { ref outflow_id, ref amount, after_index: 5, .. })
+                if outflow_id == "withdraw_9" && *amount == Nat::from(40_000u64)
+        ));
+    }
+
+    /// The amount already left the position. Thus a release waits for the payout, without a new withdraw.
+    #[tokio::test]
+    async fn a_release_of_a_late_payout_waits_for_it_again() {
+        let late = OpenWithdraw::Accepted {
+            outflow_id: "withdraw_3".to_string(),
+            amount: Nat::from(40_000u64),
+            after_index: 5,
+            at: 1,
+        };
+        let (receipt, wal) = parked_holding(Some(late));
+        one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .expect("release");
+        let holding = wal.wrapper().share_holding.expect("share holding");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert!(matches!(
+            holding.open,
+            Some(OpenWithdraw::Accepted { ref outflow_id, at, .. }) if outflow_id == "withdraw_3" && at > 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_release_queues_a_row_whose_share_flag_the_canister_ignored() {
+        let receipt = share_request_receipt();
+        let wal = parked(LiqMetaWrapper::new(receipt.clone()));
+        let finalizer = one_venue_finalizer();
+
+        let report = finalizer
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .expect("release");
+        assert!(report.contains("paid the collateral as tokens"), "{report}");
+        assert_eq!(status(&wal), ResultStatus::Enqueued);
+    }
+
+    /// A row that never asked for shares keeps the existing rule: no swap state, no reconcile.
+    #[tokio::test]
+    async fn a_row_without_the_share_flag_is_not_released_this_way() {
+        let receipt = receipt();
+        let wal = parked(LiqMetaWrapper::new(receipt.clone()));
+        let error = one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .unwrap_err();
+        assert!(error.contains("no multi-venue swap state"), "{error}");
+        assert_eq!(status(&wal), ResultStatus::OperatorRequired);
+    }
+}
