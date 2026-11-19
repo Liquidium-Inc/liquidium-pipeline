@@ -216,7 +216,43 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 BOT_NAME=prod-liquidator
 LOW_BALANCE_THRESHOLDS=ckBTC=0.001,ckUSDT=100,ckUSDC=100,ICP=5,ETH=0.05
 BALANCE_CHECK_EXCLUDE=ckETH,ETH
+# Share payout: take the collateral as supply shares when the pool cannot pay tokens
+SHARE_PAYOUT_ENABLED=true
+SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS=500
 ```
+
+### Share Payout (collateral held as supply shares)
+
+A collateral pool without free liquidity cannot pay the seized collateral as tokens. Then the bot takes the collateral as supply shares of that pool and withdraws it later. Without this feature, the canister makes the liquidation smaller, or the liquidation fails after the deposit.
+
+| Setting | Meaning |
+|---|---|
+| `SHARE_PAYOUT_ENABLED` | Default `true`. Set it to `false` while the lending canister does not support `collateral_as_shares`: an older canister ignores the flag and pays tokens to the main account, and a row with a swap then stops for an operator. Any value but `true` or `false` stops the startup. |
+| `SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS` | Default `500`. The bot asks for shares when the pool's free liquidity is below the expected seized collateral plus this margin. |
+
+How a row moves:
+
+1. The liquidation names the main (liquidator) account as receiver, because the canister pays shares only to the caller. The row gets the status `held_shares`.
+2. The bot reads the pool's liquidity, at most once per minute for a row that waits. When the pool can pay, it calls `withdraw` on the lending canister. The destination is the trader account when a swap follows, else the main account.
+3. The bot finds the payout on the ledger. Then the row goes to the normal swap flow with the amount that arrived.
+4. A held row swaps only when the swap is in profit. If every venue gave a price and none is in profit, the tokens go to the recovery account. If a venue gave no price, the bot tries again later.
+
+What to know:
+
+- **No cap.** Nothing limits how much the bot holds as shares. A pool that stays empty can take the bot's debt tokens one liquidation after another. Watch the log lines `share_holding_total` and `share_holding_total_usd`, and the low-balance alerts.
+- **Price exposure.** The bot keeps the collateral's price risk while it waits. The shares earn supply interest, and the last held row of a pool collects it.
+- **The switch decides only new liquidations.** The bot withdraws rows that already hold shares, also when the switch is off.
+- **Operator rows.** `liquidator reconcile <id>` shows the state and names the action. The bot parks a row as `operator` in three cases:
+
+  | Case | What to check | Action |
+  |---|---|---|
+  | The outcome of a withdraw call is not known | Did the position of the liquidator's profile shrink? Is there a transfer from the pool to the destination? | `--landed <withdraw id>` if it ran (for example `withdraw_123`; the bot then looks for the payout), or `--absent` if it did not. A plain `--release` is refused, because it could withdraw twice. |
+  | A payout is not on the ledger after 60 minutes | The pool canister and its ledger | `--release` waits for the payout again. The bot does not withdraw again. |
+  | An older canister ignored the flag and paid tokens to the main account | The main account balance | Move the tokens to the trader account, then `--release` queues the row for the swap. |
+
+  A parked row with an open withdraw blocks new withdraws from its pool until an operator answers it.
+- **Rollback.** An older binary reads the status `held_shares` as permanently failed and does not withdraw. Before you go back to an older version, let this version finish all held rows.
+- **Log events:** `share_holding_held`, `share_withdraw_accepted`, `share_withdraw_arrived`, `share_holding_released`. The `liquidation_outcome` line has `collateral_payout=shares` for these rows.
 
 ### Swap Configuration
 
