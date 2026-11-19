@@ -17,6 +17,7 @@ pub use types::{
     BridgeSubmissionCandidate, BridgeSweepRoute, DepositNotice, EvmReceiptStatus, MockBridgeBackend,
     TransactionPayment,
 };
+pub use utils::{account_transactions, ledger_index};
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,
     resolve_cketh_forward_route_by_target, resolve_cketh_reverse_route_by_source, resolve_forward_route_by_target,

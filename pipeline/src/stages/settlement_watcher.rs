@@ -184,6 +184,7 @@ mod tests {
                 debt_amount: Nat::from(0u32),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt,
+                collateral_as_shares: None,
             },
             swap_args,
             debt_asset,
@@ -239,6 +240,7 @@ mod tests {
                 tx_id: None,
                 status: collateral_status,
             },
+            collateral_share_receiver: None,
         }
     }
 

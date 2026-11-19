@@ -3,6 +3,25 @@ use ic_agent::Agent;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+/// The reason that an update call gave no reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateFailure {
+    /// The canister rejected the call with a certified answer.
+    /// A method without an inter-canister call then changed no state, for example the lending `withdraw`.
+    Rejected(String),
+    /// The bot does not know if the call ran, for example after a transport error.
+    Ambiguous(String),
+}
+
+impl std::fmt::Display for UpdateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateFailure::Rejected(message) => write!(f, "rejected: {message}"),
+            UpdateFailure::Ambiguous(message) => write!(f, "outcome unknown: {message}"),
+        }
+    }
+}
+
 #[mockall::automock]
 #[async_trait::async_trait]
 pub trait PipelineAgent: Send + Sync {
@@ -23,6 +42,19 @@ pub trait PipelineAgent: Send + Sync {
     ) -> Result<R, String>;
 
     async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String>;
+
+    /// Returns the reply bytes of an update call, or the reason for no reply.
+    /// An implementation that cannot tell the reason returns `Ambiguous`.
+    async fn call_update_classified(
+        &self,
+        canister: &Principal,
+        method: &str,
+        arg: Vec<u8>,
+    ) -> Result<Vec<u8>, UpdateFailure> {
+        self.call_update_raw(canister, method, arg)
+            .await
+            .map_err(UpdateFailure::Ambiguous)
+    }
 
     async fn call_update_via_proxy_raw(
         &self,
@@ -116,6 +148,22 @@ impl PipelineAgent for ic_agent::Agent {
     async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
         let res = self.update(canister, method).with_arg(arg).call_and_wait().await;
         res.map_err(|e| e.to_string())
+    }
+
+    async fn call_update_classified(
+        &self,
+        canister: &Principal,
+        method: &str,
+        arg: Vec<u8>,
+    ) -> Result<Vec<u8>, UpdateFailure> {
+        match self.update(canister, method).with_arg(arg).call_and_wait().await {
+            Ok(reply) => Ok(reply),
+            // The subnet signs a certified reject. Other errors do not prove that the call failed.
+            Err(error @ ic_agent::AgentError::CertifiedReject { .. }) => {
+                Err(UpdateFailure::Rejected(error.to_string()))
+            }
+            Err(error) => Err(UpdateFailure::Ambiguous(error.to_string())),
+        }
     }
 
     async fn call_update_via_proxy_raw(

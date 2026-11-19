@@ -770,6 +770,7 @@ mod tests {
                     debt_amount: Nat::from(100_000u64),
                     receiver_address: Principal::from_slice(&[4]),
                     buy_bad_debt: false,
+                    collateral_as_shares: None,
                 },
                 swap_args: Some(request),
                 debt_asset: output,

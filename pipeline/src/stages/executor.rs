@@ -348,6 +348,7 @@ mod tests {
                 debt_amount: Nat::from(11_244u64),
                 receiver_address: p("2vxsx-fae"),
                 buy_bad_debt: false,
+                collateral_as_shares: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: debt_asset.asset_id(),
@@ -390,6 +391,7 @@ mod tests {
                 status: TransferStatus::Success,
             },
             id,
+            collateral_share_receiver: None,
         }
     }
 
