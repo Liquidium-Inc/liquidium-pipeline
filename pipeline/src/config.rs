@@ -110,6 +110,10 @@ pub struct Config {
     /// The most one Rift order may carry, in USD at the oracle price. A Rift
     /// quote has no slippage cap, so this bounds what one order can lose.
     pub rift_max_order_usd: f64,
+    /// True when a liquidation can take supply shares, for a pool that cannot pay tokens.
+    pub share_payout_enabled: bool,
+    /// The pool must hold the expected seized collateral plus this margin to pay tokens.
+    pub share_payout_liquidity_margin_bps: u32,
     /// Rift venues that may route an order, and venues that never may.
     pub rift_venue_allowlist: Vec<String>,
     pub rift_venue_blocklist: Vec<String>,
@@ -388,6 +392,8 @@ impl Config {
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let rift_api_url = parse_rift_api_url_from_env()?;
         let rift_max_order_usd = parse_rift_max_order_usd_from_env()?;
+        let share_payout_enabled = parse_share_payout_enabled_from_env()?;
+        let share_payout_liquidity_margin_bps = parse_share_payout_margin_bps_from_env()?;
         let rift_venue_allowlist = parse_name_list_from_env("RIFT_VENUE_ALLOWLIST");
         let rift_venue_blocklist = parse_name_list_from_env("RIFT_VENUE_BLOCKLIST");
         let rift_api_key = env::var("RIFT_API_KEY")
@@ -478,6 +484,8 @@ impl Config {
             rift_api_url,
             rift_api_key,
             rift_max_order_usd,
+            share_payout_enabled,
+            share_payout_liquidity_margin_bps,
             rift_venue_allowlist,
             rift_venue_blocklist,
             icpswap_factory_canister,
@@ -781,6 +789,35 @@ fn parse_rift_max_order_usd_from_env() -> Result<f64, String> {
         .ok()
         .filter(|value| value.is_finite() && *value > 0.0)
         .ok_or_else(|| format!("RIFT_MAX_ORDER_USD must be a positive number of USD, got '{text}'"))
+}
+
+const DEFAULT_SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS: u32 = 500;
+
+/// Returns the share payout switch: on when unset, and a startup error for anything but `true` or `false`.
+fn parse_share_payout_enabled_from_env() -> Result<bool, String> {
+    let Ok(raw) = env::var("SHARE_PAYOUT_ENABLED") else {
+        return Ok(true);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("SHARE_PAYOUT_ENABLED must be true or false, got '{other}'")),
+    }
+}
+
+/// Returns the liquidity margin of the share payout: the default when unset, and a startup error for a value that is not 0 to 10000.
+fn parse_share_payout_margin_bps_from_env() -> Result<u32, String> {
+    let Ok(raw) = env::var("SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS") else {
+        return Ok(DEFAULT_SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS);
+    };
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(DEFAULT_SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS);
+    }
+    text.parse::<u32>()
+        .ok()
+        .filter(|bps| *bps <= MAX_BPS)
+        .ok_or_else(|| format!("SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS must be 0 to {MAX_BPS} basis points, got '{text}'"))
 }
 
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
@@ -1313,6 +1350,28 @@ mod tests {
 
             unsafe { env::remove_var(var) };
         }
+    }
+
+    #[test]
+    fn the_share_payout_is_on_by_default_and_refuses_a_malformed_value() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("SHARE_PAYOUT_ENABLED") };
+        assert_eq!(parse_share_payout_enabled_from_env(), Ok(true));
+        unsafe { env::set_var("SHARE_PAYOUT_ENABLED", " False ") };
+        assert_eq!(parse_share_payout_enabled_from_env(), Ok(false));
+        unsafe { env::set_var("SHARE_PAYOUT_ENABLED", "yes") };
+        assert!(parse_share_payout_enabled_from_env().is_err());
+        unsafe { env::remove_var("SHARE_PAYOUT_ENABLED") };
+
+        unsafe { env::remove_var("SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS") };
+        assert_eq!(parse_share_payout_margin_bps_from_env(), Ok(500));
+        unsafe { env::set_var("SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS", "250") };
+        assert_eq!(parse_share_payout_margin_bps_from_env(), Ok(250));
+        for malformed in ["5%", "-1", "10001", "2.5"] {
+            unsafe { env::set_var("SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS", malformed) };
+            assert!(parse_share_payout_margin_bps_from_env().is_err(), "{malformed}");
+        }
+        unsafe { env::remove_var("SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS") };
     }
 
     /// A typed cap such as `5,000` once became the 25,000 default without a word.
