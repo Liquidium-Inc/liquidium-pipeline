@@ -91,7 +91,8 @@ the requested subaccount is preserved.
 
 Discovery and venue execution run independently but share `DB_PATH`. Accepting a
 liquidation records its receipt and creates execution work in one SQLite
-transaction. Interrupted submissions remain ambiguous rather than being replayed;
+transaction. Interrupted submissions remain ambiguous rather than being replayed
+(see [Recovery of an Interrupted Liquidation Call](#recovery-of-an-interrupted-liquidation-call));
 there is no second intake database, handoff importer or import cursor. The daemon
 lock is scoped to `DB_PATH`, and the TUI reads pause state from that same database.
 
@@ -254,6 +255,26 @@ What to know:
   A parked row with an open withdraw blocks new withdraws from its pool until an operator answers it.
 - **Rollback.** An older binary reads the status `held_shares` as permanently failed and does not withdraw. Before you go back to an older version, let this version finish all held rows.
 - **Log events:** `share_holding_held`, `share_withdraw_accepted`, `share_withdraw_arrived`, `share_holding_released`. The `liquidation_outcome` line has `collateral_payout=shares` for these rows.
+
+### Recovery of an Interrupted Liquidation Call
+
+The bot saves a journal entry before each liquidation call. If the bot stops before the answer arrives, the entry has an unknown outcome (`ambiguous`). The canister possibly ran the liquidation, and the bot has no row for it. The bot never sends the call again.
+
+The recovery runs when the execution worker starts, and then one time each hour. It needs no setting. For each ambiguous entry:
+
+1. The bot reads the newest 200 transfers of the main account on the debt ledger. It looks for the offer transfer to the debt pool: the same amount, sent after the entry was saved, with the liquidation id in the memo.
+2. It ignores a liquidation id that already has a row.
+3. If exactly one transfer fits, the bot reads that liquidation from the lending canister. The debt asset and the collateral asset must agree with the saved request, and a share payout is accepted only if the request asked for shares.
+4. Then the bot makes the row, as for a normal answer. Collateral that the canister paid as shares gets the status `held_shares`, and the withdraw step continues from there.
+
+What to know:
+
+- **No transfer found.** The entry stays ambiguous, and the next run looks again. The ledger index can be behind.
+- **More than one transfer fits, or the canister data does not agree.** The entry stays ambiguous, and the log has a `[recovery] entry stays open` warning. An operator must look at it.
+- **A liquidation that failed in the canister.** The bot closes the entry as failed and makes no row.
+- **Age limit.** The recovery does not touch an entry that is older than 7 days. An operator possibly moved its collateral by hand already.
+- **Debt on an ICP ledger only.** An entry with a native SOL debt stays ambiguous.
+- **Log events:** `liquidation_recovered` for each recovered liquidation, and one summary line `Interrupted liquidation calls checked` with the counts `recovered`, `failed` and `open`. A recovered liquidation also sends a watchdog notice.
 
 ### Swap Configuration
 
