@@ -55,6 +55,26 @@ pub struct ExecutionReceipt {
 }
 
 impl ExecutionReceipt {
+    /// Returns the receipt of a liquidation that the canister answered.
+    /// The normal call and the recovery of an interrupted call both use it, so their rows are the same.
+    pub fn from_result(request: ExecutorRequest, liquidation: LiquidationResult) -> Self {
+        let status = match (&liquidation.status, &liquidation.collateral_tx.status) {
+            (LiquidationStatus::FailedLiquidation(error), _) => ExecutionStatus::FailedLiquidation(error.clone()),
+            (_, TransferStatus::Success) => ExecutionStatus::Success,
+            (_, TransferStatus::Pending) => ExecutionStatus::CollateralTransferFailed("collateral pending".to_string()),
+            (_, TransferStatus::Failed(error)) => ExecutionStatus::CollateralTransferFailed(error.clone()),
+        };
+        // A failed liquidation keeps the default, as before. No retry reads this flag.
+        let change_received = matches!(status, ExecutionStatus::FailedLiquidation(_))
+            || matches!(liquidation.change_tx.status, TransferStatus::Success);
+        Self {
+            request,
+            liquidation_result: Some(liquidation),
+            status,
+            change_received,
+        }
+    }
+
     /// Takes the pool's current view of the liquidation. A collateral transfer
     /// that has landed clears its earlier failure. Returns whether anything changed.
     pub fn apply_pool_view(&mut self, mut fresh: LiquidationResult) -> bool {
@@ -159,31 +179,22 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     }
                 };
 
-                receipt.liquidation_result = Some(liq.clone());
-                if let LiquidationStatus::FailedLiquidation(err) = &liq.status {
+                // A missing change must not stop the receipt: the WAL is the only handoff of the
+                // collateral to the finalizer. The batch end reports the unpaid change (audit L04).
+                let receipt = ExecutionReceipt::from_result(executor_request.clone(), liq.clone());
+                if let ExecutionStatus::FailedLiquidation(err) = &receipt.status {
                     warn!(
                         "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | {summary} | err={err}",
                         liq.id
                     );
-                    receipt.status = ExecutionStatus::FailedLiquidation(err.clone());
-                    return self.save_failed(&intent_id, Some(liq.id.to_string()), receipt, err).await;
+                    let err = err.clone();
+                    return self.save_failed(&intent_id, Some(liq.id.to_string()), receipt, &err).await;
                 }
-
-                // A missing change must not stop the receipt: the WAL is the only handoff of the
-                // collateral to the finalizer. The batch end reports the unpaid change (audit L04).
-                receipt.change_received = matches!(liq.change_tx.status, TransferStatus::Success);
-
-                let collateral_error = match &liq.collateral_tx.status {
-                    TransferStatus::Success => None,
-                    TransferStatus::Pending => Some("collateral pending".to_string()),
-                    TransferStatus::Failed(err) => Some(err.clone()),
-                };
-                if let Some(error) = collateral_error {
+                if matches!(receipt.status, ExecutionStatus::CollateralTransferFailed(_)) {
                     info!(
                         "[executor] 🧱 collateral_tx status={:?} liq_id={}",
                         liq.collateral_tx.status, liq.id
                     );
-                    receipt.status = ExecutionStatus::CollateralTransferFailed(error);
                 }
 
                 debug!("Executed liquidation {:?}", liq);

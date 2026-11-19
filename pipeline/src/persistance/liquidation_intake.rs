@@ -167,7 +167,7 @@ impl LiquidationIntentStore for SqliteWalStore {
         conn.transaction::<_, anyhow::Error, _>(|conn| {
             let updated = diesel::sql_query(
                 "UPDATE liquidation_intents SET liquidation_id = ?, status = ?, receipt_json = ?, \
-                 last_error = NULL, updated_at = ? WHERE intent_id = ? AND status = ?",
+                 last_error = NULL, updated_at = ? WHERE intent_id = ? AND status IN (?, ?)",
             )
             .bind::<Text, _>(liquidation_id)
             .bind::<Integer, _>(LiquidationIntentStatus::Accepted as i32)
@@ -175,9 +175,10 @@ impl LiquidationIntentStore for SqliteWalStore {
             .bind::<BigInt, _>(now)
             .bind::<Text, _>(intent_id)
             .bind::<Integer, _>(LiquidationIntentStatus::Submitting as i32)
+            .bind::<Integer, _>(LiquidationIntentStatus::Ambiguous as i32)
             .execute(conn)?;
             if updated != 1 {
-                anyhow::bail!("intent {intent_id} is missing or no longer submitting");
+                anyhow::bail!("intent {intent_id} is missing or already closed");
             }
             diesel::sql_query(
                 "INSERT INTO liquidation_results (liq_id, status, created_at, updated_at, meta_json, last_error) \
@@ -210,7 +211,7 @@ impl LiquidationIntentStore for SqliteWalStore {
         let mut conn = self.get_conn()?;
         let updated = diesel::sql_query(
             "UPDATE liquidation_intents SET liquidation_id = ?, status = ?, receipt_json = ?, \
-             last_error = ?, updated_at = ? WHERE intent_id = ? AND status = ?",
+             last_error = ?, updated_at = ? WHERE intent_id = ? AND status IN (?, ?)",
         )
         .bind::<Nullable<Text>, _>(liquidation_id)
         .bind::<Integer, _>(LiquidationIntentStatus::Failed as i32)
@@ -219,9 +220,10 @@ impl LiquidationIntentStore for SqliteWalStore {
         .bind::<BigInt, _>(now_secs())
         .bind::<Text, _>(intent_id)
         .bind::<Integer, _>(LiquidationIntentStatus::Submitting as i32)
+        .bind::<Integer, _>(LiquidationIntentStatus::Ambiguous as i32)
         .execute(&mut conn)?;
         if updated != 1 {
-            anyhow::bail!("intent {intent_id} is missing or no longer submitting");
+            anyhow::bail!("intent {intent_id} is missing or already closed");
         }
         Ok(())
     }
@@ -263,6 +265,19 @@ impl LiquidationIntentStore for SqliteWalStore {
         .bind::<Integer, _>(LiquidationIntentStatus::Submitting as i32)
         .execute(&mut conn)?;
         Ok(updated)
+    }
+
+    async fn list_ambiguous(&self) -> Result<Vec<LiquidationIntentRecord>> {
+        let mut conn = self.get_conn()?;
+        diesel::sql_query(
+            "SELECT intent_id, liquidation_id, status, request_json, receipt_json, last_error, \
+             created_at, updated_at FROM liquidation_intents WHERE status = ? ORDER BY created_at ASC",
+        )
+        .bind::<Integer, _>(LiquidationIntentStatus::Ambiguous as i32)
+        .load::<IntentSqlRow>(&mut conn)?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
     }
 
     async fn get_intent(&self, intent_id: &str) -> Result<Option<LiquidationIntentRecord>> {
