@@ -131,6 +131,13 @@ impl MultiVenueFinalizer {
         let released_to = match wrapper.share_holding.as_mut() {
             Some(holding) => {
                 let release = share_release(&row.id, holding.open.as_ref(), &request.action, crate::utils::now_ts())?;
+                if release.rest_is_absent {
+                    if holding.arrived == 0u8 {
+                        return Err(format!("row {} has no arrived tokens, so it has nothing to swap", row.id));
+                    }
+                    let rest = holding.remaining();
+                    holding.written_off += rest;
+                }
                 holding.open = release.open;
                 holding.withdrawn += release.newly_withdrawn;
                 holding.next_try_at = 0;
@@ -231,7 +238,7 @@ fn share_row_report(row: &LiqResultRecord, wrapper: &LiqMetaWrapper) -> String {
                     "  withdraw {outflow_id} of {} waits for its payout: --release waits for it again",
                     shown(amount)
                 ),
-                None => "  no open withdraw: --release lets the bot withdraw what is still held".to_string(),
+                None => "  no open withdraw: --release lets the bot withdraw what is still held; --absent, when the position is empty, sends the row to the swap with what arrived".to_string(),
             });
         }
         None => {
@@ -250,6 +257,8 @@ struct ShareRelease {
     open: Option<OpenWithdraw>,
     /// The amount that the action counts as withdrawn now.
     newly_withdrawn: Nat,
+    /// True when the row stops waiting for the amount that is still held.
+    rest_is_absent: bool,
 }
 
 /// Returns the new state of a parked share row after an operator action, or an error when the action does not fit.
@@ -276,12 +285,14 @@ fn share_release(
                 at: now,
             }),
             newly_withdrawn: amount.clone(),
+            rest_is_absent: false,
         }),
         // Rule 2: the operator saw that the withdraw did not run. The bot withdraws the amount again later.
         (Some(OpenWithdraw::Submitting { .. }), ReconcileAction::Answer(OperatorDecision::Absent)) => {
             Ok(ShareRelease {
                 open: None,
                 newly_withdrawn: nothing(),
+                rest_is_absent: false,
             })
         }
         // Rule 3: a withdraw with an unknown outcome needs an answer, because a plain release could withdraw twice.
@@ -305,14 +316,22 @@ fn share_release(
                 at: now,
             }),
             newly_withdrawn: nothing(),
+            rest_is_absent: false,
         }),
         // Rule 5: no open withdraw. The bot withdraws the amount that is still held.
         (None, ReconcileAction::Release) => Ok(ShareRelease {
             open: None,
             newly_withdrawn: nothing(),
+            rest_is_absent: false,
         }),
-        // Rule 6: an answer to a row that has no open question.
-        _ => Err(format!("row {row_id} has no open question; use --release")),
+        // Rule 6: no open withdraw, and the operator saw that the position is empty. The row goes to the swap with the amount that arrived.
+        (None, ReconcileAction::Answer(OperatorDecision::Absent)) => Ok(ShareRelease {
+            open: None,
+            newly_withdrawn: nothing(),
+            rest_is_absent: true,
+        }),
+        // Rule 7: an answer that does not fit the open withdraw.
+        _ => Err(format!("row {row_id} has no open question for this answer; use --release")),
     }
 }
 
@@ -395,14 +414,17 @@ mod tests {
                     at: 100,
                 }),
                 newly_withdrawn: Nat::from(newly_withdrawn),
+                rest_is_absent: false,
             })
         };
-        let withdraw_again = || {
+        let no_open = |rest_is_absent: bool| {
             Some(ShareRelease {
                 open: None,
                 newly_withdrawn: Nat::from(0u8),
+                rest_is_absent,
             })
         };
+        let (withdraw_again, swap_what_arrived) = (|| no_open(false), || no_open(true));
         #[rustfmt::skip]
         let cases = [
             ("rule 1: unknown outcome, landed", Some(submitting()), &landed, wait_for("withdraw_9", 40_000)),
@@ -410,10 +432,10 @@ mod tests {
             ("rule 3: unknown outcome, release", Some(submitting()), &release, None),
             ("rule 4: late payout, release", Some(accepted()), &release, wait_for("withdraw_3", 0)),
             ("rule 5: nothing open, release", None, &release, withdraw_again()),
-            ("rule 6: late payout, landed", Some(accepted()), &landed, None),
-            ("rule 6: late payout, absent", Some(accepted()), &absent, None),
-            ("rule 6: nothing open, landed", None, &landed, None),
-            ("rule 6: nothing open, absent", None, &absent, None),
+            ("rule 6: nothing open, absent", None, &absent, swap_what_arrived()),
+            ("rule 7: late payout, landed", Some(accepted()), &landed, None),
+            ("rule 7: late payout, absent", Some(accepted()), &absent, None),
+            ("rule 7: nothing open, landed", None, &landed, None),
         ];
         for (name, open, action, expected) in cases {
             assert_eq!(share_release("7", open.as_ref(), action, 100).ok(), expected, "{name}");

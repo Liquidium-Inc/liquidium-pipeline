@@ -146,6 +146,36 @@ async fn liquidity_for_a_part_withdraws_the_part_and_the_rest_later() {
 }
 
 #[tokio::test]
+async fn an_empty_position_parks_the_row_and_a_written_off_rest_sends_it_to_the_swap() {
+    let fixture = Fixture::with_rows(vec![held_record("7", SEIZED, 100, true)]).await;
+
+    let mut positions = liquid_pool(40_000, SEIZED);
+    accept(&mut positions, 40_000, 40_000, "withdraw_1");
+    fixture.tick(positions).await;
+    fixture.tick(payout(Some(39_980))).await;
+
+    // The position is empty, but the row still expects 60,000.
+    fixture.tick(liquid_pool(1_000_000, 0)).await;
+    assert_eq!(fixture.row("7").await.0.status, ResultStatus::OperatorRequired);
+
+    // The operator answer `--absent` writes the rest off and gives the row back to the withdraw step.
+    let (mut row, mut wrapper) = fixture.row("7").await;
+    let holding = wrapper.share_holding.as_mut().unwrap();
+    holding.written_off = holding.remaining();
+    row.status = ResultStatus::HeldAsShares;
+    encode_meta(&mut row, &wrapper).unwrap();
+    fixture.wal.upsert_result(row).await.unwrap();
+    fixture.tick(liquid_pool(1_000_000, 0)).await;
+
+    let (row, wrapper) = fixture.row("7").await;
+    assert_eq!(row.status, ResultStatus::Enqueued);
+    assert_eq!(
+        wrapper.receipt.liquidation_result.unwrap().amounts.collateral_received,
+        Nat::from(39_980u64)
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_outcome_is_retried_only_with_proof_that_the_call_did_not_run() {
     let fixture = Fixture::with_rows(vec![held_record("7", SEIZED, 100, true)]).await;
     let mut positions = liquid_pool(1_000_000, SEIZED);

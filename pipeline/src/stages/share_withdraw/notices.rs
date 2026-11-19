@@ -4,6 +4,10 @@ use super::*;
 impl<D: WalStore> ShareWithdrawWatcher<D> {
     /// Sends one notice per held row and process run.
     pub(super) async fn announce(&self, entry: &HeldRow) {
+        // A row with nothing left to withdraw goes to the swap in this tick.
+        if entry.holding.remaining() == 0u8 {
+            return;
+        }
         if !self
             .announced
             .lock()

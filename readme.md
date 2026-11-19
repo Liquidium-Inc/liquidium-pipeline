@@ -242,12 +242,13 @@ What to know:
 - **No cap.** Nothing limits how much the bot holds as shares. A pool that stays empty can take the bot's debt tokens one liquidation after another. Watch the log lines `share_holding_total` and `share_holding_total_usd`, and the low-balance alerts.
 - **Price exposure.** The bot keeps the collateral's price risk while it waits. The shares earn supply interest, and the last held row of a pool collects it.
 - **The switch decides only new liquidations.** The bot withdraws rows that already hold shares, also when the switch is off.
-- **Operator rows.** `liquidator reconcile <id>` shows the state and names the action. The bot parks a row as `operator` in three cases:
+- **Operator rows.** `liquidator reconcile <id>` shows the state and names the action. The bot parks a row as `operator` in four cases:
 
   | Case | What to check | Action |
   |---|---|---|
   | The outcome of a withdraw call is not known | Did the position of the liquidator's profile shrink? Is there a transfer from the pool to the destination? | `--landed <withdraw id>` if it ran (for example `withdraw_123`; the bot then looks for the payout), or `--absent` if it did not. A plain `--release` is refused, because it could withdraw twice. |
   | A payout is not on the ledger after 60 minutes | The pool canister and its ledger | `--release` waits for the payout again. The bot does not withdraw again. |
+  | The position is empty, but the row still expects tokens | The position of the liquidator's profile in the pool, and the withdraws of that profile | `--absent` if the position is empty: the row goes to the swap with the amount that arrived. `--release` makes the bot look at the position again. |
   | An older canister ignored the flag and paid tokens to the main account | The main account balance | Move the tokens to the trader account, then `--release` queues the row for the swap. |
 
   A parked row with an open withdraw blocks new withdraws from its pool until an operator answers it.
