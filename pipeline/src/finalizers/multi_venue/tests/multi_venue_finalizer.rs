@@ -1432,6 +1432,90 @@ async fn bad_debt_below_minimum_edge_never_advances_a_venue_leg() {
     assert!(wal.wrapper().meta_v2.is_none(), "a rejected plan must not be committed");
 }
 
+/// A receipt of collateral that the bot held as supply shares and then withdrew.
+fn held_receipt(debt_repaid: Option<u64>) -> ExecutionReceipt {
+    let mut receipt = receipt();
+    let liquidation = receipt.liquidation_result.as_mut().expect("liquidation result");
+    liquidation.collateral_share_receiver = Some(Principal::management_canister());
+    if let Some(debt_repaid) = debt_repaid {
+        liquidation.amounts.debt_repaid = Nat::from(debt_repaid);
+    }
+    receipt
+}
+
+/// The loss floor for bad debt would let this row swap at a loss. A held row gets no such allowance.
+#[tokio::test]
+async fn held_collateral_that_is_not_in_profit_goes_to_recovery_and_is_not_swapped() {
+    // The repaid debt is above every quote. Thus the swap would return less than the debt.
+    let mut receipt = held_receipt(Some(250_000_000));
+    receipt.request.liquidation.buy_bad_debt = true;
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer()
+        .withf(|_, _, amount| amount == &Nat::from(TOTAL_PAY - 10_000))
+        .times(1)
+        .returning(|_, _, _| Ok("recovery-block-9".to_string()));
+    let config = IcpswapFirstPlannerConfig {
+        bad_debt_min_net_edge_bps: -6000,
+        ..planner_config()
+    };
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap.clone(), mexc.clone()], config)
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let completed = finalizer.finalize(&wal, receipt).await.expect("sweep to recovery");
+
+    assert!(completed.finalized);
+    assert_eq!(completed.swapper.as_deref(), Some("recovery"));
+    // Both venues gave a price, and the bot used neither.
+    assert_eq!(icpswap.previews(), 1);
+    assert_eq!(mexc.previews(), 1);
+    assert_eq!(icpswap.calls(), 0);
+    assert_eq!(mexc.calls(), 0);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.status, RecoverySweepStatus::Completed);
+    assert!(
+        state.reason.contains("held collateral is not in profit"),
+        "{}",
+        state.reason
+    );
+}
+
+#[tokio::test]
+async fn held_collateral_in_profit_is_planned_for_a_swap() {
+    let receipt = held_receipt(None);
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(0);
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap], planner_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    finalizer.finalize(&wal, receipt).await.expect("a swap plan");
+
+    let meta = wal.wrapper().meta_v2.expect("committed meta_v2");
+    assert!(matches!(meta.payload, FinalizerMetaPayload::MultiVenueSwap(_)));
+}
+
+/// Without a recovery account the row fails once and does not swap at a loss.
+#[tokio::test]
+async fn held_collateral_not_in_profit_without_a_recovery_account_fails_once() {
+    let receipt = held_receipt(Some(199_000_000));
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap.clone()]);
+
+    let error = finalizer.finalize(&wal, receipt).await.expect_err("no swap at a loss");
+
+    assert!(matches!(error, FinalizerError::Permanent(_)), "{error:?}");
+    assert!(error.message().contains("held collateral is not in profit"));
+    assert_eq!(icpswap.calls(), 0);
+}
+
 /// Bad debt repays more than the collateral is worth by construction, so a
 /// non-negative floor strands it forever. A negative floor opts into recycling
 /// that collateral, and applies only to rows actually bought as bad debt.

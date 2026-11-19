@@ -234,6 +234,7 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
         buy_bad_debt: false,
+        held_as_shares: false,
     }
 }
 
@@ -273,6 +274,7 @@ fn ckusdc_to_native_icp_input() -> IcpswapFirstPlanInput {
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
         buy_bad_debt: false,
+        held_as_shares: false,
     }
 }
 
@@ -1595,6 +1597,51 @@ async fn unprofitable_icpswap_and_mexc_report_both_rejections() {
     );
 }
 
+fn held_input() -> IcpswapFirstPlanInput {
+    IcpswapFirstPlanInput {
+        held_as_shares: true,
+        ..input_with_pay_token(native_icp())
+    }
+}
+
+fn mexc_below_the_floor() -> PlannerAdapter {
+    mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 180_000_000, 180_000_000))
+    })
+}
+
+/// Held collateral leaves the swap path only when every venue gave a price and none was in profit.
+#[tokio::test]
+async fn held_collateral_is_not_in_profit_when_every_venue_was_priced_below_the_floor() {
+    let error = planner(unprofitable_icpswap(), mexc_below_the_floor(), config(1.1))
+        .plan(&held_input(), 123)
+        .await
+        .expect_err("no route clears the floor");
+    assert!(matches!(error, IcpswapFirstPlannerError::NotInProfit(_)), "{error}");
+}
+
+/// ICPSwap gave no price, and a later try can still find a route in profit. Thus the row must not go to recovery.
+#[tokio::test]
+async fn held_collateral_is_retried_when_icpswap_gave_no_price() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let error = planner(icpswap, mexc_below_the_floor(), config(1.1))
+        .plan(&held_input(), 123)
+        .await
+        .expect_err("the overflow venue is below the floor");
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)), "{error}");
+}
+
+#[tokio::test]
+async fn collateral_that_was_not_held_is_retried_as_before() {
+    let error = planner(unprofitable_icpswap(), mexc_below_the_floor(), config(1.1))
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect_err("no route clears the floor");
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)), "{error}");
+}
+
 // Venue availability
 
 #[tokio::test]
@@ -2712,6 +2759,7 @@ proptest! {
             receive_reference_price_ray: Some(Nat::from(u128::from(receive_price) * RAY)),
             reference_price_captured_at: Some(QUOTED_AT),
             buy_bad_debt: false,
+            held_as_shares: false,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

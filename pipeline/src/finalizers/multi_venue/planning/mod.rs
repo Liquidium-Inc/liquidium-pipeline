@@ -7,5 +7,5 @@ pub(super) mod venue_registry;
 pub use icpswap_first_planner::*;
 #[cfg(test)]
 pub(in crate::finalizers::multi_venue) use icpswap_first_planner::{
-    oracle_guard_waiver_banner, oracle_price_symbol, reference_price_usd,
+    oracle_guard_waiver_banner, oracle_price_symbol,
 };
