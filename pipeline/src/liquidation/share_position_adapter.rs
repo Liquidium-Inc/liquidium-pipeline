@@ -1,24 +1,19 @@
 //! Calls for collateral that the bot holds as supply shares: pool liquidity, the position, the withdraw, and the ledger check for the payout.
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use candid::{CandidType, Decode, Encode, Nat, Principal, Reserved};
-use ic_ledger_types::{AccountIdentifier, Subaccount};
+use candid::{Decode, Encode, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_connectors::backend::bridge_backend::{account_transactions, ledger_index};
+use liquidium_pipeline_connectors::backend::ledger_history_backend::{LedgerHistoryBackend, LedgerTransfer};
 use liquidium_pipeline_connectors::pipeline_agent::{PipelineAgent, UpdateFailure};
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::types::protocol_types::{
     IcpCallerAuth, LendingOutflow, LendingPositionView, LendingSignature, LendingWithdrawRequest, ProtocolError,
     SignedLendingWithdraw, WithdrawDestination,
 };
-use serde::Deserialize;
 
-use crate::utils::{ICP_LEDGER_PRINCIPAL, now_ts};
-
-/// The index canister of the ICP ledger. The ICP ledger does not give its index (no ICRC-106).
-const ICP_INDEX: &str = "qhbym-qaaaa-aaaaa-aaafq-cai";
+use crate::liquidation::ledger_party_utils::{has_subaccount, is_default_account, is_owned_by};
+use crate::utils::now_ts;
 
 /// How many of the newest transactions of the destination one arrival check reads.
 const ARRIVAL_SCAN_DEPTH: u64 = 100;
@@ -91,52 +86,26 @@ pub trait SharePositions: Send + Sync {
 
 pub struct LendingSharePositions<A: PipelineAgent> {
     agent: Arc<A>,
+    history: Arc<dyn LedgerHistoryBackend>,
     lending_canister: Principal,
     /// The principal that signs the calls. The canister requires it as the signer of a withdraw.
     caller: Principal,
-    index_by_ledger: Mutex<HashMap<Principal, Principal>>,
 }
 
 impl<A: PipelineAgent> LendingSharePositions<A> {
-    pub fn new(agent: Arc<A>, lending_canister: Principal, caller: Principal) -> Self {
+    pub fn new(
+        agent: Arc<A>,
+        history: Arc<dyn LedgerHistoryBackend>,
+        lending_canister: Principal,
+        caller: Principal,
+    ) -> Self {
         Self {
             agent,
+            history,
             lending_canister,
             caller,
-            index_by_ledger: Mutex::new(HashMap::new()),
         }
     }
-
-    async fn index_of(&self, ledger: Principal) -> Result<Principal, String> {
-        if let Some(index) = self.index_by_ledger.lock().expect("index cache").get(&ledger) {
-            return Ok(*index);
-        }
-        let index = ledger_index(self.agent.as_ref(), ledger).await?;
-        self.index_by_ledger.lock().expect("index cache").insert(ledger, index);
-        Ok(index)
-    }
-
-    async fn icp_transactions(&self, destination: Principal) -> Result<Vec<IcpIndexedTransaction>, String> {
-        let request = IcpAccountTransactionsArgs {
-            account: Account {
-                owner: destination,
-                subaccount: None,
-            },
-            start: None,
-            max_results: Nat::from(ARRIVAL_SCAN_DEPTH),
-        };
-        let arg = Encode!(&request).map_err(|error| error.to_string())?;
-        let index = Principal::from_text(ICP_INDEX).expect("ICP index principal");
-        let answer: Result<IcpAccountTransactions, IcpIndexError> =
-            self.agent.call_query(&index, "get_account_transactions", arg).await?;
-        Ok(answer
-            .map_err(|error| format!("ICP index did not list {destination}: {}", error.message))?
-            .transactions)
-    }
-}
-
-fn icp_ledger() -> Principal {
-    Principal::from_text(ICP_LEDGER_PRINCIPAL).expect("ICP ledger principal")
 }
 
 fn ledger_of(token: &ChainToken) -> Result<Principal, String> {
@@ -146,80 +115,21 @@ fn ledger_of(token: &ChainToken) -> Result<Principal, String> {
     }
 }
 
-fn account_id_hex(owner: Principal) -> String {
-    AccountIdentifier::new(&owner, &Subaccount([0; 32])).to_hex()
-}
-
 /// Returns the memo that the pool writes on the payout of `outflow_id`.
 fn payout_memo(outflow_id: &str) -> Vec<u8> {
     outflow_id.as_bytes().iter().take(PAYOUT_MEMO_BYTES).copied().collect()
 }
 
-#[derive(CandidType)]
-struct IcpAccountTransactionsArgs {
-    account: Account,
-    start: Option<Nat>,
-    max_results: Nat,
-}
-
-#[derive(CandidType, Deserialize)]
-struct IcpIndexError {
-    message: String,
-}
-
-#[derive(CandidType, Deserialize)]
-struct IcpAccountTransactions {
-    transactions: Vec<IcpIndexedTransaction>,
-}
-
-#[derive(CandidType, Deserialize)]
-struct IcpIndexedTransaction {
-    id: u64,
-    transaction: IcpTransaction,
-}
-
-#[derive(CandidType, Deserialize)]
-struct IcpTransaction {
-    icrc1_memo: Option<Vec<u8>>,
-    operation: IcpOperation,
-}
-
-#[derive(CandidType, Deserialize)]
-struct IcpTokens {
-    e8s: u64,
-}
-
-/// The operations of the ICP index. The bot uses only a transfer.
-#[derive(CandidType, Deserialize)]
-enum IcpOperation {
-    Approve(Reserved),
-    Burn(Reserved),
-    Mint(Reserved),
-    Transfer {
-        to: String,
-        from: String,
-        amount: IcpTokens,
-    },
-}
-
 /// Returns the amount of a transfer when it is the payout that `query` looks for.
 /// The payout has the withdraw id as memo, or it comes from a pool subaccount after the withdraw.
-fn icrc_payout_amount(
-    query: &PayoutQuery,
-    index: u64,
-    transfer: &icrc_ledger_types::icrc3::transactions::Transfer,
-) -> Option<Nat> {
-    let to_destination = transfer.to.owner == query.destination && transfer.to.effective_subaccount() == &[0u8; 32];
-    if !to_destination || transfer.from.owner != query.pool {
+fn payout_amount(query: &PayoutQuery, transfer: &LedgerTransfer) -> Option<Nat> {
+    if !is_default_account(&transfer.to, query.destination) || !is_owned_by(&transfer.from, query.pool) {
         return None;
     }
     let memo = payout_memo(&query.outflow_id);
-    let direct = transfer
-        .memo
-        .as_ref()
-        .is_some_and(|found| found.0.as_slice() == memo.as_slice());
-    let two_step = transfer.from.subaccount.is_some()
-        && index > query.after_index
+    let direct = transfer.memo.as_deref() == Some(memo.as_slice());
+    let two_step = has_subaccount(&transfer.from)
+        && transfer.index > query.after_index
         && transfer.amount >= query.min_amount
         && transfer.amount <= query.max_amount;
     (direct || two_step).then(|| transfer.amount.clone())
@@ -297,67 +207,38 @@ impl<A: PipelineAgent> SharePositions for LendingSharePositions<A> {
     }
 
     async fn newest_index(&self, token: ChainToken, destination: Principal) -> Result<u64, String> {
-        let ledger = ledger_of(&token)?;
-        if ledger == icp_ledger() {
-            let transactions = self.icp_transactions(destination).await?;
-            return Ok(transactions.iter().map(|entry| entry.id).max().unwrap_or(0));
-        }
-        let index = self.index_of(ledger).await?;
-        let account = Account {
-            owner: destination,
-            subaccount: None,
-        };
-        let transactions = account_transactions(self.agent.as_ref(), index, &account, 1).await?;
-        Ok(transactions.iter().map(|(id, _)| *id).max().unwrap_or(0))
+        self.history
+            .newest_index(ledger_of(&token)?, default_account(destination))
+            .await
     }
 
     async fn arrived(&self, query: PayoutQuery) -> Result<Option<Nat>, String> {
-        let ledger = ledger_of(&query.token)?;
-        if ledger == icp_ledger() {
-            // The ICP pool pays in one transfer. The memo identifies the payout.
-            let memo = payout_memo(&query.outflow_id);
-            let from = account_id_hex(query.pool);
-            let to = account_id_hex(query.destination);
-            let found = self
-                .icp_transactions(query.destination)
-                .await?
-                .into_iter()
-                .find_map(|entry| match entry.transaction.operation {
-                    IcpOperation::Transfer {
-                        to: found_to,
-                        from: found_from,
-                        amount,
-                    } if found_to == to
-                        && found_from == from
-                        && entry.transaction.icrc1_memo.as_deref() == Some(&memo[..]) =>
-                    {
-                        Some(Nat::from(amount.e8s))
-                    }
-                    _ => None,
-                });
-            return Ok(found);
-        }
-        let index = self.index_of(ledger).await?;
-        let account = Account {
-            owner: query.destination,
-            subaccount: None,
-        };
-        let transactions = account_transactions(self.agent.as_ref(), index, &account, ARRIVAL_SCAN_DEPTH).await?;
-        Ok(transactions.iter().find_map(|(id, transaction)| {
-            transaction
-                .transfer
-                .as_ref()
-                .and_then(|transfer| icrc_payout_amount(&query, *id, transfer))
-        }))
+        let transfers = self
+            .history
+            .recent_transfers(
+                ledger_of(&query.token)?,
+                default_account(query.destination),
+                ARRIVAL_SCAN_DEPTH,
+            )
+            .await?;
+        Ok(transfers.iter().find_map(|transfer| payout_amount(&query, transfer)))
+    }
+}
+
+fn default_account(owner: Principal) -> Account {
+    Account {
+        owner,
+        subaccount: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icrc_ledger_types::icrc1::transfer::Memo;
-    use icrc_ledger_types::icrc3::transactions::Transfer;
+    use liquidium_pipeline_connectors::backend::ledger_history_backend::{LedgerParty, MockLedgerHistoryBackend};
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
+
+    use crate::liquidation::ledger_party_utils::default_account_id_hex;
 
     fn p(text: &str) -> Principal {
         Principal::from_text(text).unwrap()
@@ -384,28 +265,24 @@ mod tests {
         }
     }
 
-    fn transfer(from_subaccount: Option<[u8; 32]>, memo: Option<&str>, amount: u64) -> Transfer {
+    fn transfer(index: u64, from_subaccount: Option<[u8; 32]>, memo: Option<&str>, amount: u64) -> LedgerTransfer {
         let query = query();
-        Transfer {
-            amount: Nat::from(amount),
-            from: Account {
+        LedgerTransfer {
+            index,
+            from: LedgerParty::Account(Account {
                 owner: query.pool,
                 subaccount: from_subaccount,
-            },
-            to: Account {
-                owner: query.destination,
-                subaccount: None,
-            },
-            spender: None,
-            memo: memo.map(|text| Memo::from(text.as_bytes().to_vec())),
-            fee: None,
-            created_at_time: None,
+            }),
+            to: LedgerParty::Account(default_account(query.destination)),
+            amount: Nat::from(amount),
+            memo: memo.map(|text| text.as_bytes().to_vec()),
+            timestamp_nanos: None,
         }
     }
 
     #[test]
     fn a_direct_payout_is_found_by_its_memo() {
-        let found = icrc_payout_amount(&query(), 400, &transfer(None, Some("withdraw_7"), 9_990));
+        let found = payout_amount(&query(), &transfer(400, None, Some("withdraw_7"), 9_990));
         assert_eq!(found, Some(Nat::from(9_990u64)));
     }
 
@@ -413,52 +290,62 @@ mod tests {
     fn a_collateral_payout_of_a_normal_liquidation_is_not_the_withdraw() {
         // The pool and the destination are the same. Only the memo is different.
         assert_eq!(
-            icrc_payout_amount(&query(), 600, &transfer(None, Some("liq_55"), 9_990)),
+            payout_amount(&query(), &transfer(600, None, Some("liq_55"), 9_990)),
             None
         );
     }
 
     #[test]
     fn a_two_step_payout_is_found_after_the_withdraw() {
-        let found = icrc_payout_amount(&query(), 501, &transfer(Some([7; 32]), None, 9_980));
+        let found = payout_amount(&query(), &transfer(501, Some([7; 32]), None, 9_980));
         assert_eq!(found, Some(Nat::from(9_980u64)));
     }
 
     #[test]
     fn a_two_step_payout_from_before_the_withdraw_does_not_count() {
         assert_eq!(
-            icrc_payout_amount(&query(), 500, &transfer(Some([7; 32]), None, 9_980)),
+            payout_amount(&query(), &transfer(500, Some([7; 32]), None, 9_980)),
             None
         );
     }
 
     #[test]
     fn a_small_transfer_from_another_withdraw_does_not_count() {
-        assert_eq!(
-            icrc_payout_amount(&query(), 501, &transfer(Some([7; 32]), None, 12)),
-            None
-        );
+        assert_eq!(payout_amount(&query(), &transfer(501, Some([7; 32]), None, 12)), None);
     }
 
     /// The bot does not take a late payout of a larger, earlier withdraw for this one.
     #[test]
     fn a_two_step_transfer_above_the_withdrawn_amount_does_not_count() {
         assert_eq!(
-            icrc_payout_amount(&query(), 501, &transfer(Some([7; 32]), None, 99_980)),
+            payout_amount(&query(), &transfer(501, Some([7; 32]), None, 99_980)),
             None
         );
     }
 
     #[test]
     fn a_transfer_from_another_sender_does_not_count() {
-        let mut other = transfer(None, Some("withdraw_7"), 9_990);
-        other.from.owner = Principal::anonymous();
-        assert_eq!(icrc_payout_amount(&query(), 600, &other), None);
+        let mut other = transfer(600, None, Some("withdraw_7"), 9_990);
+        other.from = LedgerParty::Account(default_account(Principal::anonymous()));
+        assert_eq!(payout_amount(&query(), &other), None);
+    }
+
+    /// The ICP index gives account identifiers. The bot finds the direct payout of the ICP pool by its memo.
+    #[test]
+    fn a_direct_payout_on_the_icp_ledger_is_found_by_its_memo() {
+        let query = query();
+        let mut icp = transfer(600, None, Some("withdraw_7"), 9_990);
+        icp.from = LedgerParty::AccountId(default_account_id_hex(query.pool));
+        icp.to = LedgerParty::AccountId(default_account_id_hex(query.destination));
+        assert_eq!(payout_amount(&query, &icp), Some(Nat::from(9_990u64)));
+        icp.to = LedgerParty::AccountId(default_account_id_hex(Principal::anonymous()));
+        assert_eq!(payout_amount(&query, &icp), None);
     }
 
     fn positions(agent: MockPipelineAgent) -> LendingSharePositions<MockPipelineAgent> {
         LendingSharePositions::new(
             Arc::new(agent),
+            Arc::new(MockLedgerHistoryBackend::new()),
             p("nja4y-2yaaa-aaaae-qddxa-cai"),
             Principal::anonymous(),
         )

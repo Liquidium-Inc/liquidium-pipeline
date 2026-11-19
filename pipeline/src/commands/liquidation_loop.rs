@@ -1,4 +1,5 @@
 use candid::{Nat, Principal};
+use liquidium_pipeline_connectors::backend::ledger_history_backend::IndexLedgerHistory;
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
     collections::{HashMap, HashSet},
@@ -196,6 +197,7 @@ async fn park_unresumable_row(db: &SqliteWalStore, row_id: &str, reason: String)
 fn share_positions(ctx: &PipelineContext) -> Arc<dyn SharePositions> {
     Arc::new(LendingSharePositions::new(
         ctx.agent.clone(),
+        Arc::new(IndexLedgerHistory::new(ctx.agent.clone())),
         ctx.config.lending_canister,
         ctx.config.liquidator_principal,
     ))
