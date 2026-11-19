@@ -582,6 +582,7 @@ fn status_short(status: ResultStatus) -> &'static str {
         ResultStatus::WaitingProfit => "wait_profit",
         ResultStatus::OperatorRequired => "operator",
         ResultStatus::Unresumable => "unresumable",
+        ResultStatus::HeldAsShares => "held_shares",
     }
 }
 
@@ -590,7 +591,9 @@ fn status_style(status: ResultStatus) -> Style {
         ResultStatus::Succeeded => Style::default().fg(Color::Green),
         ResultStatus::FailedRetryable | ResultStatus::FailedPermanent => Style::default().fg(Color::Red),
         ResultStatus::InFlight => Style::default().fg(Color::Yellow),
-        ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => Style::default().fg(Color::Cyan),
+        ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit | ResultStatus::HeldAsShares => {
+            Style::default().fg(Color::Cyan)
+        }
         ResultStatus::OperatorRequired => Style::default().fg(Color::Magenta),
         ResultStatus::Unresumable => Style::default().fg(Color::Red),
         ResultStatus::Enqueued => Style::default().fg(Color::DarkGray),

@@ -547,6 +547,7 @@ mod tests {
             }),
             venue_execution: None,
             meta_v2: None,
+            share_holding: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
 

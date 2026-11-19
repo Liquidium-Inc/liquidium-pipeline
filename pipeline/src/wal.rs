@@ -360,6 +360,7 @@ mod tests {
             profit_snapshot: None,
             venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
             meta_v2: None,
+            share_holding: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
         let encoded: serde_json::Value = serde_json::from_str(&row.meta_json).expect("encoded wrapper json");

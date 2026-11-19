@@ -131,6 +131,7 @@ impl TestWal {
                 version: FINALIZER_META_V2_VERSION,
                 payload: FinalizerMetaPayload::RecoverySweep(state),
             }),
+            share_holding: None,
         })
     }
 
@@ -1844,6 +1845,7 @@ async fn committed_legacy_state_is_rejected_without_being_upgraded() {
         profit_snapshot: None,
         venue_execution: None,
         meta_v2: None,
+        share_holding: None,
     };
     wrapper.venue_execution = Some(VenueExecutionState {
         venue: MEXC_VENUE_ID.to_string(),
