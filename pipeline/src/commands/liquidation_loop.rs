@@ -38,6 +38,7 @@ use crate::{
     },
     operator::OperatorDesk,
     liquidation::collateral_service::CollateralService,
+    liquidation::intent_recovery::IntentRecovery,
     liquidation::share_payout_policy::LiquidityPayoutPolicy,
     liquidation::share_position_adapter::{LendingSharePositions, SharePositions},
     stages::share_withdraw_watcher::ShareWithdrawWatcher,
@@ -619,11 +620,26 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         }
     });
 
+    let intent_recovery = Arc::new({
+        let recovery = IntentRecovery::new(
+            ctx.agent.clone(),
+            wal.clone(),
+            Arc::new(IndexLedgerHistory::new(ctx.agent.clone())),
+            config.lending_canister,
+            config.liquidator_principal,
+        );
+        match slack_watchdog.clone() {
+            Some(watchdog) => recovery.with_watchdog(watchdog),
+            None => recovery,
+        }
+    });
+
     let _execution_worker = match spawn_execution_worker(
         finalizer,
         wal,
         settlement,
         share_withdrawals,
+        intent_recovery,
         exporter,
         config.enabled_swap_venues.clone(),
         config.icpswap_mnemonic.clone(),

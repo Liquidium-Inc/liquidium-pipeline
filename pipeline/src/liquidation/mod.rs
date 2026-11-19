@@ -1,4 +1,6 @@
 pub mod collateral_service;
+#[path = "intent_recovery/intent_recovery.rs"]
+pub mod intent_recovery;
 pub mod ledger_party_utils;
 pub mod lending_queries;
 pub mod liquidation_math;

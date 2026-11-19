@@ -3,7 +3,7 @@ use std::{
     panic::AssertUnwindSafe,
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{FutureExt, StreamExt, stream};
@@ -17,6 +17,7 @@ use crate::{
         liquidation_outcome::LiquidationOutcome, multi_venue::MultiVenueFinalizer,
         profit_calculator::SimpleProfitCalculator,
     },
+    liquidation::intent_recovery::IntentRecovery,
     persistance::sqlite::SqliteWalStore,
     stage::PipelineStage,
     stages::{
@@ -33,6 +34,9 @@ const EXECUTION_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const EXECUTION_WORKER_PANIC_DELAY: Duration = Duration::from_secs(1);
 const SETTLEMENT_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
 const SHARE_WITHDRAW_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
+const INTENT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// The pause between two tries to recover interrupted liquidation calls. The first try runs at start.
+const INTENT_RECOVERY_INTERVAL: Duration = Duration::from_secs(3_600);
 const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const LIQUIDATION_NOTIFY_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,6 +45,7 @@ const LIQUIDATION_NOTIFY_CONCURRENCY: usize = 4;
 pub(crate) type RuntimeFinalizer = FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>;
 pub(crate) type RuntimeSettlementWatcher = SettlementWatcher<Agent, SqliteWalStore>;
 pub(crate) type RuntimeShareWithdrawWatcher = ShareWithdrawWatcher<SqliteWalStore>;
+pub(crate) type RuntimeIntentRecovery = IntentRecovery<Agent, SqliteWalStore>;
 
 /// Starts venue execution on a dedicated OS thread with its own Tokio runtime.
 ///
@@ -52,6 +57,7 @@ pub(crate) fn spawn_execution_worker(
     wal: Arc<SqliteWalStore>,
     settlement: Arc<RuntimeSettlementWatcher>,
     share_withdrawals: Arc<RuntimeShareWithdrawWatcher>,
+    intent_recovery: Arc<RuntimeIntentRecovery>,
     exporter: Arc<ExportStage>,
     enabled_venues: Vec<String>,
     icpswap_mnemonic: Arc<str>,
@@ -66,6 +72,7 @@ pub(crate) fn spawn_execution_worker(
             wal,
             settlement,
             share_withdrawals,
+            intent_recovery,
             exporter,
             enabled_venues,
             icpswap_mnemonic,
@@ -97,6 +104,7 @@ async fn run_execution_worker(
     wal: Arc<SqliteWalStore>,
     settlement: Arc<RuntimeSettlementWatcher>,
     share_withdrawals: Arc<RuntimeShareWithdrawWatcher>,
+    intent_recovery: Arc<RuntimeIntentRecovery>,
     exporter: Arc<ExportStage>,
     enabled_venues: Vec<String>,
     icpswap_mnemonic: Arc<str>,
@@ -119,7 +127,14 @@ async fn run_execution_worker(
         }
     }
 
+    let mut next_intent_recovery = Instant::now();
     loop {
+        // A recovered row is ready before the steps below run, so they take it in the same cycle.
+        if Instant::now() >= next_intent_recovery {
+            next_intent_recovery = Instant::now() + INTENT_RECOVERY_INTERVAL;
+            recover_interrupted_liquidations(intent_recovery.as_ref()).await;
+        }
+
         let cycle = run_execution_cycle(
             finalizer.as_ref(),
             settlement.as_ref(),
@@ -136,6 +151,21 @@ async fn run_execution_worker(
         }
 
         sleep(EXECUTION_WORKER_POLL_INTERVAL).await;
+    }
+}
+
+/// Looks for the results of liquidation calls whose answer the bot did not get. A failure only logs.
+async fn recover_interrupted_liquidations(recovery: &RuntimeIntentRecovery) {
+    match timeout(INTENT_RECOVERY_TIMEOUT, recovery.resolve_ambiguous()).await {
+        Ok(Ok(summary)) if summary.recovered + summary.failed + summary.open != 0 => info!(
+            recovered = summary.recovered,
+            failed = summary.failed,
+            open = summary.open,
+            "Interrupted liquidation calls checked"
+        ),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!("Recovery of interrupted liquidation calls failed: {error}"),
+        Err(_) => warn!("Recovery of interrupted liquidation calls timed out"),
     }
 }
 
