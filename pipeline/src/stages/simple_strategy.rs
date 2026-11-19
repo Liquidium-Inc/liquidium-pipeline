@@ -5,8 +5,8 @@ use std::{
 
 use crate::config::ConfigTrait;
 use crate::constants::repay_buffer_native_units;
-use crate::liquidation::share_payout_policy::SharePayoutPolicy;
 use crate::executors::executor::ExecutorRequest;
+use crate::liquidation::share_payout_policy::SharePayoutPolicy;
 
 use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
@@ -916,9 +916,10 @@ where
                 )
                 .await;
 
-            // The main account receives collateral without a swap, and each share payout, because the canister pays shares only to the caller.
-            // The trader account receives the other collateral, for the swap (audit L03).
-            let collateral_receiver = if swap_args.is_some() && !as_shares {
+            // The trader account receives collateral for a swap (audit L03).
+            // A share payout goes to the main account, because the canister pays shares only to the caller.
+            let pays_trader = swap_args.is_some() && !as_shares;
+            let collateral_receiver = if pays_trader {
                 self.config.get_trader_principal()
             } else {
                 self.config.get_liquidator_principal()
