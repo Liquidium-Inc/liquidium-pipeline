@@ -150,6 +150,7 @@ This will:
 
 - Re-running the install command (without `--tag`/`--branch`) upgrades to the latest released tag.
 - `config.env` is preserved across upgrades; new config keys should be added manually when needed.
+- **Upgrade from a version before the ICPSwap routes:** before the restart, set `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=500` in your `config.env`. With the old value `250`, the bot stops at startup, because the discount must be above the new route limit of 300 bps (`ICPSWAP_MAX_ROUTE_COST_BPS`).
 - Legacy alias `CEX_BUY_INVERSE_OVESPEND_BPS` remains accepted, while `CEX_BUY_INVERSE_OVERSPEND_BPS` is canonical.
 
 ---
