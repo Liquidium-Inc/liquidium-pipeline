@@ -260,7 +260,13 @@ async fn a_resumed_order_is_judged_by_the_bound_it_went_out_with() {
 
     finalizer.trade(&mut state).await.expect("the fill met its own bound");
 
-    assert_eq!(orders.lock().unwrap().len(), 1);
+    // The order itself goes out at today's bound, in case no earlier attempt reached the exchange.
+    let limits = sent_limits(&orders);
+    assert_eq!(limits.len(), 1);
+    assert!(
+        (limits[0].reference_price - oracle_order_price()).abs() < 1e-12,
+        "{limits:?}"
+    );
     assert_eq!(state.trade.trade_pending_oracle_bound, None);
     assert_eq!(state.trade.trade_leg_index, Some(1));
 }

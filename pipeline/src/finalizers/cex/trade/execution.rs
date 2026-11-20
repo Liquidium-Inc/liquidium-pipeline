@@ -138,16 +138,21 @@ where
                 .oracle_price_bound(leg, state.trade.trade_oracle_route_keep.unwrap_or(1.0))
                 .await
                 .inspect_err(|err| state.last_error = Some(err.to_string()))?;
-            // A resumed order goes out again under its id, so its fill is read
-            // back. It is judged by the bound it was sent with, not by today's price.
+            // Every order goes out at today's bound. A resumed order goes out
+            // again under its id, and the fill read back may be the one an
+            // earlier attempt sent under the bound saved with it, so the fill is
+            // judged by the looser of the two.
             let resuming = state
                 .trade
                 .trade_pending_client_order_id
                 .as_ref()
                 .is_some_and(|id| !state.trade.trade_applied_client_order_ids.contains(id));
-            let oracle_bound = match (resuming, state.trade.trade_pending_oracle_bound) {
-                (true, Some(sent_with)) if oracle.is_some() => Some(sent_with),
-                _ => oracle.map(|(_, bound)| bound),
+            let oracle_bound = oracle.map(|(_, bound)| bound);
+            let fill_bound = match (resuming, state.trade.trade_pending_oracle_bound, oracle_bound) {
+                (true, Some(sent_with), Some(today)) if Self::is_worse_price(&leg.side, sent_with, today) => {
+                    Some(sent_with)
+                }
+                _ => oracle_bound,
             };
             let mut oracle_limited = false;
             if let Some(bound) = oracle_bound {
@@ -170,7 +175,7 @@ where
 
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
             let pending = self.prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
-            state.trade.trade_pending_oracle_bound = oracle_bound;
+            state.trade.trade_pending_oracle_bound = fill_bound;
 
             // The exchange enforces the limit with an IOC order. If it refuses
             // the IOC order, the slice fails and nothing trades without the limit.
@@ -296,7 +301,7 @@ where
             // bound, or an exchange that ignored the limit) parks the leg, so
             // the next cycle cannot carry the fill on to the next leg. It comes
             // before the slippage check, whose plain error would allow that.
-            if let Some(bound) = oracle_bound
+            if let Some(bound) = fill_bound
                 && Self::is_worse_price(&leg.side, exec_price, bound)
             {
                 let err = format!(
