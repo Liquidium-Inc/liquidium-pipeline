@@ -239,7 +239,7 @@ async fn a_quote_refuses_a_cap_the_fee_uses_up() {
     }];
 
     let error = finalizer
-        .preview_resolved_trade_route(&legs, 0.01)
+        .preview_resolved_trade_route(&legs, 0.01, RouteStage::Admission)
         .await
         .err()
         .expect("no price room");

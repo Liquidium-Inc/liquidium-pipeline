@@ -896,14 +896,14 @@ async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
     .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2);
 
     let small = finalizer
-        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
+        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5, RouteStage::Admission)
         .await
         .unwrap();
     assert_eq!(markets(&small), vec!["BTC_USDC", "USDC_USDT"]);
 
     // The USDC book holds 1 BTC, so 2 BTC can only go direct.
     let large = finalizer
-        .resolve_trade_legs_for_amount("BTC", "USDT", 2.0)
+        .resolve_trade_legs_for_amount("BTC", "USDT", 2.0, RouteStage::Admission)
         .await
         .unwrap();
     assert_eq!(markets(&large), vec!["BTC_USDT"]);
@@ -911,7 +911,7 @@ async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
     // 150 bps stays inside the 200 bps cap, but it costs more than the better USDC price gains.
     usdc_fee_bps.store(150, Ordering::SeqCst);
     let expensive = finalizer
-        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
+        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5, RouteStage::Admission)
         .await
         .unwrap();
     assert_eq!(markets(&expensive), vec!["BTC_USDT"]);
@@ -931,7 +931,7 @@ async fn best_output_routing_uses_any_configured_sol_market() {
         .with_route_config(vec!["SOL_USDT".into(), "SOL_USDC".into(), "USDC_USDT".into()], 2);
 
     let legs = finalizer
-        .resolve_trade_legs_for_amount("SOL", "USDT", 1.0)
+        .resolve_trade_legs_for_amount("SOL", "USDT", 1.0, RouteStage::Admission)
         .await
         .unwrap();
     assert_eq!(markets(&legs), vec!["SOL_USDC", "USDC_USDT"]);

@@ -91,7 +91,9 @@ where
         let mut forced_next_buy_mode: Option<BuyOrderInputMode> = None;
 
         self.sanitize_pending_trade_state_for_leg(state, leg);
-        self.adopt_legacy_oracle_record(state, leg_idx, total_out);
+        self.adopt_legacy_oracle_record(state, leg, leg_idx, total_out)
+            .await
+            .inspect_err(|err| state.last_error = Some(err.to_string()))?;
 
         // Keep slicing until the leg input is consumed (or considered dust).
         while remaining_in > LIQUIDITY_EPS {
@@ -136,17 +138,20 @@ where
                 .oracle_price_bound(leg, state.trade.trade_oracle_route_keep.unwrap_or(1.0))
                 .await
                 .inspect_err(|err| state.last_error = Some(err.to_string()))?;
-            let oracle_bound = oracle.map(|(_, bound)| bound);
+            // A resumed order goes out again under its id, so its fill is read
+            // back. It is judged by the bound it was sent with, not by today's price.
+            let resuming = state
+                .trade
+                .trade_pending_client_order_id
+                .as_ref()
+                .is_some_and(|id| !state.trade.trade_applied_client_order_ids.contains(id));
+            let oracle_bound = match (resuming, state.trade.trade_pending_oracle_bound) {
+                (true, Some(sent_with)) if oracle.is_some() => Some(sent_with),
+                _ => oracle.map(|(_, bound)| bound),
+            };
             let mut oracle_limited = false;
             if let Some(bound) = oracle_bound {
                 let order_price = Self::oracle_order_price(&leg.side, bound, preview.taker_fee_bps);
-                // A resumed order goes out again under its id, so its fill is
-                // read back; the oracle price still limits it.
-                let resuming = state
-                    .trade
-                    .trade_pending_client_order_id
-                    .as_ref()
-                    .is_some_and(|id| !state.trade.trade_applied_client_order_ids.contains(id));
                 if !resuming && Self::is_worse_price(&leg.side, preview.best_price, order_price) {
                     let reason = format!(
                         "the best book price {} is past the oracle bound {bound}",
@@ -165,6 +170,7 @@ where
 
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
             let pending = self.prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
+            state.trade.trade_pending_oracle_bound = oracle_bound;
 
             // The exchange enforces the limit with an IOC order. If it refuses
             // the IOC order, the slice fails and nothing trades without the limit.
@@ -286,6 +292,21 @@ where
                 preview.preview_impact_bps,
             );
 
+            // A fill past the oracle bound (an order read back from before the
+            // bound, or an exchange that ignored the limit) parks the leg, so
+            // the next cycle cannot carry the fill on to the next leg. It comes
+            // before the slippage check, whose plain error would allow that.
+            if let Some(bound) = oracle_bound
+                && Self::is_worse_price(&leg.side, exec_price, bound)
+            {
+                let err = format!(
+                    "slice on {} {} filled at {} past the oracle bound {} (client_id={}); an operator must decide",
+                    leg.market, leg.side, exec_price, bound, pending.client_order_id
+                );
+                state.last_error = Some(err.clone());
+                return Err(CexBackendError::OperatorRequired(err));
+            }
+
             // Enforce hard per-slice slippage limit before allowing leg continuation.
             if slice_slippage_bps > limit_bps {
                 let err = format!(
@@ -304,20 +325,6 @@ where
                 );
                 state.last_error = Some(err.clone());
                 return Err(err.into());
-            }
-
-            // A fill past the oracle bound (an order read back from before the
-            // bound, or an exchange that ignored the limit) parks the leg, so
-            // the next cycle cannot carry the fill on to the next leg.
-            if let Some(bound) = oracle_bound
-                && Self::is_worse_price(&leg.side, exec_price, bound)
-            {
-                let err = format!(
-                    "slice on {} {} filled at {} past the oracle bound {} (client_id={}); an operator must decide",
-                    leg.market, leg.side, exec_price, bound, pending.client_order_id
-                );
-                state.last_error = Some(err.clone());
-                return Err(CexBackendError::OperatorRequired(err));
             }
 
             // Emit slice execution log with route and quality context.
@@ -397,22 +404,46 @@ where
 
     /// A row saved before the oracle bound has no oracle record. Its finished
     /// legs count as having spent the route's whole discount, and its fills on
-    /// this leg count at the oracle price, so no later leg gets the room twice.
-    pub(in crate::finalizers::cex) fn adopt_legacy_oracle_record(
+    /// this leg are valued from their recorded input at today's oracle price,
+    /// so no later leg gets the room twice.
+    pub(in crate::finalizers::cex) async fn adopt_legacy_oracle_record(
         &self,
         state: &mut CexState,
+        leg: &TradeLeg,
         leg_idx: usize,
         total_out: f64,
-    ) {
+    ) -> Result<(), CexBackendError> {
         if self.price_oracle.is_none() {
-            return;
+            return Ok(());
         }
         if leg_idx > 0 && state.trade.trade_oracle_route_keep.is_none() {
             state.trade.trade_oracle_route_keep = Some(self.oracle_route_keep());
         }
         if total_out > 0.0 && state.trade.trade_progress_oracle_out.is_none() {
-            state.trade.trade_progress_oracle_out = Some(total_out);
+            let spent: f64 = state
+                .trade
+                .trade_slices
+                .iter()
+                .filter(|slice| slice.leg_index as usize == leg_idx)
+                .map(|slice| slice.amount_in)
+                .sum();
+            let Some((oracle_price, _)) = self.oracle_price_bound(leg, 1.0).await? else {
+                return Ok(());
+            };
+            let at_oracle = if leg.side.eq_ignore_ascii_case("sell") {
+                spent * oracle_price
+            } else {
+                spent / oracle_price
+            };
+            if at_oracle <= 0.0 {
+                return Err(CexBackendError::OperatorRequired(format!(
+                    "{} {}: fills from before the oracle bound have no recorded input; an operator must decide",
+                    leg.market, leg.side
+                )));
+            }
+            state.trade.trade_progress_oracle_out = Some(at_oracle);
         }
+        Ok(())
     }
 
     /// The order price whose fill, after the taker fee, is no worse than `bound`.
@@ -438,7 +469,7 @@ where
     }
 
     /// Whether `price` is worse for this side than `than`: lower for a sell, higher for a buy.
-    fn is_worse_price(side: &str, price: f64, than: f64) -> bool {
+    pub(in crate::finalizers::cex) fn is_worse_price(side: &str, price: f64, than: f64) -> bool {
         if side.eq_ignore_ascii_case("sell") {
             price < than
         } else {

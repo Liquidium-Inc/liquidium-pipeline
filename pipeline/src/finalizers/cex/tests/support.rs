@@ -400,6 +400,6 @@ pub(super) async fn preview_receipt_route(
         )
         .await?;
     finalizer
-        .preview_resolved_trade_route(&legs, state.size_in.to_f64())
+        .preview_resolved_trade_route(&legs, state.size_in.to_f64(), RouteStage::Admission)
         .await
 }

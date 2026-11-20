@@ -3,6 +3,7 @@
 use super::*;
 use crate::config::normalize_cex_market_pair;
 use crate::finalizers::bridge_planner::BridgePlanner;
+use crate::finalizers::cex::route_preview::RouteStage;
 use crate::finalizers::cex::state::CexRouteLeg;
 use crate::finalizers::cex::utils::parse_market_symbols;
 
@@ -376,11 +377,12 @@ where
     /// The route for `amount`: of the configured simple routes and the first
     /// executable route, the one with the largest net output, by the same preview
     /// that prices the trade. A thin direct market loses to a hop route by itself.
-    pub(crate) async fn resolve_trade_legs_for_amount(
+    pub(in crate::finalizers::cex) async fn resolve_trade_legs_for_amount(
         &self,
         deposit_symbol: &str,
         withdraw_symbol: &str,
         amount: f64,
+        stage: RouteStage,
     ) -> Result<Vec<TradeLeg>, String> {
         // The first executable route is the baseline. Without one, its reason is the answer.
         let baseline = self
@@ -401,7 +403,7 @@ where
         let mut best: Option<(f64, Vec<TradeLeg>)> = None;
         let mut baseline_failure = None;
         for candidate in candidates {
-            let preview = match self.preview_resolved_trade_route(&candidate, amount).await {
+            let preview = match self.preview_resolved_trade_route(&candidate, amount, stage).await {
                 Ok(preview) => preview,
                 Err(error) => {
                     if Self::route_signature(&candidate) == baseline_signature {
@@ -444,6 +446,7 @@ where
                 &<Self as BridgePlanner>::planned_deposit_asset(state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(state),
                 amount,
+                RouteStage::Funded,
             )
             .await?;
         Self::persist_trade_legs(state, &legs);
