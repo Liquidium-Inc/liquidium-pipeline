@@ -545,6 +545,53 @@ async fn a_refused_ioc_order_type_sends_no_market_order() {
     server.abort();
 }
 
+/// DEV-3462, both sides through the full swap call: after a 30041 refusal of
+/// the IOC order, the only other request is the lookup by client id.
+#[tokio::test]
+async fn a_refused_ioc_slice_sends_no_market_order_on_either_side() {
+    for (side, amount_in) in [("sell", 0.45), ("buy", 10.0)] {
+        let refused = r#"{"code":30041,"msg":"current order type can not place order"}"#;
+        let missing = r#"{"code":-2013,"msg":"Order does not exist."}"#;
+        let (endpoint, server) = serve(vec![(400, refused), (400, missing)]).await;
+        let client = client_at(endpoint);
+        client.symbol_filters.lock().await.insert(
+            "ICP_USDT".into(),
+            SymbolFilters {
+                base_precision: Some(2),
+                ..SymbolFilters::default()
+            },
+        );
+        let options = SwapExecutionOptions {
+            client_order_id: Some("lqclient3".into()),
+            price_limit: Some(PriceLimit {
+                reference_price: 2.5,
+                max_slippage_bps: 200.0,
+            }),
+            ..SwapExecutionOptions::default()
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.execute_swap_detailed_with_options("ICP_USDT", side, amount_in, options),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(result.is_err(), "{side}: {result:?}");
+        assert!(
+            requests[0].contains("type=IMMEDIATE_OR_CANCEL") && requests[0].contains("price="),
+            "{side}: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("GET") && !requests[1].contains("type=MARKET"),
+            "{side}: {}",
+            requests[1]
+        );
+    }
+}
+
 /// An answer that may hide a placed order never gets a second order.
 #[tokio::test]
 async fn an_ambiguous_ioc_error_sends_no_market_order() {
