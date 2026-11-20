@@ -17,10 +17,13 @@ async fn the_first_cycle_saves_the_quote_and_the_second_creates_the_order() {
         .returning(|request| Ok(quote(&request.amount_in, "99.5")));
     rift.expect_create_order()
         .times(1)
-        .returning(|quote_id, to_address, refund_address| {
-            assert_eq!(quote_id, "quote-1");
-            assert_eq!(to_address, "0x2222222222222222222222222222222222222222");
-            assert_eq!(refund_address.as_deref(), Some(MAIN_WALLET));
+        .returning(|request| {
+            assert_eq!(request.quote_id, "quote-1");
+            assert_eq!(request.to_address, "0x2222222222222222222222222222222222222222");
+            assert_eq!(request.refund_address, MAIN_WALLET);
+            assert_eq!(request.amount_in, "100");
+            assert_eq!(request.from.as_str(), "ethereum.usdc");
+            assert_eq!(request.to.as_str(), "ethereum.usdt");
             Ok(order("100"))
         });
     let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
@@ -102,64 +105,10 @@ async fn a_quote_under_the_return_deposit_minimum_is_refused_as_below_minimum() 
 }
 
 #[tokio::test]
-async fn a_quote_for_another_amount_or_pair_is_refused_and_nothing_is_saved() {
-    for other in [
-        quote("250", "248"),
-        RiftQuote {
-            to: RiftAsset::new("bitcoin", "BTC"),
-            ..quote("100", "99.5")
-        },
-    ] {
-        let mut rift = MockRiftBackend::new();
-        rift.expect_quote().returning(move |_| Ok(other.clone()));
-        rift.expect_create_order().times(0);
-        let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
-        let mut state = fresh_state();
-
-        let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
-
-        assert!(
-            matches!(error, VenueStepError::Other(ref m) if m.contains("but the request was")),
-            "{error}"
-        );
-        assert!(state.quote_id.is_none());
-        assert!(!state.send_saved);
-    }
-}
-
-#[tokio::test]
-async fn an_order_from_another_quote_or_with_no_address_is_never_saved() {
-    for other in [
-        RiftOrder {
-            quote_id: "quote-2".to_string(),
-            ..order("100")
-        },
-        RiftOrder {
-            deposit_address: " ".to_string(),
-            ..order("100")
-        },
-    ] {
-        let mut rift = MockRiftBackend::new();
-        rift.expect_create_order().returning(move |_, _, _| Ok(other.clone()));
-        let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
-        let mut state = fresh_state();
-        state.quote_id = Some("quote-1".to_string());
-
-        let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
-
-        assert!(
-            matches!(error, VenueStepError::Other(ref m) if m.contains("but the request was quote quote-1")),
-            "{error}"
-        );
-        assert!(state.order.is_none());
-    }
-}
-
-#[tokio::test]
 async fn an_expired_quote_is_dropped_so_the_next_cycle_quotes_again() {
     let mut rift = MockRiftBackend::new();
     rift.expect_create_order()
-        .returning(|_, _, _| Err(RiftError::QuoteExpired("quote expired".to_string())));
+        .returning(|_| Err(RiftError::QuoteExpired("quote expired".to_string())));
     let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
     let mut state = fresh_state();
     state.quote_id = Some("quote-1".to_string());
@@ -177,7 +126,7 @@ async fn an_expired_quote_is_dropped_so_the_next_cycle_quotes_again() {
 #[tokio::test]
 async fn an_order_for_another_amount_is_never_saved() {
     let mut rift = MockRiftBackend::new();
-    rift.expect_create_order().returning(|_, _, _| Ok(order("99.9")));
+    rift.expect_create_order().returning(|_| Ok(order("99.9")));
     let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
     let mut state = fresh_state();
     state.quote_id = Some("quote-1".to_string());
@@ -226,8 +175,8 @@ async fn a_throttled_rift_is_unreachable_too() {
 async fn a_bitcoin_order_refunds_to_the_minter_address_of_the_refund_account() {
     use liquidium_pipeline_connectors::backend::bridge_backend::BridgeDestination;
     let mut rift = MockRiftBackend::new();
-    rift.expect_create_order().times(1).returning(|_, _, refund_address| {
-        assert_eq!(refund_address.as_deref(), Some(REFUND_BTC_ADDRESS));
+    rift.expect_create_order().times(1).returning(|request| {
+        assert_eq!(request.refund_address, REFUND_BTC_ADDRESS);
         Ok(order("0.0006"))
     });
     let mut bridge = free_bridge();
@@ -267,9 +216,9 @@ async fn an_order_paying_out_on_bitcoin_names_the_minter_address_of_the_final_ac
     let mut rift = MockRiftBackend::new();
     rift.expect_create_order()
         .times(1)
-        .returning(|_, to_address, refund_address| {
-            assert_eq!(to_address, "bc1qminter");
-            assert_eq!(refund_address.as_deref(), Some(MAIN_WALLET));
+        .returning(|request| {
+            assert_eq!(request.to_address, "bc1qminter");
+            assert_eq!(request.refund_address, MAIN_WALLET);
             Ok(order("100"))
         });
     let mut bridge = free_bridge();

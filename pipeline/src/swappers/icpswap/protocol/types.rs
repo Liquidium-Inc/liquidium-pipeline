@@ -350,7 +350,7 @@ pub enum IcpswapQuoteError {
     MissingToken(String),
     #[error("swap request pay asset does not match pay amount token")]
     PayAssetMismatch,
-    #[error("ICPSwap only supports canonical ICP <-> ckUSDC swaps; received {pay_asset} -> {receive_asset}")]
+    #[error("ICPSwap does not list the pair {pay_asset} -> {receive_asset}")]
     UnsupportedPair { pay_asset: String, receive_asset: String },
     #[error("ICPSwap input budget {budget} cannot cover transfer and deposit fees totaling {fees}")]
     InputFeesExceedBudget { budget: Nat, fees: Nat },

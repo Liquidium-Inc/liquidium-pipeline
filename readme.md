@@ -150,6 +150,7 @@ This will:
 
 - Re-running the install command (without `--tag`/`--branch`) upgrades to the latest released tag.
 - `config.env` is preserved across upgrades; new config keys should be added manually when needed.
+- **Upgrade from a version before the ICPSwap routes:** before the restart, set `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=500` in your `config.env`. With the old value `250`, the bot stops at startup, because the discount must be above the new route limit of 300 bps (`ICPSWAP_MAX_ROUTE_COST_BPS`).
 - Legacy alias `CEX_BUY_INVERSE_OVESPEND_BPS` remains accepted, while `CEX_BUY_INVERSE_OVERSPEND_BPS` is canonical.
 
 ---
@@ -238,6 +239,10 @@ ICPSWAP_TEST_ALLOCATION_USD=1
 MEXC_TEST_ALLOCATION_USD=10
 # Allow full ICPSwap up to 1.5% impact only when the CEX remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
+# Highest total cost (slippage plus pool fees) of an ICPSwap route over several
+# pools. One pool keeps ICPSWAP_MAX_PRICE_IMPACT_BPS. Must stay below
+# MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS. Default 300 = 3%.
+ICPSWAP_MAX_ROUTE_COST_BPS=300
 # A CEX transport above this impact is not sound: a listed asset then moves
 # through the bridge instead of its direct ck market. With Kraken enabled, a
 # MEXC leg above it also overflows to Kraken.
@@ -284,7 +289,7 @@ MULTI_VENUE_MIN_NET_EDGE_BPS=150
 # Normal-settlement floor after liquidation; -150 allows up to 1.5% shortfall (the default)
 MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
 # Reject a venue quote this far below the oracle-implied output (bps)
-MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
+MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=500
 # How long a price recorded on a receipt may stand in for a live oracle read (seconds)
 MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS=300
 # Additional latency-risk haircut applied to projected edge (bps)
@@ -323,12 +328,12 @@ Quick reference:
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
 | `CEX_KRAKEN_AVAILABLE_PAIRS` | Kraken's market allowlist. Required when `kraken` is enabled: Kraken never trades outside it, and startup stops if it is empty. |
 | `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops in Kraken's route search; defaults to 2. |
-| `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. |
+| `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. It must use `https`. Plain `http` is accepted for a loopback address only, and any other value stops the startup. |
 | `RIFT_API_KEY` | Optional. Names the integrator to Rift; without it Rift serves one request per second. |
 | `BRIDGE_CKBTC_MINTER_CANISTER` | The ckBTC minter; defaults to `mqygn-kiaaa-aaaar-qaadq-cai`. |
 | `BRIDGE_CKBTC_LEDGER_CANISTER` | The ckBTC ledger the minter burns from; defaults to `mxzaz-hqaaa-aaaar-qaada-cai`. |
 | `RIFT_VENUE_ALLOWLIST`, `RIFT_VENUE_BLOCKLIST` | Comma-separated Rift venue names that may, or never may, route an order. A venue's own confirmation count sets a leg's duration, and Rift does not report it. Measured on 2026-11-10 for ckBTC: the OTC route took 120 minutes to deliver, `near_intents` 16, so `RIFT_VENUE_BLOCKLIST=rift_otc` is the shipped default. |
-| `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. |
+| `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. An order can pass the cap by less than `CEX_MIN_EXEC_USD`: a rest that small is not a leg for any venue, so Rift takes it too. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -413,7 +418,7 @@ Route summary metrics are updated from slice notional, and weighted slippage is 
 
 **Supported venues:**
 
-- `icpswap` — native ICP input only.
+- `icpswap` — ICP, ckUSDC, ckUSDT, ckBTC and ckETH. A swap uses one pool, or a route of up to three pools through ICP and ckUSDC when that pays more or the direct pool is thin. The pool list is `SUPPORTED_PAIRS` in `swappers/icpswap/planning/venue_policy.rs`; ckUSDT/ckBTC and ckUSDT/ckETH have no usable pool and trade only along a route.
 - `mexc` — requires `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET` when enabled.
 - Venue IDs are ordered, comma-separated, and validated at startup. `SWAPPER` is obsolete and ignored.
 
@@ -905,7 +910,6 @@ Kraken is opt-in. Before you enable it:
 1. Create an API key with balance and funding reads, order create and query, and withdrawal access only. Use an IP allowlist.
 2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address. For a Solana deposit, create a permanent deposit address; the pipeline reads it and never creates one.
 3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a narrow `CEX_KRAKEN_AVAILABLE_PAIRS`.
-4. Run `liquidator kraken-check`. It reads the balances, the allowed markets and their minimums, and for each route the deposit address and whether our destination is a verified withdrawal address. It moves nothing. Fix each route it lists, then add `kraken` to `ENABLED_SWAP_VENUES`.
 
 Checked on 2026-11-11: ICP, USDC and ETH deposit and withdraw. The account offers no USDT deposit method, so ckUSDT cannot reach Kraken; USDT can still be withdrawn.
 
@@ -925,24 +929,7 @@ A Rift leg takes these steps, each saved before it acts:
 4. The order status until Rift delivers. An underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide. A refunded order parks too; the operator finds the refund transaction and answers `landed <tx>`, which ends the leg as refunded and reports the row failed. The funds sit at the refund address, outside the pipeline.
 5. The ckERC20 bridge brings an Ethereum payout back to ICP as its ck form. A Bitcoin payout goes to the ckBTC minter's address for the final account, so the minter mints ckBTC straight into it once the deposit has four confirmations; the leg only asks the minter until it does. The minter takes its check fee out of the deposit, and the preview takes it off the receive.
 
-Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
-
-### Checking Rift without a liquidation
-
-`rift-swap-check` runs one Rift leg from the trader account, the way the daemon
-would run it inside a liquidation: the quote, the order, the bridge out, the
-wait for Rift, the bridge back. Without `--confirm` it only prints the preview.
-
-```bash
-liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20
-liquidator rift-swap-check --pay ckUSDC --receive ckUSDT --amount 20 --confirm
-```
-
-The leg is saved to `rift-check-<ts>.json` in the working directory after every
-cycle. A stopped run continues with `--resume <file>`. A parked leg prints its
-open question; answer it on the resume with `--answer absent` or
-`--answer landed:<receipt>`. The trader account pays the amount plus one ledger
-fee, and the proceeds mint to the liquidator account.
+Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. A Rift order has no minimum output: Rift swaps at the market price when the deposit arrives, and the deposit needs the time of the bridge out to get there. The bot holds the quote to the planned floor before it creates the order, and it cannot stop the swap after the funds left. `CEX_DELAY_BUFFER_BPS` is the only room for a price move in that time, and a delivery below the floor is logged as a warning. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
 
 ## Native Simulator
 

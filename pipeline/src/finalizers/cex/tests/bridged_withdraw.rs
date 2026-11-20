@@ -1,5 +1,6 @@
 //! The return bridge after a MEXC withdrawal (ckETH and ckERC20).
 use super::*;
+use liquidium_pipeline_connectors::backend::bridge_backend::TransactionPayment;
 
 #[tokio::test]
 async fn mexc_withdraw_bridge_waits_when_source_balance_below_expected_net() {
@@ -587,4 +588,112 @@ async fn mexc_non_bridge_withdraw_keeps_evm_destination_address() {
         .expect("direct EVM withdraw should complete");
     assert!(matches!(state.step, CexStep::Completed));
     assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-evm-direct"));
+}
+
+const WITHDRAW_TX: &str = "0x02757aa8ab1355493c1b2d84f60a1c7e93d5b8426f0e9a3d17c6b24f58a0de13";
+
+/// A ckBTC -> ckUSDC leg whose 1.5 USDC withdrawal the exchange reports as sent in `WITHDRAW_TX`.
+/// `bridge` answers the chain reads of the return bridge.
+async fn sent_withdrawal(bridge: MockBridgeBackend) -> (CexVenueFinalizer<MockCexBackend>, CexState) {
+    let mut cex = MockCexBackend::new();
+    cex.expect_get_withdraw_status_snapshot_by_id().returning(|_, _| {
+        Ok(WithdrawStatusSnapshot {
+            status: WithdrawStatus::Completed,
+            txid: Some(WITHDRAW_TX.to_string()),
+            transaction_fee: Some(0.1),
+        })
+    });
+    let finalizer = CexVenueFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        Principal::management_canister(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let receipt = make_execution_receipt_with_assets(111, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer.prepare("111", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+    state.withdraw.withdraw_id = Some("withdraw-1".to_string());
+    state.withdraw.withdraw_txid = Some(WITHDRAW_TX.to_string());
+    state.withdraw.withdraw_accepted_at_ts = Some(crate::utils::now_ts());
+    (finalizer, state)
+}
+
+/// A bridge that answers the read of `WITHDRAW_TX`: 1.4 USDC is the withdrawal after the exchange fee.
+fn bridge_reading(payment: TransactionPayment) -> MockBridgeBackend {
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_payment_in_transaction()
+        .times(1)
+        .returning(move |asset, chain, wallet, transaction| {
+            assert_eq!((asset, chain), ("USDC", "ETH"));
+            assert_eq!(wallet, "0x2222222222222222222222222222222222222222");
+            assert_eq!(transaction, WITHDRAW_TX);
+            Ok(payment)
+        });
+    bridge
+}
+
+/// The bridge wallet is shared: funds of another row there must not start this row's bridge.
+#[tokio::test]
+async fn a_withdrawal_that_the_chain_does_not_show_waits_and_reads_no_wallet_balance() {
+    // No balance expectation: a read of the shared wallet would fail the test.
+    let (finalizer, mut state) = sent_withdrawal(bridge_reading(TransactionPayment::NotOnChain)).await;
+
+    finalizer.withdraw(&mut state).await.expect("the leg waits");
+
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert!(state.withdraw.bridge.awaits_funds());
+}
+
+/// A short payment waits and never reads the shared wallet: the exchange can report its fee late.
+#[tokio::test]
+async fn a_withdrawal_that_paid_less_than_reported_waits_then_errors_at_the_bound() {
+    for (accepted_secs_ago, errors) in [(60, false), (WITHDRAW_DELIVERY_TIMEOUT_SECS + 60, true)] {
+        // No balance expectation: a read of the shared wallet would fail the test.
+        let (finalizer, mut state) = sent_withdrawal(bridge_reading(TransactionPayment::Paid(1.2))).await;
+        state.withdraw.withdraw_accepted_at_ts = Some(crate::utils::now_ts() - accepted_secs_ago);
+
+        let outcome = finalizer.withdraw(&mut state).await;
+
+        assert_eq!(outcome.is_err(), errors, "{outcome:?}");
+        if let Err(error) = outcome {
+            let text = error.to_string();
+            assert!(text.contains("1.4") && text.contains("paid 1.2"), "{text}");
+        }
+        assert!(matches!(state.step, CexStep::WithdrawPending));
+        assert!(state.withdraw.bridge.awaits_funds());
+    }
+}
+
+#[tokio::test]
+async fn a_withdrawal_that_the_chain_shows_lets_the_bridge_read_the_wallet() {
+    let mut bridge = bridge_reading(TransactionPayment::Paid(1.4));
+    // The wallet is short, so the leg waits after the read. The read is what the test checks.
+    bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(0.0));
+    let (finalizer, mut state) = sent_withdrawal(bridge).await;
+
+    finalizer.withdraw(&mut state).await.expect("the leg waits for the balance");
+
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+}
+
+/// An exchange that names no chain transaction keeps the balance check alone.
+#[tokio::test]
+async fn a_withdrawal_without_a_chain_transaction_keeps_the_balance_check() {
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_payment_in_transaction().times(0);
+    bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(0.0));
+    let (finalizer, mut state) = sent_withdrawal(bridge).await;
+    state.withdraw.withdraw_txid = Some("internal-id-17".to_string());
+
+    finalizer.withdraw(&mut state).await.expect("the leg waits for the balance");
+
+    assert!(matches!(state.step, CexStep::WithdrawPending));
 }

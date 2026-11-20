@@ -19,33 +19,9 @@ async fn wait_with(
         assert_eq!(order_id, "order-1");
         Ok(order_state(status.clone(), amount_out))
     });
-    let finalizer = finalizer(rift, MockBridgeBackend::new(), MockOutboundSender::new());
+    // A delivery reads the return leg's minimum and fee to compare it with the floor.
+    let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
     finalizer.advance_current_step(state).await
-}
-
-#[tokio::test]
-async fn a_status_of_another_order_is_not_saved() {
-    let mut rift = MockRiftBackend::new();
-    rift.expect_order_state().times(1).returning(|_| {
-        Ok(RiftOrderState {
-            id: "order-2".to_string(),
-            ..order_state(RiftOrderStatus::Delivered, Some("99.5"))
-        })
-    });
-    let finalizer = finalizer(rift, MockBridgeBackend::new(), MockOutboundSender::new());
-    let mut state = waiting_state(60);
-    let status_before = state.order.as_ref().unwrap().status.clone();
-
-    let error = finalizer.advance_current_step(&mut state).await.unwrap_err();
-
-    assert!(
-        matches!(error, VenueStepError::Other(ref m) if m.contains("order-2")),
-        "{error}"
-    );
-    let order = state.order.as_ref().unwrap();
-    assert_eq!(order.status, status_before);
-    assert!(order.amount_out.is_none());
-    assert_eq!(state.step, RiftStep::Swap);
 }
 
 #[tokio::test]
@@ -108,7 +84,7 @@ async fn a_delivered_order_moves_to_the_leg_back_with_its_amount() {
     assert_eq!(state.step, RiftStep::BridgeBack);
     let order = state.order.unwrap();
     assert_eq!(order.amount_out.as_deref(), Some("99.4"));
-    assert_eq!(order.payout_tx.as_deref(), Some("0xpayout"));
+    assert_eq!(order.payout_tx.as_deref(), Some(PAYOUT_TX));
     assert!(order.delivered_at_ts.is_some());
 }
 

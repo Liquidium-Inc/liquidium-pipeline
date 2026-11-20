@@ -6,6 +6,15 @@ use crate::finalizers::bridge_planner::BridgePlanner;
 use crate::finalizers::cex::state::CexRouteLeg;
 use crate::finalizers::cex::utils::parse_market_symbols;
 
+/// Which direct markets a probe may read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectMarkets {
+    /// A trade: only a market in the pair list, because another one may not be tradable by API.
+    Listed,
+    /// A price read: any market the exchange has.
+    Any,
+}
+
 impl<C> CexVenueFinalizer<C>
 where
     C: CexBackend,
@@ -24,40 +33,34 @@ where
         out
     }
 
-    /// Resolve a single direct market leg for `deposit_symbol -> withdraw_symbol`.
-    ///
-    /// Probe order is intentional:
-    /// 1) Prefer `DEPOSIT_WITHDRAW` on `sell` if there are bids.
-    /// 2) Fallback to `WITHDRAW_DEPOSIT` on `buy` if there are asks.
-    ///
-    /// When neither side is tradable, returns a combined error with both probe outcomes.
-    async fn resolve_direct_leg(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<TradeLeg, String> {
+    /// One market that swaps the deposit asset for the withdraw asset: first `A_B` as a sell,
+    /// then `B_A` as a buy. If neither book can take the trade, the error names both reasons.
+    async fn resolve_direct_leg(
+        &self,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+        markets: DirectMarkets,
+    ) -> Result<TradeLeg, String> {
         let deposit = deposit_symbol.to_ascii_uppercase();
         let withdraw = withdraw_symbol.to_ascii_uppercase();
-
-        let sell_market = format!("{}_{}", deposit, withdraw);
-        let buy_market = format!("{}_{}", withdraw, deposit);
+        let candidates = [
+            (format!("{deposit}_{withdraw}"), "sell"),
+            (format!("{withdraw}_{deposit}"), "buy"),
+        ];
         let mut errors: Vec<String> = Vec::new();
 
-        // Sell the deposit asset first; then buy the withdraw asset on the inverse market.
-        for (market, side, book_side) in [(sell_market, "sell", "bids"), (buy_market, "buy", "asks")] {
-            // The pair list is the gate: a market left out of it may not be tradable by API.
-            if !self.is_configured_market(&market) {
+        for (market, side) in candidates {
+            if markets == DirectMarkets::Listed && !self.is_configured_market(&market) {
                 errors.push(format!("{market} is not a configured pair"));
                 continue;
             }
-            match self.backend.get_orderbook(&market, Some(DEFAULT_ORDERBOOK_LIMIT)).await {
-                Ok(orderbook) => {
-                    let levels = if side == "sell" { &orderbook.bids } else { &orderbook.asks };
-                    if !levels.is_empty() {
-                        return Ok(TradeLeg {
-                            market,
-                            side: side.to_string(),
-                        });
-                    }
-                    errors.push(format!("{market} has no {book_side}"));
-                }
-                Err(err) => errors.push(format!("{market}: {err}")),
+            let leg = TradeLeg {
+                market,
+                side: side.to_string(),
+            };
+            match self.ensure_leg_liquidity(&leg).await {
+                Ok(()) => return Ok(leg),
+                Err(error) => errors.push(error),
             }
         }
 
@@ -361,7 +364,7 @@ where
 
         // The direct market first, then the configured graph hops. No fixed routes:
         // the pair list is the only gate on markets, and the book decides the rest.
-        let direct_err = match self.resolve_direct_leg(&deposit, &withdraw).await {
+        let direct_err = match self.resolve_direct_leg(&deposit, &withdraw, DirectMarkets::Listed).await {
             Ok(direct_leg) => return Ok(vec![direct_leg]),
             Err(err) => err,
         };
@@ -464,7 +467,8 @@ where
             if stable.eq_ignore_ascii_case(symbol) {
                 continue;
             }
-            match self.resolve_direct_leg(symbol, stable).await {
+            // A price read trades nothing, so it may use a market outside the pair list.
+            match self.resolve_direct_leg(symbol, stable, DirectMarkets::Any).await {
                 Ok(leg) => return Ok(vec![leg]),
                 Err(err) => direct_errors.push(format!("{} ({})", stable, err)),
             }

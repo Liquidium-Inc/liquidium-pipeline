@@ -219,7 +219,8 @@ where
         buy_mode: BuyOrderInputMode,
     ) -> String {
         let raw = format!(
-            "liq-{}-l{}-s{}-{}",
+            "{}-{}-l{}-s{}-{}",
+            self.order_id_scope(),
             state.liq_id,
             leg_idx + 1,
             slice_seq,

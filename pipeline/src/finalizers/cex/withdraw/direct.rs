@@ -5,6 +5,8 @@ use crate::finalizers::bridge_legs::net_of_withdraw_fee;
 use liquidium_pipeline_connectors::backend::cex_backend::WithdrawStatusSnapshot;
 
 /// The withdrawal order id for one withdrawal attempt of a row (MEXC `withdrawOrderId`).
+/// Known limit: it does not name the bot, so bots on one MEXC account can share an id;
+/// saved rows rebuild it, so a new format must keep the old one for them.
 pub fn withdraw_order_id(liq_id: &str, attempt: u32) -> String {
     let hash = super::super::utils::fnv1a_64(liq_id);
     format!("lq{hash:016x}w{attempt}")

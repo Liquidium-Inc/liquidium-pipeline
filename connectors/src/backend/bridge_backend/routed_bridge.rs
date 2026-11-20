@@ -4,7 +4,8 @@ use async_trait::async_trait;
 
 use super::{
     BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeProvider, BridgeRequest, BridgeSend,
-    BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, ckbtc_bridge::CKBTC_HANDLE_PREFIX,
+    BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, TransactionPayment,
+    ckbtc_bridge::CKBTC_HANDLE_PREFIX,
     resolve_route_by_source,
 };
 
@@ -65,6 +66,18 @@ impl RoutedBridgeBackend {
 impl BridgeBackend for RoutedBridgeBackend {
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String> {
         self.source(asset, chain).get_source_balance(asset, chain, address).await
+    }
+
+    async fn payment_in_transaction(
+        &self,
+        asset: &str,
+        chain: &str,
+        address: &str,
+        transaction: &str,
+    ) -> Result<TransactionPayment, String> {
+        self.source(asset, chain)
+            .payment_in_transaction(asset, chain, address, transaction)
+            .await
     }
 
     async fn get_gas_balance(&self, chain: &str, address: &str) -> Result<f64, String> {

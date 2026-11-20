@@ -1,6 +1,8 @@
 //! The order: a fresh quote checked against the planned floor, saved, then the
 //! order Rift creates from it. The order names the deposit address the bridge pays.
-use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBackend, RiftError, RiftQuoteRequest};
+use liquidium_pipeline_connectors::backend::rift_backend::{
+    RiftAsset, RiftBackend, RiftError, RiftOrderRequest, RiftQuoteRequest,
+};
 use log::info;
 
 use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
@@ -28,22 +30,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             return Ok(());
         }
         let Some(quote_id) = state.quote_id.clone() else {
-            let request = self.quote_request(state);
-            let quote = self.backend.quote(&request).await?;
-            // A quote for another pair or amount is not ours. Nothing is saved.
-            let quoted_in = rift_amount(&state.size_in.token, &quote.amount_in)?;
-            if quote.from != request.from || quote.to != request.to || quoted_in.value != state.amount_in.value {
-                return Err(VenueStepError::Other(format!(
-                    "Rift quote {} is for {} {} -> {}, but the request was {} {} -> {}",
-                    quote.id,
-                    quote.amount_in,
-                    quote.from.as_str(),
-                    quote.to.as_str(),
-                    request.amount_in,
-                    request.from.as_str(),
-                    request.to.as_str()
-                )));
-            }
+            let quote = self.backend.quote(&self.quote_request(state)).await?;
             let amount_out = rift_amount(&state.final_asset, &quote.estimated_amount_out)?;
             // The planned floor is what the trader receives after the leg back,
             // so the fresh quote is held to it after today's return fee.
@@ -77,11 +64,17 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
 
         let refund_address = self.refund_address(state).await?;
         let to_address = self.delivery_address(state).await?;
-        let order = match self
-            .backend
-            .create_order(&quote_id, &to_address, Some(refund_address.clone()))
-            .await
-        {
+        // The order must have the pair and the amount of the quote, and the two addresses.
+        let RiftQuoteRequest { from, to, amount_in, .. } = self.quote_request(state);
+        let order_request = RiftOrderRequest {
+            quote_id: quote_id.clone(),
+            from,
+            to,
+            amount_in,
+            to_address: to_address.clone(),
+            refund_address: refund_address.clone(),
+        };
+        let order = match self.backend.create_order(&order_request).await {
             Ok(order) => order,
             // Nothing was created. The next cycle takes a new quote.
             Err(RiftError::QuoteExpired(reason)) => {
@@ -92,14 +85,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             }
             Err(error) => return Err(error.into()),
         };
-        // An order from another quote, or with no address to pay, is not ours.
-        // It is never saved, so nothing funds it; it expires unfunded.
-        if order.quote_id != quote_id || order.deposit_address.trim().is_empty() {
-            return Err(VenueStepError::Other(format!(
-                "Rift order {} answers quote `{}` with deposit address `{}`, but the request was quote {quote_id}",
-                order.id, order.quote_id, order.deposit_address
-            )));
-        }
+        // The order is never saved, so nothing funds it; it expires unfunded.
         let amount_in = rift_amount(&state.size_in.token, &order.amount_in)?;
         if amount_in.value != state.amount_in.value {
             return Err(VenueStepError::Other(format!(

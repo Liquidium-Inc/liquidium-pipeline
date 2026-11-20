@@ -306,7 +306,7 @@ async fn a_failed_read_leaves_the_route_unknown() {
 async fn the_withdraw_terms_are_the_method_minimum_and_its_quoted_fee() {
     let mut api = funding_api(Decimal::ZERO, None);
     api.expect_withdrawal_fee()
-        .withf(|asset, key, amount| asset == "XBT" && key == "verified-key" && *amount == Decimal::new(1, 3))
+        .withf(|asset, key, amount| asset == "XBT" && key == "verified-key" && *amount == Decimal::new(2, 3))
         .once()
         .returning(|_, _, _| Ok(Decimal::new(15, 5)));
 
@@ -314,6 +314,15 @@ async fn the_withdraw_terms_are_the_method_minimum_and_its_quoted_fee() {
 
     assert_eq!(terms.minimum, 0.001);
     assert_eq!(terms.fee, 0.000_15);
+}
+
+/// Live on 2026-11-17: Kraken's USDC minimum rose from 0.63936 to 0.67512 in
+/// a minute, and it refused a fee question for any amount under the new one.
+#[test]
+fn the_fee_question_asks_well_above_the_minimum() {
+    use crate::swappers::kraken::funding::fee_probe_amount;
+    assert_eq!(fee_probe_amount(Decimal::new(63_936, 5)), Decimal::new(127_872, 5));
+    assert_eq!(fee_probe_amount(Decimal::ZERO), Decimal::ONE);
 }
 
 /// Kraken refuses a small amount with no code, so the client names it.

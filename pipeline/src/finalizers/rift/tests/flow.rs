@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeDestination, BridgeMintReceipt, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice,
+    BridgeDestination, BridgeMintReceipt, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice, TransactionPayment,
 };
 use liquidium_pipeline_core::outbound::PreparedSend;
 
@@ -57,7 +57,7 @@ async fn a_leg_pays_the_order_through_the_bridge_and_mints_what_rift_delivered()
         .returning(|request| Ok(quote(&request.amount_in, "99.5")));
     rift.expect_create_order()
         .times(1)
-        .returning(|_, _, _| Ok(order("100")));
+        .returning(|_| Ok(order("100")));
     rift.expect_order_state()
         .times(1)
         .returning(|_| Ok(order_state(RiftOrderStatus::Delivered, Some("99.4"))));
@@ -69,6 +69,16 @@ async fn a_leg_pays_the_order_through_the_bridge_and_mints_what_rift_delivered()
             ("ckUSDC", "ICP") => Ok(100.0),
             ("USDT", "ETH") => Ok(99.4),
             other => panic!("unexpected source balance read {other:?}"),
+        });
+    // The payout transaction is read one time, before the bridge back starts.
+    bridge
+        .expect_payment_in_transaction()
+        .times(1)
+        .returning(|asset, chain, wallet, transaction| {
+            assert_eq!((asset, chain), ("USDT", "ETH"));
+            assert_eq!(wallet, "0x2222222222222222222222222222222222222222");
+            assert_eq!(transaction, PAYOUT_TX);
+            Ok(TransactionPayment::Paid(99.4))
         });
     bridge.expect_prepare_submission().times(1).returning(|_| Ok(None));
     bridge.expect_submit_bridge().times(1).returning(|request| {
@@ -162,7 +172,7 @@ async fn a_bridge_minimum_before_funding_ends_the_leg_with_its_funds_in_the_trad
     let mut rift = MockRiftBackend::new();
     rift.expect_quote()
         .returning(|request| Ok(quote(&request.amount_in, "99.5")));
-    rift.expect_create_order().returning(|_, _, _| Ok(order("100")));
+    rift.expect_create_order().returning(|_| Ok(order("100")));
     let mut bridge = MockBridgeBackend::new();
     bridge
         .expect_get_fee_budget()
@@ -273,7 +283,7 @@ async fn the_quote_id_is_durable_before_the_order_is_created() {
         .returning(|request| Ok(quote(&request.amount_in, "99.5")));
     rift.expect_create_order()
         .times(1)
-        .returning(|_, _, _| Ok(order("100")));
+        .returning(|_| Ok(order("100")));
     let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
     let context = VenuePlanningContext {
         liquidation_id: "2".to_string(),

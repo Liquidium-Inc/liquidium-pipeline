@@ -111,6 +111,8 @@ impl KrakenRestApi {
             key: api_key,
             secret: api_secret,
         })));
+        // Known limit: the nonce is this machine's clock, so bots that share one key need the
+        // key's nonce window in Kraken, or Kraken refuses some requests (nothing moves; the step retries).
         let nonce: Box<Arc<Mutex<dyn NonceProvider>>> = Box::new(Arc::new(Mutex::new(IncreasingNonceProvider::new())));
         Self {
             client: Mutex::new(Client::new(secrets, nonce)),
@@ -388,13 +390,18 @@ impl KrakenApi for KrakenRestApi {
                 // Absent while pending, and blank on some assets once present.
                 tx_id: withdrawal.tx_id.filter(|tx_id| !tx_id.trim().is_empty()),
                 fee: withdrawal.fee,
-                status: match withdrawal.status {
-                    TransferStatus::Success | TransferStatus::Settled => KrakenTransferStatus::Completed,
-                    TransferStatus::Failure => KrakenTransferStatus::Failed,
-                    TransferStatus::Initial | TransferStatus::Pending => KrakenTransferStatus::Pending,
-                },
+                status: transfer_status(withdrawal.status),
             })
             .collect())
+    }
+}
+
+/// Kraken's transfer states, as the pipeline reads them.
+fn transfer_status(status: TransferStatus) -> KrakenTransferStatus {
+    match status {
+        TransferStatus::Success | TransferStatus::Settled => KrakenTransferStatus::Completed,
+        TransferStatus::Failure => KrakenTransferStatus::Failed,
+        TransferStatus::Initial | TransferStatus::Pending => KrakenTransferStatus::Pending,
     }
 }
 

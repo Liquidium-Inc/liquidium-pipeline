@@ -12,7 +12,8 @@ use super::{RiftChain, RiftVenueFinalizer, VenueStepError, leg_routes, rift_amou
 use crate::{
     finalizers::{
         bridge_legs::{
-            BridgeInInputs, BridgeLegOutcome, WaitBound, advance_bridge_in, bridge_failure, read_bridge_status,
+            BridgeInInputs, BridgeLegOutcome, DeliveryCheck, WaitBound, advance_bridge_in, bridge_failure,
+            check_delivery, evm_transaction_hash, read_bridge_status,
             wait_within_bound,
         },
         bridge_planner::bridge_destination,
@@ -64,9 +65,62 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
         }
     }
 
+    /// Returns the payout transaction of the order. Rift can report the delivery
+    /// before it names the transaction, so a missing one is read from Rift once more.
+    async fn payout_transaction(&self, state: &mut RiftState) -> Result<Option<String>, VenueStepError> {
+        let order = state
+            .order
+            .as_mut()
+            .ok_or("missing Rift order before the bridge back")?;
+        if order.payout_tx.is_none() {
+            order.payout_tx = self.backend.order_state(&order.id).await?.payout_tx;
+        }
+        Ok(order.payout_tx.clone())
+    }
+
+    /// True when the chain shows that Rift's payout transaction paid this delivery to the bridge wallet.
+    /// False while the leg must wait: Rift named no transaction yet, or the chain does not show it.
+    async fn payout_arrived(&self, state: &mut RiftState, payout: &Payout) -> Result<bool, VenueStepError> {
+        let check = match self.payout_transaction(state).await? {
+            None => DeliveryCheck::NotYet("Rift names no payout transaction"),
+            // The chain cannot be asked about such an id, so a wait would never end.
+            Some(transaction) if evm_transaction_hash(&transaction).is_none() => DeliveryCheck::Refused(format!(
+                "its payout transaction `{transaction}` is not an Ethereum transaction hash"
+            )),
+            Some(transaction) => check_delivery(&self.bridge, payout.route, &transaction, payout.amount.to_f64())
+                .await
+                .map_err(VenueStepError::Unreachable)?,
+        };
+        match check {
+            DeliveryCheck::Arrived => Ok(true),
+            DeliveryCheck::NotYet(reason) => {
+                let order = state
+                    .order
+                    .as_mut()
+                    .ok_or("missing Rift order before the bridge back")?;
+                let mut wait = WaitBound {
+                    since: &mut order.delivered_at_ts,
+                    timeout_secs: payout.chain.return_timeout_secs(),
+                };
+                wait_within_bound(&state.liq_id, &mut wait, "Rift payout", reason)?;
+                Ok(false)
+            }
+            DeliveryCheck::Refused(reason) => Err(VenueStepError::Ambiguous(format!(
+                "Rift reports a delivery of {} {}, but {reason}",
+                payout.amount.to_f64(),
+                payout.route.source_asset
+            ))),
+        }
+    }
+
     /// The shared leg: the payout at the bridge wallet funds the ckERC20 or
     /// native ETH bridge.
     async fn bridge_back_from_ethereum(&self, state: &mut RiftState, payout: Payout) -> Result<(), VenueStepError> {
+        // The bridge wallet is shared with other rows. Until the bridge starts, the balance alone
+        // does not show whose funds are there, so the payout transaction must show this delivery.
+        if state.bridge_in.awaits_funds() && !self.payout_arrived(state, &payout).await? {
+            return Ok(());
+        }
         let order = state
             .order
             .as_mut()

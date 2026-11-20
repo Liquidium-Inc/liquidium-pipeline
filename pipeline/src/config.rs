@@ -120,6 +120,9 @@ pub struct Config {
     /// Highest ICPSwap price impact an allocation may carry, in bps. The limit is
     /// strict: an allocation quoted exactly at it is rejected.
     pub icpswap_max_price_impact_bps: f64,
+    /// Highest total cost (slippage plus pool fees) of an ICPSwap route over
+    /// several pools, in bps. A single pool keeps `icpswap_max_price_impact_bps`.
+    pub icpswap_max_route_cost_bps: f64,
     /// Iteration budget for the planner's binary search for the largest safe
     /// ICPSwap allocation. Each iteration costs one pool quote.
     pub icpswap_max_search_iterations: u8,
@@ -480,6 +483,7 @@ impl Config {
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
+            icpswap_max_route_cost_bps: parse_icpswap_max_route_cost_bps_from_env(),
             icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
             icpswap_dust_fallback_max_price_impact_bps: parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
             cex_max_price_impact_bps: parse_cex_max_price_impact_bps_from_env(),
@@ -601,6 +605,7 @@ const DEFAULT_BRIDGE_CKBTC_LEDGER_CANISTER: &str = "mxzaz-hqaaa-aaaar-qaada-cai"
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
+const DEFAULT_ICPSWAP_MAX_ROUTE_COST_BPS: f64 = 300.0;
 const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 pub(crate) const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
@@ -824,11 +829,20 @@ pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
 /// limit would be rejected by the planner constructor, so an unusable override
 /// falls back to the default instead of failing startup.
 fn parse_icpswap_max_price_impact_bps_from_env() -> f64 {
-    env::var("ICPSWAP_MAX_PRICE_IMPACT_BPS")
+    positive_f64_from_env("ICPSWAP_MAX_PRICE_IMPACT_BPS", DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS)
+}
+
+/// A positive, finite number from the environment, or the default.
+fn positive_f64_from_env(key: &str, default: f64) -> f64 {
+    env::var(key)
         .ok()
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS)
+        .unwrap_or(default)
+}
+
+fn parse_icpswap_max_route_cost_bps_from_env() -> f64 {
+    positive_f64_from_env("ICPSWAP_MAX_ROUTE_COST_BPS", DEFAULT_ICPSWAP_MAX_ROUTE_COST_BPS)
 }
 
 /// The planner rejects a zero iteration budget, so zero falls back to the
@@ -842,11 +856,7 @@ fn parse_icpswap_max_search_iterations_from_env() -> u8 {
 }
 
 fn parse_icpswap_dust_fallback_max_price_impact_bps_from_env() -> f64 {
-    env::var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS")
-        .ok()
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS)
+    positive_f64_from_env("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS", DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS)
 }
 
 /// Mirrors the planner's check: a ceiling outside 0..=10000 bps would be

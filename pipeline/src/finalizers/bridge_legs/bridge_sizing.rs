@@ -28,7 +28,7 @@ const GAS_MARGIN: f64 = 1.25;
 
 /// Checks that the bridge wallet holds the gas the return route pays, with a
 /// margin, before any funds commit to it. Only a real shortfall is
-/// `GasShortfall`; a failed read is `Other`, so an outage refuses no route.
+/// `GasShortfall`; a failed read is `Other`, so an outage is never taken for a shortfall.
 pub async fn ensure_return_gas(
     bridge: &BridgeRuntime,
     route: &BridgeRouteSpec,

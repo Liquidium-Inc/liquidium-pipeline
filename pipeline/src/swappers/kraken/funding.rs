@@ -19,57 +19,24 @@ pub(super) const WITHDRAWAL_RECENT_PAGE: i64 = 20;
 /// The most Kraken returns for one status request, over 90 days.
 pub(super) const WITHDRAWAL_HISTORY_MAX: i64 = 500;
 
+/// The amount a fee question asks about. Kraken refuses an amount under the
+/// current minimum ("EFunding:Invalid arguments"), and a gas-priced minimum
+/// can rise between the two reads, so the question asks for twice the minimum.
+pub(super) fn fee_probe_amount(minimum: Decimal) -> Decimal {
+    if minimum > Decimal::ZERO {
+        minimum * Decimal::TWO
+    } else {
+        Decimal::ONE
+    }
+}
+
 fn unavailable(error: KrakenApiError) -> FundingRouteError {
     FundingRouteError::Unavailable(error.to_string())
-}
-
-/// What Kraken offers for one route, read without moving funds. The texts are
-/// for an operator; no code decides on them.
-#[derive(Debug, Clone)]
-pub struct KrakenRouteCheck {
-    pub deposit: Result<KrakenDepositCheck, String>,
-    pub withdrawal: Result<KrakenWithdrawalCheck, String>,
-    /// Every method Kraken lists for the asset, as `method (network)`, so an
-    /// operator can see why a route found none.
-    pub listed_deposit_methods: Vec<String>,
-    pub listed_withdrawal_methods: Vec<String>,
-    /// Every withdrawal address saved for the asset, verified or not, as
-    /// `address (method, verified)`.
-    pub saved_withdrawal_addresses: Vec<String>,
-}
-
-impl KrakenRouteCheck {
-    /// True when a leg can deposit on `network`, by the rule the route check applies.
-    pub fn deposit_usable(&self, network: &str) -> bool {
-        self.deposit
-            .as_ref()
-            .is_ok_and(|deposit| !needs_memo_on_icp(network, deposit.tag.as_deref()))
-    }
 }
 
 /// An ICP transfer cannot carry Kraken's memo, so such a deposit would not be credited.
 fn needs_memo_on_icp(network: &str, tag: Option<&str>) -> bool {
     network.eq_ignore_ascii_case("ICP") && tag.is_some_and(|tag| !tag.trim().is_empty())
-}
-
-#[derive(Debug, Clone)]
-pub struct KrakenDepositCheck {
-    pub method: String,
-    pub minimum: Decimal,
-    pub address: String,
-    pub tag: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct KrakenWithdrawalCheck {
-    pub method: String,
-    pub network: Option<String>,
-    pub minimum: Decimal,
-    /// Whether `destination` is a verified address for this method; a leg can
-    /// only withdraw there.
-    pub destination_verified: bool,
-    /// Kraken's fee for a withdrawal of the minimum, once the address is verified.
-    pub fee_at_minimum: Option<Result<Decimal, String>>,
 }
 
 impl KrakenClient {
@@ -184,7 +151,7 @@ impl KrakenClient {
     }
 
     /// The method minimum, and the fee Kraken quotes for it. The fee is fixed
-    /// per method, so any verified address and the minimum amount read it.
+    /// per method, so any verified address and any amount above the minimum read it.
     pub(super) async fn withdraw_terms(&self, asset: &str, network: &str) -> Result<WithdrawTerms, String> {
         let (method, verified) = self
             .withdrawal_method_and_addresses(asset, network)
@@ -195,84 +162,16 @@ impl KrakenClient {
                 "Kraken has no verified {asset} withdrawal address for network {network}"
             ));
         };
-        let probe = if method.minimum > Decimal::ZERO {
-            method.minimum
-        } else {
-            Decimal::ONE
-        };
+        let probe = fee_probe_amount(method.minimum);
         let fee = self
             .api
             .withdrawal_fee(&api_asset(asset), key, probe)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("Kraken {asset} withdrawal fee for {probe}: {error}"))?;
         Ok(WithdrawTerms {
             fee: decimal_f64(fee, "withdrawal fee")?,
             minimum: decimal_f64(method.minimum, "withdrawal minimum")?,
         })
-    }
-
-    /// The deposit and withdrawal side of one route, as the leg would resolve
-    /// them. Only reads: no address is created and nothing is sent.
-    pub async fn route_check(&self, asset: &str, network: &str, destination: &str) -> KrakenRouteCheck {
-        let deposit = self
-            .resolve_deposit(asset, network)
-            .await
-            .map(|(method, address, tag)| KrakenDepositCheck {
-                method: method.method,
-                minimum: method.minimum,
-                address,
-                tag,
-            })
-            .map_err(|error| error.to_string());
-        let withdrawal = match self.withdrawal_method_and_addresses(asset, network).await {
-            Ok((method, verified)) => {
-                let key = verified
-                    .iter()
-                    .find(|(address, _)| addresses_match(address, destination))
-                    .map(|(_, key)| key.clone());
-                let fee_at_minimum = match &key {
-                    Some(key) => Some(
-                        self.api
-                            .withdrawal_fee(&api_asset(asset), key, method.minimum)
-                            .await
-                            .map_err(|error| error.to_string()),
-                    ),
-                    None => None,
-                };
-                Ok(KrakenWithdrawalCheck {
-                    method: method.method,
-                    network: method.network,
-                    minimum: method.minimum,
-                    destination_verified: key.is_some(),
-                    fee_at_minimum,
-                })
-            }
-            Err(error) => Err(error.to_string()),
-        };
-        let api_asset = api_asset(asset);
-        let listed = |methods: Result<Vec<KrakenFundingMethod>, KrakenApiError>| match methods {
-            Ok(methods) => methods
-                .into_iter()
-                .map(|method| format!("{} ({})", method.method, method.network.as_deref().unwrap_or("-")))
-                .collect(),
-            Err(error) => vec![format!("read failed: {error}")],
-        };
-        KrakenRouteCheck {
-            deposit,
-            withdrawal,
-            listed_deposit_methods: listed(self.deposit_methods(&api_asset).await),
-            listed_withdrawal_methods: listed(self.withdrawal_methods(&api_asset).await),
-            saved_withdrawal_addresses: match self.withdrawal_addresses(&api_asset).await {
-                Ok(addresses) => addresses
-                    .into_iter()
-                    .map(|entry| {
-                        let state = if entry.verified { "verified" } else { "NOT verified" };
-                        format!("{} ({}, {state})", entry.address, entry.method)
-                    })
-                    .collect(),
-                Err(error) => vec![format!("read failed: {error}")],
-            },
-        }
     }
 
     pub(super) async fn submit_withdrawal(

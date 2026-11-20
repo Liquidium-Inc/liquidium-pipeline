@@ -1,10 +1,12 @@
 //! The wire format as Rift sends it, and the typed failures per status.
 use liquidium_pipeline_connectors::backend::rift_backend::{
-    RiftAsset, RiftError, RiftOrderStatus, RiftQuoteRequest, RiftVenueLists,
+    RiftAsset, RiftError, RiftOrderRequest, RiftOrderStatus, RiftQuoteRequest, RiftVenueLists,
 };
 
 use super::client::quote_body;
-use super::protocol::{classify_failure, parse_order, parse_order_state, parse_quote};
+use super::protocol::{
+    classify_failure, matched_order, matched_order_state, matched_quote, parse_order, parse_order_state, parse_quote,
+};
 
 /// A live quote from 2026-11-09, trimmed to the fields the client reads plus the ones it ignores.
 const QUOTE: &str = r#"{
@@ -89,13 +91,33 @@ fn an_asset_without_a_chain_is_malformed() {
     assert!(matches!(error, RiftError::Malformed(_)), "{error}");
 }
 
+/// An order answer in the shape of Rift's API reference, with the fields that the client ignores.
+const ORDER: &str = r#"{
+  "id": "o1", "quote_id": "q1", "vault_id": "v",
+  "from": "ethereum.usdc", "to": "ethereum.usdt",
+  "amount_in": "100", "amount_out": null, "payout_tx": null, "format": "formatted",
+  "deposit_address": "0xdeposit", "deposit_tx": null,
+  "to_address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72",
+  "refund_address": "0x1111111111111111111111111111111111111111",
+  "status": "awaiting_deposit",
+  "deposit_deadline": "2026-11-16T07:40:36Z", "created_at": "2026-11-09T07:40:36Z"
+}"#;
+
+/// The request that `ORDER` answers.
+fn order_request() -> RiftOrderRequest {
+    RiftOrderRequest {
+        quote_id: "q1".to_string(),
+        from: RiftAsset::new("ethereum", "usdc"),
+        to: RiftAsset::new("ethereum", "usdt"),
+        amount_in: "100".to_string(),
+        to_address: "0x8ba1f109551bd432803012645ac136ddd64dba72".to_string(),
+        refund_address: "0x1111111111111111111111111111111111111111".to_string(),
+    }
+}
+
 #[test]
 fn an_order_carries_its_deposit_address_deadline_and_status() {
-    let order = parse_order(
-        r#"{"id":"o1","quote_id":"q1","vault_id":"v","deposit_address":"0xdeposit",
-            "amount_in":"3699.400709","deposit_deadline":"2026-11-16T07:40:36Z","status":"awaiting_deposit"}"#,
-    )
-    .expect("order");
+    let order = matched_order(&order_request(), parse_order(ORDER).expect("order")).expect("matched");
     assert_eq!((order.id.as_str(), order.quote_id.as_str()), ("o1", "q1"));
     assert_eq!(order.deposit_address, "0xdeposit");
     assert_eq!(order.status, RiftOrderStatus::AwaitingDeposit);
@@ -173,4 +195,127 @@ fn a_plain_text_body_is_kept_short_in_the_message() {
 fn the_client_needs_a_parsable_base_url() {
     assert!(super::RiftClient::new("not a url", None).is_err());
     assert!(super::RiftClient::new("https://api.rift.trade/", Some(" ".to_string())).is_ok());
+}
+
+#[test]
+fn the_client_refuses_plain_http_except_to_this_machine() {
+    let key = || Some("secret".to_string());
+    for accepted in [
+        "https://api.rift.trade",
+        "http://127.0.0.1:23010",
+        "http://localhost:23010",
+        "http://[::1]:23010",
+    ] {
+        assert!(super::RiftClient::new(accepted, key()).is_ok(), "{accepted}");
+    }
+    for refused in [
+        "http://api.rift.trade",
+        "http://10.0.0.5:8080",
+        "http://localhost.evil.example",
+        "ftp://api.rift.trade",
+    ] {
+        let error = super::RiftClient::new(refused, key()).err().expect(refused);
+        assert!(error.contains("must use https"), "{refused}: {error}");
+        // The refusal is the same without a key: the payout address is in the request too.
+        assert!(super::RiftClient::new(refused, None).is_err(), "{refused}");
+    }
+}
+
+fn btc_to_usdt(amount_in: &str) -> RiftQuoteRequest {
+    RiftQuoteRequest {
+        from: RiftAsset::new("bitcoin", "btc"),
+        to: RiftAsset::new("ethereum", "usdt"),
+        amount_in: amount_in.to_string(),
+        venues: RiftVenueLists::default(),
+    }
+}
+
+/// The client returns an answer only when it belongs to the request. An answer
+/// for another quote or order must not reach the plan or the steps.
+#[test]
+fn a_quote_for_another_pair_or_amount_is_malformed() {
+    let quote = || parse_quote(QUOTE).expect("quote");
+    // Trailing zeros are the same amount.
+    assert!(matched_quote(&btc_to_usdt("0.05"), quote()).is_ok());
+    assert!(matched_quote(&btc_to_usdt("0.0500"), quote()).is_ok());
+
+    let other_amount = matched_quote(&btc_to_usdt("0.06"), quote()).unwrap_err();
+    assert!(matches!(other_amount, RiftError::Malformed(_)), "{other_amount}");
+    let mut other_pair = btc_to_usdt("0.05");
+    other_pair.to = RiftAsset::new("ethereum", "usdc");
+    assert!(matches!(matched_quote(&other_pair, quote()), Err(RiftError::Malformed(_))));
+    assert!(matches!(
+        matched_quote(&btc_to_usdt("not a number"), quote()),
+        Err(RiftError::Malformed(_))
+    ));
+}
+
+/// `ORDER` with one field replaced by the given JSON value.
+fn order_with(field: &str, value: serde_json::Value) -> String {
+    let mut order: serde_json::Value = serde_json::from_str(ORDER).expect("order json");
+    order[field] = value;
+    order.to_string()
+}
+
+#[test]
+fn an_order_with_one_wrong_term_is_malformed_and_names_the_term() {
+    use serde_json::json;
+    let request = order_request();
+    // The payout address differs in case only, so it is the same address.
+    assert!(matched_order(&request, parse_order(ORDER).expect("order")).is_ok());
+
+    for (field, value, named) in [
+        ("quote_id", json!("q2"), "quote"),
+        ("deposit_address", json!(" "), "no deposit address"),
+        ("from", json!("ethereum.dai"), "the pair"),
+        ("to", json!("ethereum.usdc"), "the pair"),
+        ("amount_in", json!("100.01"), "the amount"),
+        ("to_address", json!("0x9999999999999999999999999999999999999999"), "the payout address"),
+        ("refund_address", json!("0x9999999999999999999999999999999999999999"), "the refund address"),
+        ("refund_address", json!(null), "the refund address"),
+        ("status", json!("funded"), "the status"),
+        ("status", json!("expired"), "the status"),
+    ] {
+        let answer = parse_order(&order_with(field, value.clone())).expect("parsed");
+        let error = matched_order(&request, answer).expect_err(field);
+        assert!(
+            matches!(error, RiftError::Malformed(ref text) if text.contains(named)),
+            "{field}={value}: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_order_answer_without_its_terms_is_malformed() {
+    for field in ["from", "to", "to_address"] {
+        let mut order: serde_json::Value = serde_json::from_str(ORDER).expect("order json");
+        order.as_object_mut().expect("object").remove(field);
+        assert!(
+            matches!(parse_order(&order.to_string()), Err(RiftError::Malformed(_))),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn only_hex_and_bech32_addresses_compare_without_case() {
+    let mut request = order_request();
+    // A base58 address is case-sensitive, so another case is another address.
+    request.to_address = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT".to_string();
+    let exact = order_with("to_address", serde_json::json!("1BoatSLRHtKNngkdXEeobR76b53LETtpyT"));
+    assert!(matched_order(&request, parse_order(&exact).expect("order")).is_ok());
+    let other_case = order_with("to_address", serde_json::json!("1boatslrhtknngkdxeeobr76b53lettpyt"));
+    assert!(matched_order(&request, parse_order(&other_case).expect("order")).is_err());
+
+    request.to_address = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string();
+    let upper = order_with("to_address", serde_json::json!("BC1QAR0SRRR7XFKVY5L643LYDNW9RE59GTZZWF5MDQ"));
+    assert!(matched_order(&request, parse_order(&upper).expect("order")).is_ok());
+}
+
+#[test]
+fn a_status_of_another_order_is_malformed() {
+    let state = || parse_order_state(r#"{"id":"o1","status":"delivered","payout_tx":"0xpayout"}"#).expect("state");
+    assert!(matched_order_state("o1", state()).is_ok());
+    let other = matched_order_state("o2", state()).unwrap_err();
+    assert!(matches!(other, RiftError::Malformed(ref text) if text.contains("o1") && text.contains("o2")), "{other}");
 }

@@ -237,7 +237,14 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
     }
 }
 
-fn native_icp_to_ckusdt_input() -> IcpswapFirstPlanInput {
+/// ckSOL -> ckUSDT: ICPSwap lists no pool and no path for ckSOL, so only the exchanges can take it.
+fn unlisted_pair_input() -> IcpswapFirstPlanInput {
+    let cksol = ChainToken::Icp {
+        ledger: Principal::from_text("ls5lp-lqaaa-aaaar-qb5oa-cai").expect("ckSOL ledger"),
+        symbol: "ckSOL".to_string(),
+        decimals: 8,
+        fee: Nat::from(10u64),
+    };
     let debt = ChainToken::Icp {
         ledger: Principal::from_text(CKUSDT_LEDGER_PRINCIPAL).expect("ckUSDT ledger"),
         symbol: "ckUSDT".to_string(),
@@ -245,17 +252,9 @@ fn native_icp_to_ckusdt_input() -> IcpswapFirstPlanInput {
         fee: Nat::from(10_000u64),
     };
     IcpswapFirstPlanInput {
-        liquidation_id: "42".to_string(),
-        total_pay: ChainTokenAmount::from_raw(native_icp(), Nat::from(TOTAL_PAY)),
         receive_asset: debt.asset_id(),
         debt_repaid: ChainTokenAmount::from_raw(debt, Nat::from(DEBT_REPAID)),
-        receive_address: Some("receiver".to_string()),
-        max_execution_slippage_bps: Some(500),
-        pay_reference_price_usd: Some(10.0),
-        pay_reference_price_ray: None,
-        receive_reference_price_ray: None,
-        reference_price_captured_at: Some(QUOTED_AT),
-        buy_bad_debt: false,
+        ..input_with_pay_token(cksol)
     }
 }
 
@@ -288,6 +287,7 @@ fn native_icp_to_ckusdc_with_oracle() -> IcpswapFirstPlanInput {
 fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
     IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
+        max_route_cost_bps: 200.0,
         max_search_iterations: 16,
         dust_fallback_max_price_impact_bps: 150.0,
         max_cex_price_impact_bps: 200.0,
@@ -685,6 +685,46 @@ async fn icpswap_only_rejects_an_unsafe_quote_without_searching() {
     assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)));
     assert!(error.to_string().contains("no overflow venue is enabled"));
     assert_eq!(calls_for_assert.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
+}
+
+/// An ICPSwap quote that crosses two pools: it carries one quote leg per pool.
+fn two_pool_preview(request: &SwapRequest, cost_bps: f64) -> VenueRoutePreview {
+    let mut preview = proportional_preview(request, ICPSWAP_VENUE_ID, cost_bps, 2);
+    let second_pool = preview.quote.legs[0].clone();
+    preview.quote.legs.push(second_pool);
+    preview
+}
+
+#[tokio::test]
+async fn a_route_over_two_pools_answers_to_the_route_limit() {
+    // 150 bps is over the 100 bps limit of one pool and under the 200 bps limit of a route.
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(two_pool_preview(request, 150.0))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(1.1)).expect("ICPSwap-only planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("a route under its own limit");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+}
+
+#[tokio::test]
+async fn a_route_at_its_limit_is_refused() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(two_pool_preview(request, 200.0))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(1.1)).expect("ICPSwap-only planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect_err("a route at its limit needs an overflow venue");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)));
 }
 
 #[tokio::test]
@@ -1261,6 +1301,20 @@ fn oracle_discount_limit_must_leave_room_above_the_impact_caps() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("must exceed the 200.00 bps CEX"), "{error}");
+
+    // A route over several pools has its own cap, and the limit must clear it too.
+    let at_route_cap = IcpswapFirstPlannerConfig {
+        max_route_cost_bps: 250.0,
+        ..config(0.0)
+    };
+    let adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1, 1))
+    });
+    let error = match IcpswapFirstPlanner::new(vec![Arc::new(adapter)], at_route_cap) {
+        Ok(_) => panic!("a limit at the route cap must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("must exceed the 250.00 bps ICPSwap route"), "{error}");
 
     // The shipped pairing leaves room above both caps.
     assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).dust_fallback_max_price_impact_bps);
@@ -1928,7 +1982,7 @@ async fn tiny_collateral_does_not_preview_mexc_when_icpswap_is_unavailable() {
 }
 
 #[tokio::test]
-async fn native_icp_to_ckusdt_is_mexc_only_and_never_previews_icpswap() {
+async fn an_unlisted_pair_is_mexc_only_and_never_previews_icpswap() {
     let icpswap = PlannerAdapter {
         venue_id: ICPSWAP_VENUE_ID,
         calls: Arc::new(Mutex::new(Vec::new())),
@@ -1945,7 +1999,7 @@ async fn native_icp_to_ckusdt_is_mexc_only_and_never_previews_icpswap() {
     });
 
     let state = planner(icpswap, mexc, config(0.0))
-        .plan(&native_icp_to_ckusdt_input(), 123)
+        .plan(&unlisted_pair_input(), 123)
         .await
         .expect("unsupported ICPSwap pair should use MEXC");
 
@@ -3137,7 +3191,7 @@ async fn the_mexc_override_forces_a_two_cex_split_where_icpswap_cannot_take_the_
     planner_config.mexc_test_allocation_usd = Some(10.0);
 
     // At $10/ICP, 3 ICP is $30: $10 forced to MEXC leaves $20 for Kraken.
-    let mut input = native_icp_to_ckusdt_input();
+    let mut input = unlisted_pair_input();
     input.total_pay.value = Nat::from(300_000_000u64);
     let state = IcpswapFirstPlanner::new(
         vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
@@ -3177,7 +3231,7 @@ async fn the_forced_cex_split_defers_to_the_waterfall_when_it_cannot_be_shaped()
     // remainder, which is the condition the override has to step aside for.
     planner_config.mexc_test_allocation_usd = Some(1_000.0);
 
-    let mut input = native_icp_to_ckusdt_input();
+    let mut input = unlisted_pair_input();
     input.total_pay.value = Nat::from(300_000_000u64);
     let state = IcpswapFirstPlanner::new(
         vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],

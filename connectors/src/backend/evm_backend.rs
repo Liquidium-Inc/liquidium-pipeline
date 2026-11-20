@@ -1,4 +1,5 @@
 use alloy::{
+    consensus::Transaction as _,
     eips::{BlockId, eip2718::Encodable2718},
     network::{AnyNetwork, Network, NetworkWallet, ReceiptResponse, TransactionBuilder},
     primitives::{Address, Bytes, TxHash, U256, keccak256},
@@ -28,6 +29,15 @@ sol! {
         function transfer(address to, uint256 amount) external returns (bool);
         function decimals() external view returns (uint8);
     }
+}
+
+/// What one transaction paid to one address, in base units. See `TransactionPayment`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvmPayment {
+    NotOnChain,
+    Reverted,
+    Paid(U256),
+    NotVisible,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -351,6 +361,57 @@ where
                 }
             }
         }
+    }
+
+    /// Returns what the transaction paid to `recipient`: in `token`, or in native ETH when `token` is `None`.
+    /// A token payment is the sum of the `Transfer` logs of that token to the recipient.
+    pub(crate) async fn transaction_payment_raw(
+        &self,
+        tx_hash: TxHash,
+        token: Option<Address>,
+        recipient: Address,
+    ) -> Result<EvmPayment, String> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(|e| format!("transaction receipt fetch failed for {tx_hash:#x}: {e}"))?;
+        let Some(receipt) = receipt else {
+            return Ok(EvmPayment::NotOnChain);
+        };
+        if !receipt.status() {
+            return Ok(EvmPayment::Reverted);
+        }
+        let Some(token) = token else {
+            let transaction = self
+                .provider
+                .get_transaction_by_hash(tx_hash)
+                .await
+                .map_err(|e| format!("transaction fetch failed for {tx_hash:#x}: {e}"))?
+                .ok_or_else(|| format!("transaction {tx_hash:#x} has a receipt but cannot be read"))?;
+            // A contract call can pay ETH inside the call, and the receipt does not show that.
+            return Ok(if transaction.to() == Some(recipient) {
+                EvmPayment::Paid(transaction.value())
+            } else {
+                EvmPayment::NotVisible
+            });
+        };
+        let transfer = keccak256("Transfer(address,address,uint256)");
+        let paid = receipt
+            .inner
+            .inner
+            .logs()
+            .iter()
+            .filter(|log| {
+                let topics = log.topics();
+                log.address() == token
+                    && topics.len() == 3
+                    && topics[0] == transfer
+                    && topics[2] == recipient.into_word()
+            })
+            .map(|log| U256::try_from_be_slice(&log.data().data).unwrap_or(U256::ZERO))
+            .fold(U256::ZERO, U256::saturating_add);
+        Ok(EvmPayment::Paid(paid))
     }
 
     pub(crate) async fn erc20_balance_of_raw(&self, token: Address, owner: Address) -> Result<U256, String> {

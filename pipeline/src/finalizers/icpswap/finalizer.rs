@@ -1,11 +1,15 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
+use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_core::tokens::chain_token::ChainToken;
+
+use super::hop_route::IcpswapRouteLimits;
 
 use crate::{
     swappers::{
         icpswap::{
-            VENUE_ID, ensure_supported_pair,
+            VENUE_ID, ensure_direct_pair,
             plan::input_fee_budget,
             session::{IcpswapExecutionSession, IcpswapExecutionSessionFactory},
             transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
@@ -44,6 +48,9 @@ pub struct IcpswapFinalizer {
     pub(super) sessions: Arc<dyn IcpswapExecutionSessionFactory>,
     pub(super) clock: Arc<Clock>,
     pub(super) watchdog: Arc<dyn Watchdog>,
+    /// Tokens a route may pass through, by ledger. Empty means direct pools only.
+    pub(super) route_tokens: HashMap<Principal, ChainToken>,
+    pub(super) route_limits: IcpswapRouteLimits,
 }
 
 impl IcpswapFinalizer {
@@ -67,7 +74,26 @@ impl IcpswapFinalizer {
             sessions,
             clock,
             watchdog: noop_watchdog(),
+            route_tokens: HashMap::new(),
+            // With no route tokens only the direct pool is quoted, so the limits rank nothing.
+            route_limits: IcpswapRouteLimits {
+                direct_bps: f64::INFINITY,
+                route_bps: f64::INFINITY,
+            },
         }
+    }
+
+    /// Lets a swap cross several pools through these tokens, under these limits.
+    pub fn with_routes(mut self, tokens: Vec<ChainToken>, limits: IcpswapRouteLimits) -> Self {
+        self.route_tokens = tokens
+            .into_iter()
+            .filter_map(|token| match &token {
+                ChainToken::Icp { ledger, .. } => Some((*ledger, token)),
+                _ => None,
+            })
+            .collect();
+        self.route_limits = limits;
+        self
     }
 
     pub(super) fn prepare_execution_state(
@@ -77,7 +103,7 @@ impl IcpswapFinalizer {
         request: &SwapRequest,
         plan: IcpswapExecutionPlan,
     ) -> Result<IcpswapExecutionState, String> {
-        ensure_supported_pair(request)?;
+        ensure_direct_pair(request).map_err(|error| error.to_string())?;
         if plan.amount_in.token.asset_id() != request.pay_asset
             || plan.gross_quoted_out.token.asset_id() != request.receive_asset
         {
@@ -102,7 +128,7 @@ impl IcpswapFinalizer {
             .as_deref()
             .ok_or_else(|| "ICPSwap request is missing receive_address".to_string())?;
         let destination = Account {
-            owner: candid::Principal::from_text(address)
+            owner: Principal::from_text(address)
                 .map_err(|error| format!("invalid ICPSwap receive principal `{address}`: {error}"))?,
             subaccount: None,
         };

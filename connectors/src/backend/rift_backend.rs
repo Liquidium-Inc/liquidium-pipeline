@@ -59,6 +59,20 @@ pub struct RiftQuote {
     pub venues: Vec<String>,
 }
 
+/// What to order: the quote, and what the order must say before the bot pays it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiftOrderRequest {
+    pub quote_id: String,
+    pub from: RiftAsset,
+    pub to: RiftAsset,
+    /// The amount that the bot deposits, as decimal text.
+    pub amount_in: String,
+    /// Where Rift pays the output.
+    pub to_address: String,
+    /// Where Rift returns the deposit if the order fails.
+    pub refund_address: String,
+}
+
 /// An order. Funds sent to `deposit_address` before `deposit_deadline` start it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RiftOrder {
@@ -170,6 +184,8 @@ pub enum RiftError {
     Malformed(String),
 }
 
+/// Each answer must belong to its request: a quote to the pair and amount, an order to the
+/// quote, a status to the order. If it does not, the call returns `Malformed`.
 #[mockall::automock]
 #[async_trait]
 pub trait RiftBackend: Send + Sync {
@@ -178,12 +194,7 @@ pub trait RiftBackend: Send + Sync {
 
     /// The order for a quote. Rift returns the same order for the same quote id
     /// and addresses, so a repeat is safe. A changed address is refused.
-    async fn create_order(
-        &self,
-        quote_id: &str,
-        to_address: &str,
-        refund_address: Option<String>,
-    ) -> Result<RiftOrder, RiftError>;
+    async fn create_order(&self, request: &RiftOrderRequest) -> Result<RiftOrder, RiftError>;
 
     async fn order_state(&self, order_id: &str) -> Result<RiftOrderState, RiftError>;
 }

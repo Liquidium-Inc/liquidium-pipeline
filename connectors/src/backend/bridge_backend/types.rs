@@ -255,6 +255,20 @@ impl From<&str> for BridgeError {
     }
 }
 
+/// What one transaction paid to one address, as the chain shows it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransactionPayment {
+    /// The chain has no receipt for the transaction yet.
+    NotOnChain,
+    /// The transaction failed, so it paid nothing.
+    Reverted,
+    /// The transaction paid this amount of the asset to the address.
+    Paid(f64),
+    /// The transaction succeeded, but the receipt does not show its payment.
+    /// Native ETH that a contract call paid has no log.
+    NotVisible,
+}
+
 /// Backend contract for reading balances and executing bridge routes.
 #[mockall::automock]
 #[async_trait]
@@ -267,6 +281,19 @@ pub trait BridgeBackend: Send + Sync {
     async fn get_gas_balance(&self, chain: &str, address: &str) -> Result<f64, String> {
         let _ = (chain, address);
         Err("gas balances are not supported by this bridge backend".to_string())
+    }
+
+    /// Returns what `transaction` paid to `address` in `asset` on `chain`.
+    /// A caller uses it to prove that a delivery is its own before it spends a shared wallet.
+    async fn payment_in_transaction(
+        &self,
+        asset: &str,
+        chain: &str,
+        address: &str,
+        transaction: &str,
+    ) -> Result<TransactionPayment, String> {
+        let _ = (asset, chain, address, transaction);
+        Err("transaction payments are not supported by this bridge backend".to_string())
     }
 
     /// Returns the source-asset amount that must remain on the source account

@@ -26,6 +26,7 @@ use crate::{
             profile::CexVenueProfile,
             runtime::{build_kraken_finalizer, build_mexc_finalizer},
         },
+        icpswap::leg_identity,
         rift::runtime::build_rift_finalizer,
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, KRAKEN_VENUE_ID, MEXC_VENUE_ID, MultiVenueAdapter,
@@ -45,7 +46,7 @@ use crate::{
         export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
-    swappers::icpswap::{identity::IcpswapExecutionIdentity, types::IcpswapExecutionState},
+    swappers::icpswap::identity::IcpswapExecutionIdentity,
     wal::decode_receipt_wrapper,
     watchdog::{
         WatchdogEvent,
@@ -145,8 +146,8 @@ pub(crate) async fn park_unresumable_committed_rows(
             {
                 continue;
             }
-            let execution = match leg.execution.decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID) {
-                Ok(Some(execution)) => execution,
+            let identity = match leg_identity(&leg.execution) {
+                Ok(Some(identity)) => identity,
                 Ok(None) => {
                     reasons.push(format!("ICPSwap leg `{}` has no ICPSwap execution state", leg.leg_id));
                     continue;
@@ -159,7 +160,7 @@ pub(crate) async fn park_unresumable_committed_rows(
                     continue;
                 }
             };
-            if let Err(error) = validate_icpswap_identity(&execution.identity, configured_icpswap_mnemonic) {
+            if let Err(error) = validate_icpswap_identity(&identity, configured_icpswap_mnemonic) {
                 reasons.push(format!(
                     "ICPSwap leg `{}` derived principal cannot be reproduced: {error}",
                     leg.leg_id
@@ -288,6 +289,7 @@ async fn init(
             venue_adapters,
             IcpswapFirstPlannerConfig {
                 max_price_impact_bps: config.icpswap_max_price_impact_bps,
+                max_route_cost_bps: config.icpswap_max_route_cost_bps,
                 max_search_iterations: config.icpswap_max_search_iterations,
                 dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
                 max_cex_price_impact_bps: config.cex_max_price_impact_bps,
