@@ -84,7 +84,7 @@ async fn a_delivered_order_moves_to_the_leg_back_with_its_amount() {
     assert_eq!(state.step, RiftStep::BridgeBack);
     let order = state.order.unwrap();
     assert_eq!(order.amount_out.as_deref(), Some("99.4"));
-    assert_eq!(order.payout_tx.as_deref(), Some("0xpayout"));
+    assert_eq!(order.payout_tx.as_deref(), Some(PAYOUT_TX));
     assert!(order.delivered_at_ts.is_some());
 }
 

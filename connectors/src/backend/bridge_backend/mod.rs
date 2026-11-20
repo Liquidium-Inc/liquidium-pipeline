@@ -15,6 +15,7 @@ pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeError, BridgeFeeBudget, BridgeMintReceipt, BridgeProvider,
     BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeSend, BridgeStatus, BridgeSubmission,
     BridgeSubmissionCandidate, BridgeSweepRoute, DepositNotice, EvmReceiptStatus, MockBridgeBackend,
+    TransactionPayment,
 };
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,

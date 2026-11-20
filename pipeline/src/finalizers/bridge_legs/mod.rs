@@ -6,6 +6,7 @@ mod bridge_in;
 mod bridge_leg_state;
 mod bridge_out;
 mod bridge_sizing;
+mod delivery_check;
 
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BridgeError, BridgeMintReceipt, BridgeRouteSpec, BridgeStatus,
@@ -26,6 +27,7 @@ use crate::{
 
 pub use bridge_in::{BridgeInInputs, advance_bridge_in, awaits_other_deposit, in_route};
 pub use bridge_leg_state::{BridgeInState, BridgeOutState};
+pub use delivery_check::{DeliveryCheck, check_delivery, evm_transaction_hash};
 pub use bridge_out::{Arrival, BridgeDestinationProvider, BridgeOutInputs, FundingSlot, advance_bridge_out, out_route};
 #[cfg(test)]
 pub use bridge_sizing::reverse_bridge_source_fee_reserve;

@@ -19,6 +19,7 @@ use super::{
     },
     types::{
         BridgeError, CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus,
+        TransactionPayment,
         HelperContract, LedgerError, MinterWithdrawalStatus, TxFinalizedStatus, WithdrawErc20Arg, WithdrawErc20Error,
         WithdrawErc20Ret, WithdrawalArg, WithdrawalDetail, WithdrawalError, WithdrawalProgress, WithdrawalRet,
         WithdrawalSearchParameter,
@@ -38,7 +39,7 @@ use crate::{
             BridgeSend, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice,
             resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
         },
-        evm_backend::{Broadcast, ERC20_APPROVE_GAS_LIMIT, EvmBackendImpl, SignedEvmTx},
+        evm_backend::{Broadcast, ERC20_APPROVE_GAS_LIMIT, EvmBackendImpl, EvmPayment, SignedEvmTx},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
             MinterBurn, ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_decimals_with_context,
@@ -178,6 +179,14 @@ pub trait BridgeEvmBackend: Send + Sync {
     async fn signed_outcome(&self, tx: &SignedEvmTx) -> SendOutcome;
 
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String>;
+
+    /// Returns what the transaction paid to `recipient`: in `token`, or in native ETH when `token` is `None`.
+    async fn transaction_payment(
+        &self,
+        tx_hash: TxHash,
+        token: Option<Address>,
+        recipient: Address,
+    ) -> Result<EvmPayment, String>;
 }
 
 #[async_trait]
@@ -315,6 +324,15 @@ where
             success: receipt.status(),
             block_number: receipt.block_number,
         }))
+    }
+
+    async fn transaction_payment(
+        &self,
+        tx_hash: TxHash,
+        token: Option<Address>,
+        recipient: Address,
+    ) -> Result<EvmPayment, String> {
+        self.transaction_payment_raw(tx_hash, token, recipient).await
     }
 }
 
@@ -1078,6 +1096,40 @@ where
             .await
             .map_err(|e| format!("native ETH balance failed for owner {owner}: {e}"))?;
         base_units_to_amount_via_core(balance, ETH_DECIMALS)
+    }
+
+    async fn payment_in_transaction(
+        &self,
+        asset: &str,
+        chain: &str,
+        address: &str,
+        transaction: &str,
+    ) -> Result<TransactionPayment, String> {
+        let route = resolve_cketh_forward_route_by_source(asset, chain)
+            .ok_or_else(|| format!("no payment read for {asset}@{chain} in the ckETH minter bridge backend"))?;
+        let recipient = address
+            .parse::<Address>()
+            .map_err(|e| format!("invalid address '{address}': {e}"))?;
+        let tx_hash = transaction
+            .trim()
+            .parse::<TxHash>()
+            .map_err(|e| format!("invalid transaction hash '{transaction}': {e}"))?;
+        let (token, decimals) = if route.route_kind == BridgeRouteKind::EthToCkEth {
+            (None, ETH_DECIMALS)
+        } else {
+            let token = parse_evm_token_address(route)?;
+            (Some(token), self.token_decimals(token).await?)
+        };
+        Ok(
+            match self.evm_backend.transaction_payment(tx_hash, token, recipient).await? {
+                EvmPayment::NotOnChain => TransactionPayment::NotOnChain,
+                EvmPayment::Reverted => TransactionPayment::Reverted,
+                EvmPayment::NotVisible => TransactionPayment::NotVisible,
+                EvmPayment::Paid(base_units) => {
+                    TransactionPayment::Paid(base_units_to_amount_via_core(base_units, decimals)?)
+                }
+            },
+        )
     }
 
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String> {

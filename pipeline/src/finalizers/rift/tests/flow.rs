@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeDestination, BridgeMintReceipt, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice,
+    BridgeDestination, BridgeMintReceipt, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice, TransactionPayment,
 };
 use liquidium_pipeline_core::outbound::PreparedSend;
 
@@ -69,6 +69,16 @@ async fn a_leg_pays_the_order_through_the_bridge_and_mints_what_rift_delivered()
             ("ckUSDC", "ICP") => Ok(100.0),
             ("USDT", "ETH") => Ok(99.4),
             other => panic!("unexpected source balance read {other:?}"),
+        });
+    // The payout transaction is read one time, before the bridge back starts.
+    bridge
+        .expect_payment_in_transaction()
+        .times(1)
+        .returning(|asset, chain, wallet, transaction| {
+            assert_eq!((asset, chain), ("USDT", "ETH"));
+            assert_eq!(wallet, "0x2222222222222222222222222222222222222222");
+            assert_eq!(transaction, PAYOUT_TX);
+            Ok(TransactionPayment::Paid(99.4))
         });
     bridge.expect_prepare_submission().times(1).returning(|_| Ok(None));
     bridge.expect_submit_bridge().times(1).returning(|request| {

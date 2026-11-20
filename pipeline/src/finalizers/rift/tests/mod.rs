@@ -28,6 +28,7 @@ mod bridge_out;
 mod flow;
 mod operator;
 mod order;
+mod payout;
 mod preview;
 mod wait;
 
@@ -36,6 +37,8 @@ pub(super) const MAIN_WALLET: &str = "0x1111111111111111111111111111111111111111
 pub(super) const REFUND_MINT_ACCOUNT: &str = "aaaaa-aa";
 pub(super) const REFUND_BTC_ADDRESS: &str = "bc1qrefundminter";
 pub(super) const DEPOSIT_ADDRESS: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
+/// The payout transaction that a delivered order names, in the form of an Ethereum hash.
+pub(super) const PAYOUT_TX: &str = "0x7f3a9c1e5b2d84f60a1c7e93d5b8426f0e9a3d17c6b24f58a0de13c79b6f2e41";
 
 /// Rift gives an order a week to be funded.
 const ORDER_DEADLINE_SECS: i64 = 7 * 24 * 60 * 60;
@@ -207,7 +210,7 @@ pub(super) fn order_state(status: RiftOrderStatus, amount_out: Option<&str>) -> 
         id: "order-1".to_string(),
         status,
         amount_out: amount_out.map(str::to_string),
-        payout_tx: amount_out.map(|_| "0xpayout".to_string()),
+        payout_tx: amount_out.map(|_| PAYOUT_TX.to_string()),
         refund_address: Some(MAIN_WALLET.to_string()),
     }
 }

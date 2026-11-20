@@ -182,3 +182,104 @@ async fn anvil_an_approve_after_signed_deposits_takes_the_next_nonce() {
         .expect("the second approve takes the nonce after the deposits");
     miner.abort();
 }
+
+/// Runtime code that emits one ERC-20 `Transfer(from, to, amount)` log on any call.
+fn transfer_emitter(from: Address, to: Address, amount: U256) -> Bytes {
+    let mut code = Vec::new();
+    // MSTORE(0, amount): the log data.
+    code.push(0x7f);
+    code.extend_from_slice(&amount.to_be_bytes::<32>());
+    code.extend_from_slice(&[0x60, 0x00, 0x52]);
+    // LOG3 reads offset, size, topic0, topic1, topic2 from the top of the stack.
+    for topic in [
+        to.into_word(),
+        from.into_word(),
+        alloy::primitives::keccak256("Transfer(address,address,uint256)"),
+    ] {
+        code.push(0x7f);
+        code.extend_from_slice(topic.as_slice());
+    }
+    code.extend_from_slice(&[0x60, 0x20, 0x60, 0x00, 0xa3, 0x00]);
+    Bytes::from(code)
+}
+
+/// Sends a call from the anvil key and returns its hash. Nothing is mined.
+async fn send_call(provider: &impl Provider<AnyNetwork>, to: Address, value: U256) -> alloy::primitives::TxHash {
+    use alloy::network::TransactionBuilder;
+    let request = alloy::rpc::types::TransactionRequest::default()
+        .with_to(to)
+        .with_value(value)
+        .with_gas_limit(200_000);
+    *provider
+        .send_transaction(alloy::serde::WithOtherFields::new(request))
+        .await
+        .expect("the call is sent")
+        .tx_hash()
+}
+
+#[tokio::test]
+#[ignore = "needs anvil on PATH"]
+async fn anvil_a_transaction_shows_what_it_paid_to_an_address() {
+    use crate::backend::evm_backend::EvmPayment;
+    let (_anvil, provider, _helper) = start_anvil().await;
+    let backend = EvmBackendImpl::new(provider.clone());
+    let set_code = |address: Address, code: Bytes| {
+        let provider = provider.clone();
+        async move {
+            provider
+                .raw_request::<_, serde_json::Value>("anvil_setCode".into(), (address, code))
+                .await
+                .expect("anvil_setCode");
+        }
+    };
+    let wallet = Address::repeat_byte(0x22);
+    let other = Address::repeat_byte(0x33);
+    let token = Address::repeat_byte(0x55);
+    let other_token = Address::repeat_byte(0x66);
+    let reverting = Address::repeat_byte(0x77);
+    let sender = Address::repeat_byte(0x99);
+    set_code(token, transfer_emitter(sender, wallet, U256::from(5_000u64))).await;
+    // PUSH1 0, PUSH1 0, REVERT.
+    set_code(reverting, Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd])).await;
+
+    let native = send_call(&provider, wallet, U256::from(777u64)).await;
+    // Sent and not mined: the chain has no receipt.
+    assert_eq!(
+        backend.transaction_payment(native, None, wallet).await.unwrap(),
+        EvmPayment::NotOnChain
+    );
+    mine(&provider).await;
+    assert_eq!(
+        backend.transaction_payment(native, None, wallet).await.unwrap(),
+        EvmPayment::Paid(U256::from(777u64))
+    );
+    // The same transaction did not pay another address in a way that a receipt shows.
+    assert_eq!(
+        backend.transaction_payment(native, None, other).await.unwrap(),
+        EvmPayment::NotVisible
+    );
+
+    let transfer = send_call(&provider, token, U256::ZERO).await;
+    let failed = send_call(&provider, reverting, U256::ZERO).await;
+    mine(&provider).await;
+    assert_eq!(
+        backend.transaction_payment(transfer, Some(token), wallet).await.unwrap(),
+        EvmPayment::Paid(U256::from(5_000u64))
+    );
+    // Another receiver and another token both read as nothing paid.
+    assert_eq!(
+        backend.transaction_payment(transfer, Some(token), other).await.unwrap(),
+        EvmPayment::Paid(U256::ZERO)
+    );
+    assert_eq!(
+        backend
+            .transaction_payment(transfer, Some(other_token), wallet)
+            .await
+            .unwrap(),
+        EvmPayment::Paid(U256::ZERO)
+    );
+    assert_eq!(
+        backend.transaction_payment(failed, Some(token), wallet).await.unwrap(),
+        EvmPayment::Reverted
+    );
+}
