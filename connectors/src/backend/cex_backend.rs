@@ -133,7 +133,7 @@ pub struct SwapExecutionOptions {
     /// Optional quote overspend cap (in bps) used by base-quantity buy mode.
     pub max_quote_overspend_bps: Option<f64>,
     /// With a limit the order is an IOC limit order: nothing fills worse than the
-    /// limit. If the exchange refuses IOC outright, or without a limit, it is a market order.
+    /// limit, and a refused IOC order is an error. Without a limit it is a market order.
     pub price_limit: Option<PriceLimit>,
 }
 

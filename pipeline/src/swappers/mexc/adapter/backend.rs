@@ -35,54 +35,43 @@ impl CexBackend for MexcClient {
             "buy" => OrderSide::Buy,
             _ => return Err(format!("unsupported side: {side}").into()),
         };
-        // Lock the authenticated client per exchange interaction, not for the full swap flow.
-        let market_order = if order_side == OrderSide::Sell {
-            Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())
-        } else {
-            let ex = self.inner.lock().await;
-            self.prepare_buy_order(
-                &ex,
-                amount_dec,
-                filters.as_ref(),
-                api_symbol,
-                symbol.as_str(),
-                options.buy_mode,
-                options.max_quote_overspend_bps,
-            )
-            .await
-        }
-        .map(|(_, quantity, quote_order_quantity)| MarketOrder {
-            quantity,
-            quote_order_quantity,
-        });
-        // A price limit is never dropped: an IOC order that cannot be built here
-        // sends nothing. Only MEXC's own refusal of the IOC type allows a market order.
-        let ioc_order = options
-            .price_limit
-            .as_ref()
-            .map(|limit| {
-                Self::ioc_limit_price(&side_norm, limit, filters.as_ref())
-                    .and_then(|price| {
-                        let quantity = match order_side {
-                            OrderSide::Sell => market_order
-                                .as_ref()
-                                .map_err(Clone::clone)?
-                                .quantity
-                                .ok_or("sell order has no quantity")?,
-                            OrderSide::Buy => Self::ioc_buy_quantity(amount_dec, price, filters.as_ref(), &symbol)?,
-                        };
-                        Ok(IocOrder { quantity, price })
-                    })
-                    .map_err(|error| format!("no IOC order for {market} {side}: {error}"))
-            })
-            .transpose()?;
-        let market_order = match (market_order, ioc_order) {
-            (Ok(order), _) => Some(order),
-            (Err(error), Some(_)) => {
-                warn!("[mexc] no market fallback for {market} {side} ({error}); sending the IOC order alone");
-                None
+        // A priced order is IOC only, so MEXC enforces the limit before it
+        // matches. If the IOC order cannot be built, or MEXC refuses it, nothing
+        // is sent: an order without a price never stands in for a limit.
+        let order = match options.price_limit.as_ref() {
+            Some(limit) => Self::ioc_limit_price(&side_norm, limit, filters.as_ref())
+                .and_then(|price| {
+                    let quantity = match order_side {
+                        OrderSide::Sell => Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())?
+                            .1
+                            .ok_or("sell order has no quantity")?,
+                        OrderSide::Buy => Self::ioc_buy_quantity(amount_dec, price, filters.as_ref(), &symbol)?,
+                    };
+                    Ok(SliceOrder::Ioc(IocOrder { quantity, price }))
+                })
+                .map_err(|error| format!("no IOC order for {market} {side}: {error}"))?,
+            None => {
+                let (_, quantity, quote_order_quantity) = if order_side == OrderSide::Sell {
+                    Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())?
+                } else {
+                    // Lock the authenticated client per exchange interaction, not for the full swap flow.
+                    let ex = self.inner.lock().await;
+                    self.prepare_buy_order(
+                        &ex,
+                        amount_dec,
+                        filters.as_ref(),
+                        api_symbol,
+                        symbol.as_str(),
+                        options.buy_mode,
+                        options.max_quote_overspend_bps,
+                    )
+                    .await?
+                };
+                SliceOrder::Market(MarketOrder {
+                    quantity,
+                    quote_order_quantity,
+                })
             }
-            (Err(error), None) => return Err(error.into()),
         };
 
         // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
@@ -92,8 +81,7 @@ impl CexBackend for MexcClient {
                 &ex,
                 &candidates,
                 order_side,
-                market_order,
-                ioc_order,
+                order,
                 options.client_order_id.as_deref(),
                 market,
                 side,
