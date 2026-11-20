@@ -3,6 +3,8 @@ use super::*;
 
 use num_traits::ToPrimitive;
 
+use crate::finalizers::bridge_legs::BridgeLegError;
+
 fn return_gas() -> SideCost {
     SideCost::new(
         "ETH gas for the USDC helper deposit",
@@ -54,6 +56,11 @@ async fn bridged_preview_counts_both_bridges_and_the_mexc_withdrawal() {
             other => Err(format!("unexpected budget {other:?}")),
         });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.005));
+    // The bridge wallet can pay the return gas.
+    bridge.expect_get_gas_balance().returning(|chain, _| {
+        assert_eq!(chain, "ETH");
+        Ok(0.05)
+    });
     let pay = cketh_token();
     let receive = ckusdc_token();
     let registry = liquidium_pipeline_core::tokens::token_registry::TokenRegistry::new(HashMap::from([
@@ -90,4 +97,32 @@ async fn bridged_preview_counts_both_bridges_and_the_mexc_withdrawal() {
     // The return's gas is paid from the bridge wallet, so it travels as a side cost.
     assert_eq!(preview.side_costs, vec![return_gas()]);
     assert_eq!(preview.state.side_costs, vec![return_gas()]);
+}
+
+/// The bridge wallet for a USDC return, with `gas_balance` as its gas read.
+async fn return_gas_check(gas_balance: Result<f64, String>) -> Result<(), BridgeLegError> {
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_get_gas_balance()
+        .returning(move |_, _| gas_balance.clone());
+    let runtime = bridge_dependencies(Arc::new(bridge));
+    let route = crate::finalizers::bridge_legs::in_route("USDC", "ETH", "ckUSDC").expect("USDC return route");
+    let budget = BridgeFeeBudget {
+        side_costs: vec![return_gas()],
+        ..BridgeFeeBudget::default()
+    };
+    crate::finalizers::bridge_legs::ensure_return_gas(&runtime, route, &budget).await
+}
+
+/// A shortfall refuses this transport only. A failed read says nothing about
+/// the wallet, so it must not look like a shortfall.
+#[tokio::test]
+async fn a_failed_gas_read_is_not_a_gas_shortfall() {
+    let short = return_gas_check(Ok(0.000_1)).await.unwrap_err();
+    assert!(matches!(short, BridgeLegError::GasShortfall(_)), "{short}");
+
+    let outage = return_gas_check(Err("rpc timeout".to_string())).await.unwrap_err();
+    assert!(matches!(outage, BridgeLegError::Other(_)), "{outage}");
+
+    return_gas_check(Ok(0.05)).await.expect("enough gas passes");
 }

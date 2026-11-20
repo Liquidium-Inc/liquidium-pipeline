@@ -1,12 +1,8 @@
 pub(super) use crate::swappers::model::{LIQUIDITY_EPS, f64_to_nat};
-use crate::utils::now_ts;
 
 /// Seconds waited since `since`. A row saved before this clock existed starts
 /// it now, so it waits from here and not forever.
-pub(super) fn waited_secs(since: &mut Option<i64>) -> i64 {
-    let since = *since.get_or_insert_with(now_ts);
-    now_ts().saturating_sub(since)
-}
+pub(super) use crate::utils::waited_secs;
 
 /// Stable 64-bit FNV-1a. Exchange ids derived from it must not change
 /// between releases, so the std hasher is not an option.
@@ -86,40 +82,4 @@ pub(super) fn is_usd_stable_symbol(symbol: &str) -> bool {
         symbol.to_ascii_uppercase().as_str(),
         "USD" | "USDT" | "USDC" | "CKUSDT" | "CKUSDC"
     )
-}
-
-/// Hardcoded multi-leg routes where direct market lookup is insufficient.
-/// The ck pairs have none: the route search finds them from the configured
-/// pairs, so a dead ck market falls through to the next transport.
-pub(super) fn mexc_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &str) -> Option<Vec<TradeLeg>> {
-    let deposit = deposit_symbol.to_ascii_uppercase();
-    let withdraw = withdraw_symbol.to_ascii_uppercase();
-
-    if deposit == "ETH" && withdraw == "USDC" {
-        return Some(vec![
-            TradeLeg {
-                market: "ETH_USDT".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "USDC_USDT".to_string(),
-                side: "buy".to_string(),
-            },
-        ]);
-    }
-
-    if deposit == "USDC" && withdraw == "ETH" {
-        return Some(vec![
-            TradeLeg {
-                market: "USDC_USDT".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "ETH_USDT".to_string(),
-                side: "buy".to_string(),
-            },
-        ]);
-    }
-
-    None
 }

@@ -1,6 +1,7 @@
 //! The exchange withdrawal request: its order id, the saved send, and the
 //! below-minimum dust completion.
 use super::*;
+use crate::finalizers::bridge_legs::net_of_withdraw_fee;
 use liquidium_pipeline_connectors::backend::cex_backend::WithdrawStatusSnapshot;
 
 /// The withdrawal order id for one withdrawal attempt of a row (MEXC `withdrawOrderId`).
@@ -213,7 +214,7 @@ where
             }
             WithdrawStatus::Completed if snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) => {
                 if let Some(fee) = snapshot.transaction_fee {
-                    let net = Self::net_of_withdraw_fee(amount, fee)
+                    let net = net_of_withdraw_fee(amount, fee)
                         .map_err(|error| format!("invalid completed withdrawal fee: {error}"))?;
                     state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
                         state.withdraw.withdraw_asset.clone(),

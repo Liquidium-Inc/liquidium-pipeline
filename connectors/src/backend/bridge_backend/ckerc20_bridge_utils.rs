@@ -4,8 +4,8 @@ use icrc_ledger_types::icrc1::account::{Account, principal_to_subaccount};
 use std::str::FromStr;
 
 use crate::backend::bridge_backend::{
-    BridgeDestination, BridgeDestinationKind, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, resolve_route,
-    validate_destination_for_route,
+    BridgeDestination, BridgeDestinationKind, BridgeProvider, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+    resolve_route, validate_destination_for_route,
 };
 
 /// Encodes an ICP account into the `bytes32` principal/subaccount tuple expected by
@@ -71,44 +71,6 @@ pub(super) fn parse_ckerc20_ledger_id(route: &BridgeRouteSpec) -> Result<Princip
     })
 }
 
-/// Parses a source ICP account from either textual `Account` form or principal text.
-/// If only principal text is provided, `subaccount` is set to `None`.
-pub(super) fn parse_source_icp_account(source_address: &str) -> Result<Account, String> {
-    if let Ok(account) = Account::from_str(source_address.trim()) {
-        return Ok(account);
-    }
-    if let Ok(owner) = Principal::from_str(source_address.trim()) {
-        return Ok(Account {
-            owner,
-            subaccount: None,
-        });
-    }
-    Err(format!(
-        "invalid source ICP account '{}'; expected principal or Account text",
-        source_address
-    ))
-}
-
-/// Verifies reverse-route source account ownership and enforces principal-only source
-/// accounts for bridge flow safety.
-pub(super) fn ensure_source_matches_bridge_owner(
-    source_account: &Account,
-    bridge_owner: Principal,
-) -> Result<(), String> {
-    if source_account.owner != bridge_owner {
-        return Err(format!(
-            "source ICP account owner {} does not match configured bridge owner {}",
-            source_account.owner, bridge_owner
-        ));
-    }
-    if source_account.subaccount.is_some() {
-        return Err(
-            "bridge reverse route requires principal-only source account (subaccount must be None)".to_string(),
-        );
-    }
-    Ok(())
-}
-
 /// Extracts an ICP destination account from a route-validated destination.
 pub(super) fn expect_icp_destination<'a>(
     route: &BridgeRouteSpec,
@@ -152,13 +114,7 @@ pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result
             request.asset, request.source_chain, request.target_asset
         ));
     };
-    if !matches!(
-        route.route_kind,
-        BridgeRouteKind::CkEthErc20Forward
-            | BridgeRouteKind::CkEthErc20Reverse
-            | BridgeRouteKind::EthToCkEth
-            | BridgeRouteKind::CkEthToEth
-    ) {
+    if route.route_kind.provider() != BridgeProvider::CkEthMinter {
         return Err(format!(
             "route {}@{} -> {} is not supported by CkErc20BridgeBackend",
             request.asset, request.source_chain, request.target_asset
@@ -180,14 +136,24 @@ pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result
 /// The ckETH burn index inside a reverse-route handle. The minter indexes every
 /// withdrawal by it, so it is the one id that both handle formats share.
 pub(super) fn minter_withdrawal_id(bridge_id: &str) -> Option<u64> {
-    if let Some(id) = bridge_id.strip_prefix("ic-withdraw-eth:") {
-        return id.parse().ok();
+    let id = match bridge_id.strip_prefix("ic-withdraw-eth:") {
+        Some(id) => id,
+        None => bridge_id.strip_prefix("ic-withdraw:")?.rsplit(':').next()?,
+    };
+    parse_block_index(id)
+}
+
+/// A block index as a handle stores it. Handles print candid `Nat`, which
+/// groups digits with `_` (`1_118_452`), so the separators are dropped first.
+fn parse_block_index(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return None;
     }
-    bridge_id.strip_prefix("ic-withdraw:")?.rsplit(':').next()?.parse().ok()
+    text.replace('_', "").parse().ok()
 }
 
 /// A handle rebuilt from the minter's withdrawal record. The record has no
-/// ckERC20 burn index, and the status poller only reads the prefix.
+/// ckERC20 burn index, and the status poller reads only the withdrawal id.
 pub(super) fn recovered_bridge_id(route_kind: BridgeRouteKind, withdrawal_id: u64) -> String {
     match route_kind {
         BridgeRouteKind::CkEthToEth => format!("ic-withdraw-eth:{withdrawal_id}"),

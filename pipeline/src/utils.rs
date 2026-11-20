@@ -43,6 +43,20 @@ pub fn now_nanos() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Seconds since `since`, which is set to now on first use.
+pub fn waited_secs(since: &mut Option<i64>) -> i64 {
+    let since = *since.get_or_insert_with(now_ts);
+    now_ts().saturating_sub(since)
+}
+
+/// Starts a running wait again, after an operator release. A wait that has
+/// not started stays unset, so it never claims an event that did not happen.
+pub fn restart_wait(since: &mut Option<i64>) {
+    if since.is_some() {
+        *since = Some(now_ts());
+    }
+}
+
 /// Creates a restart-safe idempotency key for a venue execution prepared
 /// before the parent multi-venue plan has assigned its persisted leg ID.
 pub fn new_venue_execution_id(venue_id: &str) -> String {
@@ -52,6 +66,17 @@ pub fn new_venue_execution_id(venue_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_moves_a_running_wait_to_now_and_leaves_an_unset_one() {
+        let mut running = Some(now_ts() - 1_000);
+        restart_wait(&mut running);
+        assert!(waited_secs(&mut running) < 5);
+
+        let mut unset = None;
+        restart_wait(&mut unset);
+        assert!(unset.is_none());
+    }
 
     #[test]
     fn every_debt_ledger_gets_a_nonzero_allowance() {

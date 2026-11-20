@@ -49,6 +49,7 @@ async fn mexc_deposit_phase_a_rejects_fee_consumed_deposit_with_permanent_prefix
 #[tokio::test]
 async fn mexc_deposit_phase_a_uses_evm_destination_for_evm_assets() {
     let mut backend = MockCexBackend::new();
+    backend.expect_check_funding_route().returning(|_| Ok(()));
     let mut transfers = MockTransferActions::new();
 
     backend.expect_get_balance().times(1).returning(|asset| {
@@ -143,6 +144,8 @@ async fn mexc_native_icp_deposit_uses_ledger_account_id_destination() {
     AccountIdentifier::from_hex(MEXC_ICP_DEPOSIT_ACCOUNT_ID_HEX).expect("test MEXC ICP account id should be valid");
 
     let mut backend = MockCexBackend::new();
+
+    backend.expect_check_funding_route().returning(|_| Ok(()));
     let mut transfers = MockTransferActions::new();
 
     backend.expect_get_balance().times(1).returning(|asset| {
@@ -272,9 +275,10 @@ fn mexc_sol_reverse_plan_reserves_approval_fee() {
     assert!(!plan.withdraw.bridge_required);
     let route = liquidium_pipeline_connectors::backend::bridge_backend::resolve_route("ckSOL", "ICP", "SOL").unwrap();
     let amount = ChainTokenAmount::from_raw(sol.clone(), Nat::from(1_000_000_000u64));
-    let (reserve, burn) = CexVenueFinalizer::<MockCexBackend>::compute_reverse_bridge_source_fee_reserve(
-        route, &sol, &amount.value, 0.0000005,
-    ).unwrap().unwrap();
+    let (reserve, burn) =
+        crate::finalizers::bridge_legs::reverse_bridge_source_fee_reserve(route, &sol, &amount.value, 0.0000005)
+            .unwrap()
+            .unwrap();
     assert_eq!(reserve.value, Nat::from(500u64));
     assert_eq!(burn.value, Nat::from(999_999_500u64));
     assert!(
@@ -623,7 +627,6 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
             deposit_bridge_expected_amount: None,
             deposit_bridge_provider_fee_budget_native_units: None,
             deposit_bridge_call: None,
-            legacy_bridge_submit_phase: None,
             deposit_bridge_call_unrecorded: false,
         },
     };

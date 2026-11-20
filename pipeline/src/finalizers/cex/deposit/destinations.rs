@@ -1,6 +1,7 @@
 //! Deposit and withdrawal addresses on the ledgers the exchange uses: native ICP
 //! account ids, ICRC accounts and the per-network deposit destination.
 use super::*;
+use liquidium_pipeline_connectors::backend::cex_backend::FundingRoute;
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -104,6 +105,23 @@ where
                 token.symbol()
             )),
         }
+    }
+
+    /// The route the exchange checks before funds move: the deposit of
+    /// `deposit_amount` as it arrives, and the withdrawal to our address.
+    pub(in crate::finalizers::cex) fn funding_route(
+        &self,
+        state: &CexState,
+        deposit_amount: f64,
+    ) -> Result<FundingRoute, String> {
+        Ok(FundingRoute {
+            deposit_asset: <Self as BridgePlanner>::planned_deposit_asset(state),
+            deposit_network: <Self as BridgePlanner>::planned_deposit_network(state),
+            deposit_amount,
+            withdraw_asset: <Self as BridgePlanner>::planned_withdraw_asset(state),
+            withdraw_network: <Self as BridgePlanner>::planned_withdraw_network(state),
+            withdraw_address: self.planned_withdraw_address(state)?,
+        })
     }
 
     /// The address the exchange withdraws to: the bridge source for a bridged

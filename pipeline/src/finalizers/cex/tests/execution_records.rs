@@ -1,5 +1,6 @@
 //! Audit L19, L23 and L25: the fee reserve, the route slippage and the per-slice amounts.
 use super::*;
+use crate::finalizers::bridge_legs::fee_adjusted_transfer;
 use crate::finalizers::cex::state::CexTradeSlice;
 
 fn slice(
@@ -123,7 +124,6 @@ async fn usd_slice_records_keep_six_decimals() {
 /// holds back their fees; every other route keeps the transfer fee alone.
 #[test]
 fn the_deposit_reserve_covers_only_the_fees_its_route_pays() {
-    type F = CexVenueFinalizer<MockCexBackend>;
     let mexc = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()));
     let sol = ChainToken::SolanaNative {
         symbol: "SOL".into(),
@@ -136,8 +136,8 @@ fn the_deposit_reserve_covers_only_the_fees_its_route_pays() {
 
     let size_in = ChainTokenAmount::from_raw(ckusdc_token(), Nat::from(1_000_000u64));
     let fee = ckusdc_token().fee();
-    let (direct, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, 7).unwrap();
-    let (bridged, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, 1).unwrap();
+    let (direct, _) = fee_adjusted_transfer(&ckusdc_token(), &size_in, 7).unwrap();
+    let (bridged, _) = fee_adjusted_transfer(&ckusdc_token(), &size_in, 1).unwrap();
     assert_eq!(direct, Nat::from(1_000_000u64) - fee.clone() * 7u8);
     assert_eq!(bridged, Nat::from(1_000_000u64) - fee);
 

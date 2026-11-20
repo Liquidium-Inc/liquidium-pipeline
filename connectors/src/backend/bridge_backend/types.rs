@@ -45,11 +45,60 @@ pub enum BridgeRouteKind {
     IcpToSolana,
 }
 
+/// The minter behind a route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeProvider {
+    CkEthMinter,
+    CkSolMinter,
+    CkBtcMinter,
+}
+
 impl BridgeRouteKind {
     /// True when one send funds the route: the bridge signs it, and the
     /// outbound driver saves, sends and settles it.
     pub fn funded_by_signed_send(self) -> bool {
         matches!(self, Self::SolanaToIcp | Self::CkEthErc20Forward | Self::EthToCkEth)
+    }
+
+    /// A route the ckETH minter serves into ICP.
+    pub fn is_cketh_forward(self) -> bool {
+        matches!(self, Self::CkEthErc20Forward | Self::EthToCkEth)
+    }
+
+    /// A route the ckETH minter serves out of ICP.
+    pub fn is_cketh_reverse(self) -> bool {
+        matches!(self, Self::CkEthErc20Reverse | Self::CkEthToEth)
+    }
+
+    /// A withdrawal through a minter: it burns on ICP and pays out elsewhere.
+    /// The approve fee stays on the source account, so the leg reserves it.
+    pub fn is_minter_withdrawal(self) -> bool {
+        matches!(
+            self,
+            Self::CkEthErc20Reverse | Self::CkEthToEth | Self::IcpToSolana | Self::CkBtcToBtc
+        )
+    }
+
+    /// Whether the minter refuses a withdrawal under a minimum. ckERC20
+    /// withdrawals have none.
+    pub fn has_withdrawal_minimum(self) -> bool {
+        matches!(self, Self::CkEthToEth | Self::IcpToSolana | Self::CkBtcToBtc)
+    }
+
+    /// The minter burns the whole amount and takes its fee out of it at
+    /// execution time, so the far side receives less, and by a sum only known then.
+    pub fn fee_comes_out_of_amount(self) -> bool {
+        matches!(self, Self::CkBtcToBtc | Self::CkEthToEth)
+    }
+
+    pub fn provider(self) -> BridgeProvider {
+        match self {
+            Self::CkEthErc20Forward | Self::CkEthErc20Reverse | Self::EthToCkEth | Self::CkEthToEth => {
+                BridgeProvider::CkEthMinter
+            }
+            Self::SolanaToIcp | Self::IcpToSolana => BridgeProvider::CkSolMinter,
+            Self::BtcToCkBtc | Self::CkBtcToBtc => BridgeProvider::CkBtcMinter,
+        }
     }
 }
 
@@ -130,6 +179,9 @@ pub enum DepositNotice {
     Accepted(BridgeSubmission),
     /// The provider does not track it yet. Asking again is safe.
     NotYet { reason: String },
+    /// The provider holds the deposit and will not mint it on its own.
+    /// Only an operator, with the provider's support, moves it.
+    Held { reason: String },
 }
 
 /// High-level bridge lifecycle state from the provider/backend.
@@ -210,11 +262,32 @@ pub trait BridgeBackend: Send + Sync {
     /// Returns a human-readable source balance for a route input asset/account.
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String>;
 
+    /// The raw native balance of a wallet on `chain`, for a gas check. Unlike
+    /// the ETH source balance, nothing is kept back from it.
+    async fn get_gas_balance(&self, chain: &str, address: &str) -> Result<f64, String> {
+        let _ = (chain, address);
+        Err("gas balances are not supported by this bridge backend".to_string())
+    }
+
     /// Returns the source-asset amount that must remain on the source account
     /// in addition to the submitted bridge amount.
     async fn get_source_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
         let _ = (asset, chain, target_asset);
         Ok(0.0)
+    }
+
+    /// The source-side fee a submission of `amount` from `source_address`
+    /// still has to pay. A fee an earlier attempt paid is not due again.
+    async fn source_fee_due(
+        &self,
+        asset: &str,
+        chain: &str,
+        target_asset: &str,
+        source_address: &str,
+        amount: f64,
+    ) -> Result<f64, String> {
+        let _ = (source_address, amount);
+        Ok(self.get_fee_budget(asset, chain, target_asset).await?.source_fee_budget)
     }
 
     /// Returns the target-asset amount expected to be deducted before the bridge
@@ -253,6 +326,18 @@ pub trait BridgeBackend: Send + Sync {
 
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError>;
+
+    /// The provider's deposit address for `destination` on a route that
+    /// watches an address, so a third party can pay the route directly.
+    async fn deposit_address(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+    ) -> Result<String, String> {
+        let _ = (asset, chain, destination);
+        Err("deposit addresses are not supported by this bridge backend".to_string())
+    }
 
     /// Checks a request and signs the send that funds it, without sending it.
     /// The outbound driver sends it, then the caller gives `track_deposit` its receipt.
@@ -374,6 +459,42 @@ pub(super) struct WithdrawalDetail {
     pub from_subaccount: Option<Vec<u8>>,
     pub recipient_address: String,
     pub status: candid::Reserved,
+}
+
+/// A withdrawal's progress as the ckETH minter reports it, by its candid tags.
+#[allow(clippy::enum_variant_names)]
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+pub(super) enum MinterWithdrawalStatus {
+    Pending,
+    TxCreated,
+    TxSent(EthTransaction),
+    TxFinalized(TxFinalizedStatus),
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+pub(super) struct EthTransaction {
+    pub transaction_hash: String,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+pub(super) enum TxFinalizedStatus {
+    Success {
+        transaction_hash: String,
+        effective_transaction_fee: Option<Nat>,
+    },
+    PendingReimbursement(EthTransaction),
+    Reimbursed {
+        transaction_hash: String,
+        reimbursed_amount: Nat,
+        reimbursed_in_block: Nat,
+    },
+}
+
+/// The id and progress of one minter withdrawal. Candid skips the other fields.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct WithdrawalProgress {
+    pub withdrawal_id: u64,
+    pub status: MinterWithdrawalStatus,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]

@@ -758,6 +758,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
         mexc_test_allocation_usd: None,
+        rift_max_order_usd: 25_000.0,
         cycles_usd_per_trillion: 1.35,
     }
 }

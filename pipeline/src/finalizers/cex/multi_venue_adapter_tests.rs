@@ -12,10 +12,14 @@ use liquidium_pipeline_core::{
 use num_traits::ToPrimitive;
 
 use super::*;
+use crate::finalizers::multi_venue::VenueRoutePreview;
 use crate::{
     finalizers::{
         cex::{finalizer::tests::support::free_withdrawals, state::CexRouteLeg},
-        multi_venue::{MEXC_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
+        multi_venue::{
+            MEXC_VENUE_ID, MultiVenueAdapter, UNREACHABLE_WAIT_SECS, VenueGate, VenueLegCheckpoint, VenueLegProgress,
+            VenuePlanningContext,
+        },
     },
     persistance::{VenueExecutionState, VenueLegFailure, VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
@@ -425,10 +429,12 @@ fn persisted_adapter_state_defaults_a_missing_persistence_gate_to_closed() {
                 None,
             )
             .expect("state"),
-        ready_to_advance: true,
-        intent_id: None,
-        operator_required: false,
-        unreachable_since_ts: None,
+        gate: VenueGate {
+            ready_to_advance: true,
+            intent_id: None,
+            operator_required: false,
+            unreachable_since_ts: None,
+        },
     };
     let mut encoded = serde_json::to_value(state).expect("encode state");
     encoded
@@ -437,7 +443,7 @@ fn persisted_adapter_state_defaults_a_missing_persistence_gate_to_closed() {
         .remove("ready_to_advance");
 
     let decoded: CexVenueExecutionState = serde_json::from_value(encoded).expect("decode legacy state");
-    assert!(!decoded.ready_to_advance);
+    assert!(!decoded.gate.ready_to_advance);
 }
 
 #[tokio::test]
@@ -459,7 +465,7 @@ async fn first_advance_only_opens_the_parent_persistence_gate() {
         .expect("state should decode")
         .expect("state should be MEXC");
 
-    assert!(execution.ready_to_advance);
+    assert!(execution.gate.ready_to_advance);
     assert_eq!(execution.cex.step, CexStep::Deposit);
     assert_eq!(progress.status, VenueLegStatus::Running);
     assert!(progress.result.is_none());
@@ -507,9 +513,9 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
         .expect("decode re-armed state")
         .expect("MEXC state");
     assert_eq!(rearmed.status, VenueLegStatus::Running);
-    assert!(!execution.operator_required);
-    assert!(execution.ready_to_advance);
-    assert!(execution.intent_id.is_some());
+    assert!(!execution.gate.operator_required);
+    assert!(execution.gate.ready_to_advance);
+    assert!(execution.gate.intent_id.is_some());
 }
 
 #[tokio::test]
@@ -538,8 +544,8 @@ async fn restart_polls_a_direct_deposit_then_gates_the_trade_separately() {
                 assert_eq!(asset, "PAY");
                 Ok(balance)
             });
-        execution.ready_to_advance = true;
-        execution.intent_id = Some("lost-process-local-gate".into());
+        execution.gate.ready_to_advance = true;
+        execution.gate.intent_id = Some("lost-process-local-gate".into());
         let restored = serde_json::from_str(&serde_json::to_string(&execution).unwrap()).unwrap();
         let progress = restarted.advance_decoded_leg(restored, &NoopCheckpoint).await.unwrap();
         assert_eq!(progress.status, VenueLegStatus::Running);
@@ -547,9 +553,9 @@ async fn restart_polls_a_direct_deposit_then_gates_the_trade_separately() {
         execution = progress.execution.decode(VENUE_ID).unwrap().unwrap();
         assert_eq!(execution.cex.step, expected_step);
         assert_eq!(execution.cex.deposit.deposit_txid.as_deref(), Some("persisted-transfer"));
-        assert!(!execution.operator_required);
-        assert!(!execution.ready_to_advance);
-        assert!(execution.intent_id.is_none());
+        assert!(!execution.gate.operator_required);
+        assert!(!execution.gate.ready_to_advance);
+        assert!(execution.gate.intent_id.is_none());
     }
 
     // Confirmation must not submit an order; the trade needs a new durable gate.
@@ -560,8 +566,8 @@ async fn restart_polls_a_direct_deposit_then_gates_the_trade_separately() {
         .unwrap()
         .unwrap();
     assert_eq!(execution.cex.step, CexStep::Trade);
-    assert!(execution.ready_to_advance);
-    assert!(execution.intent_id.is_some());
+    assert!(execution.gate.ready_to_advance);
+    assert!(execution.gate.intent_id.is_some());
 }
 
 /// A leg as the orchestrator hands it back after a process restart: armed in a
@@ -569,10 +575,12 @@ async fn restart_polls_a_direct_deposit_then_gates_the_trade_separately() {
 fn after_restart(cex: CexState) -> CexVenueExecutionState {
     CexVenueExecutionState {
         cex,
-        ready_to_advance: true,
-        intent_id: Some("lost-process-local-gate".into()),
-        operator_required: false,
-        unreachable_since_ts: None,
+        gate: VenueGate {
+            ready_to_advance: true,
+            intent_id: Some("lost-process-local-gate".into()),
+            operator_required: false,
+            unreachable_since_ts: None,
+        },
     }
 }
 
@@ -811,7 +819,7 @@ async fn restart_resumes_a_bridged_deposit_once_its_funding_transfer_is_durable(
             .unwrap()
             .unwrap();
         assert!(execution.cex.deposit.bridge.deposit_bridge_required);
-        assert_eq!(execution.operator_required, !has_transfer);
+        assert_eq!(execution.gate.operator_required, !has_transfer);
         assert_eq!(
             execution.cex.step,
             if can_poll && bridge_completed { CexStep::Trade } else { CexStep::DepositPending }
@@ -864,7 +872,7 @@ async fn restart_surfaces_a_failed_deposit_bridge_without_resubmitting() {
         .unwrap();
     assert_eq!(execution.cex.step, CexStep::DepositPending);
     assert_eq!(execution.cex.deposit.bridge.deposit_bridge_id.as_deref(), Some("persisted-deposit-bridge"));
-    assert!(!execution.operator_required);
+    assert!(!execution.gate.operator_required);
 }
 
 #[tokio::test]
@@ -901,7 +909,7 @@ async fn restart_direct_deposit_without_baseline_records_one_and_keeps_waiting()
     assert_eq!(execution.cex.step, CexStep::DepositPending);
     assert_eq!(execution.cex.deposit.deposit_balance_before, Some(1.0));
     assert!(execution.cex.deposit.deposit_sent_at_ts.is_some());
-    assert!(!execution.ready_to_advance);
+    assert!(!execution.gate.ready_to_advance);
 }
 
 #[tokio::test]
@@ -1080,7 +1088,7 @@ async fn recover_accepts_each_durable_pending_reconciliation_phase() {
             .expect("state should decode")
             .expect("state should be MEXC");
 
-        assert!(recovered.ready_to_advance);
+        assert!(recovered.gate.ready_to_advance);
         assert_eq!(recovered.cex.step, pending_step);
         assert_eq!(progress.status, VenueLegStatus::Running);
     }
@@ -1160,9 +1168,9 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
         .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("decode retryable state")
         .expect("MEXC state");
-    assert!(!execution.operator_required);
-    assert!(!execution.ready_to_advance);
-    assert!(execution.intent_id.is_none());
+    assert!(!execution.gate.operator_required);
+    assert!(!execution.gate.ready_to_advance);
+    assert!(execution.gate.intent_id.is_none());
     assert_eq!(
         execution.cex.last_error,
         Some("deposit address request timed out".to_string())
@@ -1278,9 +1286,9 @@ async fn an_unreachable_venue_retries_without_spending_the_retry_budget() {
         .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("decode waiting state")
         .expect("MEXC state");
-    assert!(!execution.operator_required);
+    assert!(!execution.gate.operator_required);
     assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
-    assert!(execution.unreachable_since_ts.is_some(), "the outage wait starts");
+    assert!(execution.gate.unreachable_since_ts.is_some(), "the outage wait starts");
 }
 
 /// An outage that outlasts the wait spends the retry budget, so the row
@@ -1296,7 +1304,7 @@ async fn an_unreachable_venue_past_the_wait_spends_the_retry_budget() {
         .expect("decode armed state")
         .expect("MEXC state");
     let since = now_ts() - UNREACHABLE_WAIT_SECS - 1;
-    execution.unreachable_since_ts = Some(since);
+    execution.gate.unreachable_since_ts = Some(since);
     leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
 
     let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
@@ -1311,7 +1319,7 @@ async fn an_unreachable_venue_past_the_wait_spends_the_retry_budget() {
         .expect("decode state")
         .expect("MEXC state");
     assert_eq!(
-        execution.unreachable_since_ts,
+        execution.gate.unreachable_since_ts,
         Some(since),
         "the outage keeps its start"
     );
@@ -1350,7 +1358,7 @@ async fn venue_settlement_rejection_waits_instead_of_spending_the_retry_budget()
         .expect("decode waiting state")
         .expect("MEXC state");
     assert_eq!(execution.cex.step, CexStep::Trade);
-    assert!(!execution.operator_required);
+    assert!(!execution.gate.operator_required);
     assert!(execution.cex.trade.trade_settlement_waiting_since_ts.is_some());
 }
 
@@ -1372,7 +1380,7 @@ async fn prefix_shaped_other_error_does_not_enter_settlement_wait() {
         .expect("decode retryable state")
         .expect("MEXC state");
     assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
-    assert!(!execution.operator_required);
+    assert!(!execution.gate.operator_required);
 }
 
 #[tokio::test]
@@ -1403,7 +1411,7 @@ async fn venue_settlement_wait_parks_for_an_operator_once_the_deadline_passes() 
         .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("decode parked state")
         .expect("MEXC state");
-    assert!(execution.operator_required);
+    assert!(execution.gate.operator_required);
 }
 
 #[tokio::test]
@@ -1440,7 +1448,6 @@ mod bridged_deposit_restart {
     use super::*;
     use crate::bridge::call_sender::{BridgeCall, prepare_bridge_call};
     use crate::bridge::claims::{BridgeClaims, MockBridgeClaimLookup};
-    use crate::bridge::legacy::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
     use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_connectors::backend::bridge_backend::{
         BridgeFeeBudget, BridgeSubmissionCandidate, MockBridgeBackend,
@@ -1472,19 +1479,6 @@ mod bridged_deposit_restart {
     }
 
     /// An attempt that the bridge journal saved long ago, before the driver.
-    fn journal_attempt(parked: bool) -> LegacyBridgeSubmitPhase {
-        LegacyBridgeSubmitPhase::Submitting(LegacyBridgeSubmitAttempt {
-            id: "mine".into(),
-            asset: "ckETH".into(),
-            destination: DESTINATION.into(),
-            amount: 0.009,
-            cursor: Some(100),
-            started_at_ts: 1,
-            called_at_ts: None,
-            parked_for_operator: parked,
-        })
-    }
-
     fn saved_call(phase: OutboundPhase) -> OutboundRecord {
         let call = BridgeCall {
             asset: "ckETH".into(),
@@ -1531,42 +1525,9 @@ mod bridged_deposit_restart {
     }
 
     #[tokio::test]
-    async fn a_journal_funding_wait_resumes_without_the_gate_and_without_a_call() {
-        let mut bridge = MockBridgeBackend::new();
-        zero_fee(&mut bridge);
-        bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(0.0));
-        bridge.expect_prepare_submission().times(0);
-        bridge.expect_submit_bridge().times(0);
-        let mut restarted = deposit_poll_finalizer(bridge);
-        Arc::get_mut(&mut restarted.backend)
-            .unwrap()
-            .expect_get_deposit_address()
-            .times(1)
-            .returning(|asset, network| {
-                Ok(liquidium_pipeline_connectors::backend::cex_backend::DepositAddress {
-                    asset: asset.into(),
-                    network: network.into(),
-                    address: DESTINATION.into(),
-                    tag: None,
-                })
-            });
-        let mut cex = cketh_state(&restarted);
-        cex.deposit.bridge.legacy_bridge_submit_phase = Some(LegacyBridgeSubmitPhase::WaitingFunds);
-
-        let progress = restarted.advance_decoded_leg(after_restart(cex), &NoopCheckpoint).await.unwrap();
-
-        assert_eq!(progress.status, VenueLegStatus::Running);
-        let execution = decode(&progress);
-        assert!(!execution.operator_required);
-        assert!(execution.cex.deposit.bridge.deposit_bridge_call.is_none());
-        assert!(execution.cex.deposit.bridge.legacy_bridge_submit_phase.is_none());
-        assert!(execution.cex.deposit.bridge.deposit_bridge_id.is_none());
-    }
-
-    #[tokio::test]
     async fn a_call_that_may_have_run_is_looked_up_and_attached_before_any_call() {
-        // A journal attempt, and a saved call that a restart interrupted.
-        for restored in ["journal", "saved"] {
+        // A saved call that a restart interrupted.
+        for restored in ["saved"] {
             let mut bridge = MockBridgeBackend::new();
             zero_fee(&mut bridge);
             bridge.expect_submit_bridge().times(0);
@@ -1580,10 +1541,7 @@ mod bridged_deposit_restart {
             });
             let restarted = lookup_finalizer(bridge);
             let mut cex = cketh_state(&restarted);
-            match restored {
-                "journal" => cex.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(false)),
-                _ => cex.deposit.bridge.deposit_bridge_call = Some(saved_call(OutboundPhase::Prepared)),
-            }
+            cex.deposit.bridge.deposit_bridge_call = Some(saved_call(OutboundPhase::Prepared));
 
             let progress = restarted.advance_decoded_leg(after_restart(cex), &NoopCheckpoint).await.unwrap();
 
@@ -1613,7 +1571,10 @@ mod bridged_deposit_restart {
         });
         let restarted = lookup_finalizer(bridge);
         let mut cex = cketh_state(&restarted);
-        cex.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(false));
+        // Sent before the grace period; the lookup is the last word.
+        cex.deposit.bridge.deposit_bridge_call = Some(saved_call(OutboundPhase::Submitted {
+            at: crate::utils::now_ts() - 11 * 60,
+        }));
 
         let progress = restarted.advance_decoded_leg(after_restart(cex), &NoopCheckpoint).await.unwrap();
 
@@ -1622,7 +1583,7 @@ mod bridged_deposit_restart {
         let error = progress.last_error.clone().expect("reason for the operator");
         assert!(error.contains("2 unclaimed provider records match"), "{error}");
         let execution = decode(&progress);
-        assert!(execution.operator_required);
+        assert!(execution.gate.operator_required);
         assert!(matches!(
             execution.cex.deposit.bridge.deposit_bridge_call.unwrap().phase,
             OutboundPhase::Parked { .. }
@@ -1646,15 +1607,17 @@ mod bridged_deposit_restart {
         cex.deposit.bridge.deposit_bridge_call = Some(parked);
         let cleared = CexVenueExecutionState {
             cex,
-            ready_to_advance: false,
-            intent_id: None,
-            operator_required: false,
-            unreachable_since_ts: None,
+            gate: VenueGate {
+                ready_to_advance: false,
+                intent_id: None,
+                operator_required: false,
+                unreachable_since_ts: None,
+            },
         };
 
         // The first cycle arms a fresh intent; the second runs the lookup.
         let armed = decode(&released.advance_decoded_leg(cleared, &NoopCheckpoint).await.unwrap());
-        assert!(armed.ready_to_advance);
+        assert!(armed.gate.ready_to_advance);
         let progress = released.advance_decoded_leg(armed, &NoopCheckpoint).await.unwrap();
 
         assert_eq!(progress.status, VenueLegStatus::Running);
@@ -1777,10 +1740,12 @@ async fn a_saved_withdrawal_is_written_then_sent_in_one_cycle_and_a_crash_settle
     cex.withdraw.size_out = Some(ChainTokenAmount::from_formatted(receive_token(), 10.0));
     let fresh = CexVenueExecutionState {
         cex,
-        ready_to_advance: false,
-        intent_id: None,
-        operator_required: false,
-        unreachable_since_ts: None,
+        gate: VenueGate {
+            ready_to_advance: false,
+            intent_id: None,
+            operator_required: false,
+            unreachable_since_ts: None,
+        },
     };
     let armed = decode(&live.advance_decoded_leg(fresh, &NoopCheckpoint).await.unwrap());
 
@@ -1789,11 +1754,11 @@ async fn a_saved_withdrawal_is_written_then_sent_in_one_cycle_and_a_crash_settle
 
     let sent = decode(&progress);
     assert_eq!(sent.cex.withdraw.withdraw_id.as_deref(), Some("mexc-1"), "sent in the same cycle");
-    assert!(!sent.ready_to_advance);
+    assert!(!sent.gate.ready_to_advance);
     let durable = checkpoints.0.lock().unwrap().iter().map(decode).collect::<Vec<_>>();
     assert_eq!(durable.len(), 1, "one write before the call");
     let durable = durable.into_iter().next().unwrap();
-    assert!(durable.ready_to_advance && durable.intent_id.is_some(), "the gate mark stays");
+    assert!(durable.gate.ready_to_advance && durable.gate.intent_id.is_some(), "the gate mark stays");
     let request = durable.cex.withdraw.withdraw_send.as_ref().expect("the request is durable before the call");
     assert_eq!(request.phase, OutboundPhase::Prepared);
 
@@ -1859,45 +1824,31 @@ mod transport_fallback {
         }
     }
 
+    /// A bid side of `(price, quantity)` levels, best first, with no asks.
+    fn bids(levels: &[(f64, f64)]) -> OrderBook {
+        OrderBook {
+            bids: levels
+                .iter()
+                .map(|&(price, quantity)| OrderBookLevel { price, quantity })
+                .collect(),
+            asks: vec![],
+            taker_fee_bps: 10.0,
+        }
+    }
+
+    /// Deep at the top price.
     fn deep_bids(price: f64) -> OrderBook {
-        OrderBook {
-            bids: vec![OrderBookLevel {
-                price,
-                quantity: 1_000_000.0,
-            }],
-            asks: vec![],
-            taker_fee_bps: 10.0,
-        }
+        bids(&[(price, 1_000_000.0)])
     }
 
-    /// A book that takes two ICP only at half the top price.
+    /// Takes two ICP only at half the top price.
     fn thin_bids(price: f64) -> OrderBook {
-        OrderBook {
-            bids: vec![
-                OrderBookLevel { price, quantity: 0.01 },
-                OrderBookLevel {
-                    price: price / 2.0,
-                    quantity: 1_000_000.0,
-                },
-            ],
-            asks: vec![],
-            taker_fee_bps: 10.0,
-        }
+        bids(&[(price, 0.01), (price / 2.0, 1_000_000.0)])
     }
 
-    /// A book that takes two ICP at a quarter below the top price: thin, but less so than `thin_bids`.
+    /// Takes two ICP at a quarter below the top price: thin, but less so than `thin_bids`.
     fn less_thin_bids(price: f64) -> OrderBook {
-        OrderBook {
-            bids: vec![
-                OrderBookLevel { price, quantity: 0.01 },
-                OrderBookLevel {
-                    price: price * 0.75,
-                    quantity: 1_000_000.0,
-                },
-            ],
-            asks: vec![],
-            taker_fee_bps: 10.0,
-        }
+        bids(&[(price, 0.01), (price * 0.75, 1_000_000.0)])
     }
 
     /// MEXC with the bridge, the test cap as the sound-book limit, and `books` as its markets.

@@ -92,13 +92,9 @@ async fn mexc_trade_executes_swap_and_sets_size_out_and_step_withdraw() {
         }],
         taker_fee_bps: 10.0,
     };
-    backend.expect_get_orderbook().returning(move |market, _limit| {
-        if is_direct_ck_market(market) {
-            Err(format!("no market {market}"))
-        } else {
-            Ok(orderbook.clone())
-        }
-    });
+    backend
+        .expect_get_orderbook()
+        .returning(books_except_direct_ck(orderbook));
 
     let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
     let calls_handle = calls.clone();
@@ -199,13 +195,9 @@ async fn mexc_trade_propagates_backend_errors() {
         }],
         taker_fee_bps: 10.0,
     };
-    backend.expect_get_orderbook().returning(move |market, _limit| {
-        if is_direct_ck_market(market) {
-            Err(format!("no market {market}"))
-        } else {
-            Ok(orderbook.clone())
-        }
-    });
+    backend
+        .expect_get_orderbook()
+        .returning(books_except_direct_ck(orderbook));
 
     backend
         .expect_execute_swap_detailed_with_options()
@@ -1448,7 +1440,9 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         .returning(move |_market, _limit| Ok(empty_book.clone()));
     backend.expect_execute_swap_detailed_with_options().times(0);
 
-    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
+    // Both direct markets are listed, so both are probed; their books are empty.
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
+        .with_route_config(vec!["BTC_ETH".to_string(), "ETH_BTC".to_string()], 3);
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -1528,13 +1522,7 @@ async fn mexc_preview_trade_slice_buy_binary_search_finds_largest_chunk_under_ta
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |market, _limit| {
-            if is_direct_ck_market(market) {
-                Err(format!("no market {market}"))
-            } else {
-                Ok(orderbook.clone())
-            }
-        });
+        .returning(books_except_direct_ck(orderbook));
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1585,13 +1573,7 @@ async fn mexc_preview_trade_slice_sell_fallback_uses_full_remaining_when_hard_ca
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |market, _limit| {
-            if is_direct_ck_market(market) {
-                Err(format!("no market {market}"))
-            } else {
-                Ok(orderbook.clone())
-            }
-        });
+        .returning(books_except_direct_ck(orderbook));
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1641,13 +1623,7 @@ async fn mexc_preview_trade_slice_sell_fallback_errors_when_hard_cap_rejects() {
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |market, _limit| {
-            if is_direct_ck_market(market) {
-                Err(format!("no market {market}"))
-            } else {
-                Ok(orderbook.clone())
-            }
-        });
+        .returning(books_except_direct_ck(orderbook));
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1696,13 +1672,7 @@ async fn mexc_preview_trade_slice_buy_fallback_uses_full_remaining_when_hard_cap
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |market, _limit| {
-            if is_direct_ck_market(market) {
-                Err(format!("no market {market}"))
-            } else {
-                Ok(orderbook.clone())
-            }
-        });
+        .returning(books_except_direct_ck(orderbook));
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1750,13 +1720,7 @@ async fn mexc_preview_trade_slice_buy_fallback_errors_when_hard_cap_rejects() {
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |market, _limit| {
-            if is_direct_ck_market(market) {
-                Err(format!("no market {market}"))
-            } else {
-                Ok(orderbook.clone())
-            }
-        });
+        .returning(books_except_direct_ck(orderbook));
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),

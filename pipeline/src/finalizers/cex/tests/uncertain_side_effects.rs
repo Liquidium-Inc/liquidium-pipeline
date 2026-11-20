@@ -37,6 +37,7 @@ async fn withdraw_state(finalizer: &CexVenueFinalizer<MockCexBackend>) -> CexSta
 
 fn deposit_address(address: &'static str) -> MockCexBackend {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     // Measured once per prepared transfer, never on a resend.
     cex.expect_get_balance().times(1).returning(|_| Ok(10.0));
     cex.expect_get_deposit_address().times(1).returning(move |asset, network| {
@@ -145,6 +146,7 @@ async fn a_parked_funding_send_moves_only_on_an_operator_decision() {
 #[tokio::test]
 async fn a_send_that_never_landed_is_measured_and_prepared_again() {
     let mut cex = MockCexBackend::new();
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     cex.expect_get_balance().times(2).returning(|_| Ok(10.0));
     cex.expect_get_deposit_address().times(2).returning(|asset, network| {
         Ok(DepositAddress {
@@ -393,4 +395,38 @@ async fn a_refused_withdraw_retries_under_a_new_order_id() {
     let order_ids = order_ids.lock().unwrap();
     assert!(order_ids[0].ends_with("w0") && order_ids[1].ends_with("w1"), "{order_ids:?}");
     assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("mexc-internal"));
+}
+
+/// A direct deposit asks the exchange again at its fresh size before the
+/// transfer is saved. One under the minimum is never credited, so none is sent.
+#[tokio::test]
+async fn a_direct_deposit_under_the_exchange_minimum_is_never_saved() {
+    use liquidium_pipeline_connectors::backend::cex_backend::FundingRouteError;
+    let mut cex = MockCexBackend::new();
+    cex.expect_get_balance().returning(|_| Ok(10.0));
+    cex.expect_get_deposit_address().returning(|asset, network| {
+        Ok(DepositAddress {
+            asset: asset.into(),
+            network: network.into(),
+            address: "aaaaa-aa".into(),
+            tag: None,
+        })
+    });
+    cex.expect_check_funding_route()
+        .times(1)
+        .returning(|_| Err(FundingRouteError::BelowMinimum("below the deposit minimum".into())));
+    let mut sender = MockOutboundSender::new();
+    sender.expect_prepare().times(0);
+    sender.expect_submit().times(0);
+    let finalizer = funding_finalizer(cex, sender);
+    let mut state = finalizer
+        .prepare("funding", &make_execution_receipt(151))
+        .await
+        .unwrap();
+
+    let error = finalizer.deposit(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, CexBackendError::BelowMinimum(_)), "{error}");
+    assert!(state.deposit.deposit_funding.is_none(), "no transfer is saved");
+    assert!(state.deposit.deposit_txid.is_none());
 }

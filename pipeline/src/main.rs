@@ -199,6 +199,34 @@ enum Commands {
         confirm: bool,
     },
 
+    // Reads the Kraken account: balances, markets, deposit addresses and
+    // verified withdrawal addresses for each route. It moves nothing.
+    KrakenCheck,
+
+    // Runs one Rift leg from the trader account without a liquidation: the
+    // preview, then every step until it completes or parks. Without --confirm
+    // it only prints the preview. The leg is saved to a file for --resume.
+    RiftSwapCheck {
+        /// The ICP asset to pay, as the registry names it (e.g. "ckBTC")
+        #[arg(long, required_unless_present = "resume")]
+        pay: Option<String>,
+        /// The ICP asset to receive (e.g. "ckUSDT")
+        #[arg(long, required_unless_present = "resume")]
+        receive: Option<String>,
+        /// Amount of the pay asset, in its units
+        #[arg(long, default_value_t = 0.0)]
+        amount: f64,
+        /// Run the leg. Without it the command only previews.
+        #[arg(long)]
+        confirm: bool,
+        /// A saved leg file from an earlier run; continues it instead of starting one.
+        #[arg(long)]
+        resume: Option<std::path::PathBuf>,
+        /// The answer to a parked leg's open question: `absent` or `landed:<receipt>`.
+        #[arg(long)]
+        answer: Option<String>,
+    },
+
     // Shows a parked liquidation row, or answers its open question and
     // releases the parked leg. It talks to the running daemon.
     Reconcile {
@@ -461,6 +489,27 @@ async fn main() -> ExitCode {
         } => {
             if let Err(e) = commands::mexc_withdraw_check::check(&asset, &network, &address, amount, confirm).await {
                 eprintln!("MEXC withdraw check failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::KrakenCheck => {
+            if let Err(e) = commands::kraken_check::check().await {
+                eprintln!("Kraken check failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::RiftSwapCheck {
+            pay,
+            receive,
+            amount,
+            confirm,
+            resume,
+            answer,
+        } => {
+            if let Err(e) = commands::rift_swap_check::check(pay, receive, amount, confirm, resume, answer).await {
+                eprintln!("Rift swap check failed: {}", e);
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS

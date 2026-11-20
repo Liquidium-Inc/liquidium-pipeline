@@ -7,7 +7,7 @@ async fn mexc_cksol_repayment_preview_uses_icp_usdt_sol_route() {
     free_withdrawals(&mut cex);
     cex.expect_get_orderbook().returning(|market, _| {
         assert!(!market.contains("CKSOL"), "ckSOL must translate to native SOL");
-        assert!(!market.contains("SOL_USDC"), "SOL must trade through USDT");
+        assert!(!market.contains("SOL_USDC"), "only configured markets are probed");
         let price = match market {
             "ICP_USDT" => 5.0,
             "SOL_USDT" => 100.0,
@@ -554,7 +554,7 @@ async fn mexc_cksol_repayment_rejects_underfunded_bridge_before_submission() {
     for gross in [0.001, 0.021, f64::NAN, f64::INFINITY] {
         let amount = ChainTokenAmount::from_formatted(cksol_token(), gross);
         assert!(
-            CexVenueFinalizer::<MockCexBackend>::solana_repayment_bridge_amount(&deps, route, &amount, 0.002)
+            crate::finalizers::bridge_legs::solana_repayment_bridge_amount(&deps, route, &amount, 0.002)
                 .await
                 .is_err()
         );
@@ -595,24 +595,20 @@ async fn mexc_cksol_repayment_rejects_mint_receipt_for_wrong_account_or_token() 
     }
 }
 
+/// SOL trades on whatever SOL market the pair list holds; a direct market comes first.
 #[tokio::test]
-async fn mexc_sol_routes_always_use_usdt_even_with_a_direct_usdc_book() {
+async fn mexc_sol_routes_use_any_configured_market() {
     let mut cex = MockCexBackend::new();
     free_withdrawals(&mut cex);
-    cex.expect_get_orderbook().returning(|market, _| {
-        assert_ne!(market, "SOL_USDC");
-        assert_ne!(market, "USDC_SOL");
-        match market {
-            "USDC_USDT" => Ok(liquid_orderbook()),
-            "USDT_USDC" => Err("unlisted inverse market".into()),
-            _ => panic!("unexpected market {market}"),
-        }
+    cex.expect_get_orderbook().returning(|market, _| match market {
+        "SOL_USDC" | "SOL_USDT" | "USDC_USDT" => Ok(liquid_orderbook()),
+        _ => Err("unlisted market".into()),
     });
     let finalizer = cksol_finalizer(cex, MockBridgeBackend::new())
         .with_route_config(vec!["SOL_USDC".into(), "SOL_USDT".into(), "USDC_USDT".into()], 2);
     for (pay, receive, expected) in [
-        ("USDC", "SOL", vec![("USDC_USDT", "sell"), ("SOL_USDT", "buy")]),
-        ("SOL", "USDC", vec![("SOL_USDT", "sell"), ("USDC_USDT", "buy")]),
+        ("USDC", "SOL", vec![("SOL_USDC", "buy")]),
+        ("SOL", "USDC", vec![("SOL_USDC", "sell")]),
         ("USDT", "SOL", vec![("SOL_USDT", "buy")]),
         ("SOL", "USDT", vec![("SOL_USDT", "sell")]),
         ("SOL", "SOL", vec![]),
@@ -622,12 +618,12 @@ async fn mexc_sol_routes_always_use_usdt_even_with_a_direct_usdc_book() {
             .iter()
             .map(|leg| (leg.market.as_str(), leg.side.as_str()))
             .collect();
-        assert_eq!(route, expected);
+        assert_eq!(route, expected, "{pay} -> {receive}");
     }
 }
 
-/// Review finding 25: the MEXC rule sent every SOL route through `SOL_USDT`,
-/// so Kraken could not quote SOL with its USD allowlist.
+/// Review finding 25: a SOL-only market rule once sent every SOL route through
+/// `SOL_USDT`, so Kraken could not quote SOL with its USD allowlist. The rule is gone.
 #[tokio::test]
 async fn kraken_routes_sol_through_its_own_allowlist() {
     let mut cex = MockCexBackend::new();
@@ -649,15 +645,21 @@ async fn kraken_routes_sol_through_its_own_allowlist() {
     assert_eq!(route, vec![("SOL_USD", "sell"), ("ICP_USD", "buy")]);
 }
 
+/// A configured SOL/USDC market is an ordinary hop.
 #[tokio::test]
-async fn mexc_sol_usdc_is_not_used_as_an_intermediate_hop() {
+async fn mexc_sol_usdc_is_a_hop_when_configured() {
     let mut cex = MockCexBackend::new();
     free_withdrawals(&mut cex);
-    cex.expect_get_orderbook().returning(|market, _| {
-        assert!(matches!(market, "ICP_USDC" | "USDC_ICP"));
-        Err("unlisted market".into())
+    cex.expect_get_orderbook().returning(|market, _| match market {
+        "ICP_SOL" | "SOL_USDC" => Ok(liquid_orderbook()),
+        _ => Err("unlisted market".into()),
     });
     let finalizer = cksol_finalizer(cex, MockBridgeBackend::new())
         .with_route_config(vec!["ICP_SOL".into(), "SOL_USDC".into(), "SOL_USDT".into()], 2);
-    assert!(finalizer.resolve_trade_legs_for_symbols("ICP", "USDC").await.is_err());
+    let legs = finalizer.resolve_trade_legs_for_symbols("ICP", "USDC").await.unwrap();
+    let route: Vec<_> = legs
+        .iter()
+        .map(|leg| (leg.market.as_str(), leg.side.as_str()))
+        .collect();
+    assert_eq!(route, vec![("ICP_SOL", "sell"), ("SOL_USDC", "sell")]);
 }

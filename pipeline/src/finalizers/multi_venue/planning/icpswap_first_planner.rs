@@ -37,6 +37,7 @@ pub const ICPSWAP_FIRST_STRATEGY_ID: &str = "icpswap_first";
 pub const ICPSWAP_VENUE_ID: &str = "icpswap";
 pub const MEXC_VENUE_ID: &str = "mexc";
 pub const KRAKEN_VENUE_ID: &str = "kraken";
+pub const RIFT_VENUE_ID: &str = "rift";
 
 pub(super) const BPS_DENOMINATOR: u32 = 10_000;
 const RAY_PRICE_SCALE: f64 = 1e27;
@@ -72,6 +73,10 @@ pub struct IcpswapFirstPlannerConfig {
     /// Test-only fixed USD allocation for MEXC. Kraken takes the rest of the
     /// CEX side, or ICPSwap takes the rest when Kraken is not enabled.
     pub mexc_test_allocation_usd: Option<f64>,
+    /// The most one Rift order may carry, in USD at the oracle price. A
+    /// larger overflow takes this much on Rift and the rest goes on down the
+    /// waterfall.
+    pub rift_max_order_usd: f64,
     /// USD per trillion cycles, for side costs paid in cycles.
     pub cycles_usd_per_trillion: f64,
 }
@@ -1241,7 +1246,13 @@ impl IcpswapFirstPlanner {
         validate_preview(venue_id, request, preview)?;
 
         // With no usable oracle prices there is nothing to compare against.
+        // A Rift quote reports no impact, so the oracle is its only price check.
         let Some(oracle_output) = oracle_expected_output(input, request, preview)? else {
+            if venue_id == RIFT_VENUE_ID {
+                return Err(IcpswapFirstPlannerError::NoViableRoute(
+                    "rift quote has no price check without oracle prices".to_string(),
+                ));
+            }
             return Ok(());
         };
         // A zero baseline cannot express a meaningful minimum output.

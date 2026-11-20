@@ -39,40 +39,26 @@ where
         let buy_market = format!("{}_{}", withdraw, deposit);
         let mut errors: Vec<String> = Vec::new();
 
-        // Preferred direct path: sell deposit asset into withdraw asset.
-        match self
-            .backend
-            .get_orderbook(&sell_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
-            Ok(orderbook) => {
-                if !orderbook.bids.is_empty() {
-                    return Ok(TradeLeg {
-                        market: sell_market,
-                        side: "sell".to_string(),
-                    });
-                }
-                errors.push(format!("{} has no bids", sell_market));
+        // Sell the deposit asset first; then buy the withdraw asset on the inverse market.
+        for (market, side, book_side) in [(sell_market, "sell", "bids"), (buy_market, "buy", "asks")] {
+            // The pair list is the gate: a market left out of it may not be tradable by API.
+            if !self.is_configured_market(&market) {
+                errors.push(format!("{market} is not a configured pair"));
+                continue;
             }
-            Err(err) => errors.push(format!("{}: {}", sell_market, err)),
-        }
-
-        // Fallback direct path: buy withdraw asset with deposit asset on the inverse market.
-        match self
-            .backend
-            .get_orderbook(&buy_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
-            Ok(orderbook) => {
-                if !orderbook.asks.is_empty() {
-                    return Ok(TradeLeg {
-                        market: buy_market,
-                        side: "buy".to_string(),
-                    });
+            match self.backend.get_orderbook(&market, Some(DEFAULT_ORDERBOOK_LIMIT)).await {
+                Ok(orderbook) => {
+                    let levels = if side == "sell" { &orderbook.bids } else { &orderbook.asks };
+                    if !levels.is_empty() {
+                        return Ok(TradeLeg {
+                            market,
+                            side: side.to_string(),
+                        });
+                    }
+                    errors.push(format!("{market} has no {book_side}"));
                 }
-                errors.push(format!("{} has no asks", buy_market));
+                Err(err) => errors.push(format!("{market}: {err}")),
             }
-            Err(err) => errors.push(format!("{}: {}", buy_market, err)),
         }
 
         Err(format!(
@@ -81,6 +67,20 @@ where
             withdraw,
             errors.join(" | ")
         ))
+    }
+
+    /// Whether the pair list carries `market`. An empty list sets no limit.
+    fn is_configured_market(&self, market: &str) -> bool {
+        self.available_pairs.is_empty() || self.available_pairs.iter().any(|pair| pair == market)
+    }
+
+    /// Shortest route first, then by signature. The fixed order stops the route from churning.
+    fn sort_routes(routes: &mut [Vec<TradeLeg>]) {
+        routes.sort_by(|left, right| {
+            left.len()
+                .cmp(&right.len())
+                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
+        });
     }
 
     fn route_signature(legs: &[TradeLeg]) -> String {
@@ -151,15 +151,6 @@ where
             let Some((base, quote)) = parse_market_symbols(market) else {
                 continue;
             };
-
-            if (base == "SOL" || quote == "SOL")
-                && self
-                    .profile
-                    .sol_market()
-                    .is_some_and(|sol_market| *market != sol_market)
-            {
-                continue;
-            }
 
             if base == from_symbol {
                 out.push((
@@ -336,11 +327,7 @@ where
             ));
         }
 
-        candidates.sort_by(|left, right| {
-            left.len()
-                .cmp(&right.len())
-                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
-        });
+        Self::sort_routes(&mut candidates);
 
         let mut errors = Vec::new();
         for candidate in candidates {
@@ -372,108 +359,65 @@ where
             return Ok(vec![]);
         }
 
-        // An exchange that trades SOL on one market only routes SOL through it.
-        if let Some((sol_market, sol_quote)) = self
-            .profile
-            .sol_market()
-            .and_then(|market| Some((market, parse_market_symbols(market)?.1)))
-        {
-            if deposit == "SOL" {
-                let mut legs = vec![TradeLeg {
-                    market: sol_market.into(),
-                    side: "sell".into(),
-                }];
-                legs.extend(self.resolve_standard_trade_legs(&sol_quote, &withdraw).await?);
-                return Ok(legs);
-            }
-            if withdraw == "SOL" {
-                let mut legs = self.resolve_standard_trade_legs(&deposit, &sol_quote).await?;
-                legs.push(TradeLeg {
-                    market: sol_market.into(),
-                    side: "buy".into(),
-                });
-                return Ok(legs);
-            }
-        }
-        self.resolve_standard_trade_legs(&deposit, &withdraw).await
-    }
-
-    async fn resolve_standard_trade_legs(&self, deposit: &str, withdraw: &str) -> Result<Vec<TradeLeg>, String> {
-        if deposit == withdraw {
-            return Ok(vec![]);
-        }
-
-        // 1) High-priority compatibility override for legacy ck routes.
-        if let Some(legs) = self.profile.special_trade_legs(deposit, withdraw) {
-            return Ok(legs);
-        }
-
-        // 2) Probe direct tradable market first.
-        let direct_err = match self.resolve_direct_leg(deposit, withdraw).await {
+        // The direct market first, then the configured graph hops. No fixed routes:
+        // the pair list is the only gate on markets, and the book decides the rest.
+        let direct_err = match self.resolve_direct_leg(&deposit, &withdraw).await {
             Ok(direct_leg) => return Ok(vec![direct_leg]),
             Err(err) => err,
         };
-
-        // 3) Fallback to configured graph hops.
-        self.resolve_hop_route(deposit, withdraw)
+        self.resolve_hop_route(&deposit, &withdraw)
             .await
             .map_err(|hop_err| format!("{}; {}", direct_err, hop_err))
     }
 
-    /// The route for `amount`: the largest net output with best-output routing,
-    /// the first executable route otherwise.
+    /// The route for `amount`: of the configured simple routes and the first
+    /// executable route, the one with the largest net output, by the same preview
+    /// that prices the trade. A thin direct market loses to a hop route by itself.
     pub(crate) async fn resolve_trade_legs_for_amount(
         &self,
         deposit_symbol: &str,
         withdraw_symbol: &str,
         amount: f64,
     ) -> Result<Vec<TradeLeg>, String> {
-        if self.best_output_routing {
-            self.best_trade_legs_for_amount(deposit_symbol, withdraw_symbol, amount)
-                .await
-        } else {
-            self.resolve_trade_legs_for_symbols(deposit_symbol, withdraw_symbol)
-                .await
+        // The first executable route is the baseline. Without one, its reason is the answer.
+        let baseline = self
+            .resolve_trade_legs_for_symbols(deposit_symbol, withdraw_symbol)
+            .await?;
+        // Nothing to trade or nothing to size: no preview can rank the routes, so the baseline stands.
+        if baseline.is_empty() || !amount.is_finite() || amount <= LIQUIDITY_EPS {
+            return Ok(baseline);
         }
-    }
-
-    /// Of the configured simple routes and the first executable route, the one with the
-    /// largest net output for `amount`, by the same preview that prices the trade.
-    async fn best_trade_legs_for_amount(
-        &self,
-        deposit_symbol: &str,
-        withdraw_symbol: &str,
-        amount: f64,
-    ) -> Result<Vec<TradeLeg>, String> {
         let deposit = Self::normalize_symbol(deposit_symbol);
         let withdraw = Self::normalize_symbol(withdraw_symbol);
-        if deposit == withdraw {
-            return Ok(vec![]);
-        }
-        // Both sources keep an exchange's one SOL market: the hop graph skips the others.
+        let baseline_signature = Self::route_signature(&baseline);
         let mut candidates = self.discover_hop_candidates(&deposit, &withdraw, self.max_hops);
-        if let Ok(first_executable) = self.resolve_trade_legs_for_symbols(&deposit, &withdraw).await {
-            candidates.push(first_executable);
-        }
+        candidates.push(baseline);
         // A stable order breaks ties the same way each time, so the route does not churn.
-        candidates.sort_by(|left, right| {
-            left.len()
-                .cmp(&right.len())
-                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
-        });
+        Self::sort_routes(&mut candidates);
         candidates.dedup_by(|left, right| Self::route_signature(left) == Self::route_signature(right));
         let mut best: Option<(f64, Vec<TradeLeg>)> = None;
+        let mut baseline_failure = None;
         for candidate in candidates {
-            let Ok(preview) = self.preview_resolved_trade_route(&candidate, amount).await else {
-                continue;
+            let preview = match self.preview_resolved_trade_route(&candidate, amount).await {
+                Ok(preview) => preview,
+                Err(error) => {
+                    if Self::route_signature(&candidate) == baseline_signature {
+                        baseline_failure = Some(error);
+                    }
+                    continue;
+                }
             };
             let output = preview.receive_amount;
             if output.is_finite() && best.as_ref().is_none_or(|(best_output, _)| output > *best_output) {
                 best = Some((output, candidate));
             }
         }
-        best.map(|(_, legs)| legs)
-            .ok_or_else(|| format!("no fully executable route for {amount} {deposit} -> {withdraw}"))
+        best.map(|(_, legs)| legs).ok_or_else(|| {
+            format!(
+                "no fully executable route for {amount} {deposit} -> {withdraw}: {}",
+                baseline_failure.unwrap_or_else(|| "every candidate failed its preview".to_string())
+            )
+        })
     }
 
     /// Resolve route legs once, then always reuse persisted legs on subsequent calls.
@@ -559,11 +503,7 @@ where
             ));
         }
 
-        candidates.sort_by(|left, right| {
-            left.len()
-                .cmp(&right.len())
-                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
-        });
+        Self::sort_routes(&mut candidates);
 
         let mut errors = Vec::new();
         for candidate in candidates {
