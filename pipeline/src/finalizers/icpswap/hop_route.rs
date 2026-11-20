@@ -92,6 +92,11 @@ impl IcpswapRouteState {
         pays_output(self.path.len(), self.finished.len())
     }
 
+    /// True when a step after the first one ended without its swap. The route then holds an intermediate asset.
+    fn stopped_after_first_step(&self) -> bool {
+        !self.is_first_step() && matches!(self.current.state.step, IcpswapStep::Refunded | IcpswapStep::Failed)
+    }
+
     /// The asset the route holds between steps, with its amount when known.
     fn held_between_steps(&self) -> String {
         let step = &self.current;
@@ -175,15 +180,18 @@ impl IcpswapLegState {
         }
     }
 
+    /// True when a route stopped after its first step, with an intermediate asset in the trader account.
+    pub(super) fn stopped_after_first_step(&self) -> bool {
+        matches!(self, Self::Route(route) if route.stopped_after_first_step())
+    }
+
     /// The error a reader of the leg should see.
     pub(super) fn last_error(&self) -> Option<String> {
         match self {
             Self::Single(state) => state.last_error.clone(),
             Self::Route(route) => {
                 let step_error = route.current.state.last_error.clone();
-                if !route.is_first_step()
-                    && matches!(route.current.state.step, IcpswapStep::Refunded | IcpswapStep::Failed)
-                {
+                if route.stopped_after_first_step() {
                     return Some(format!(
                         "ICPSwap route stopped at step {}: {} is back in the trader's accounts ({})",
                         route.finished.len() + 1,
@@ -649,6 +657,20 @@ impl IcpswapFinalizer {
             legs: steps.into_iter().flat_map(|step| step.legs).collect(),
             ..last
         })
+    }
+
+    /// Alerts that a route stopped after its first step. The bot does not swap the held asset, so an operator must.
+    pub(super) async fn notify_route_stopped(&self, leg: &IcpswapLegState) {
+        let reason = leg.last_error().unwrap_or_else(|| "no error recorded".to_string());
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: leg.current().execution_id.clone(),
+                venue: VENUE_ID.to_string(),
+                pending_step: "ManualSwap".to_string(),
+                owner: self.trader.to_string(),
+                details: format!("{reason}. The bot does not swap it: swap it by hand"),
+            })
+            .await;
     }
 
     /// Alerts while a route waits for an operator before its next step.

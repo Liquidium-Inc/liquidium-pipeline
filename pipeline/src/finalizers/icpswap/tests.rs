@@ -213,10 +213,10 @@ pub(super) struct TestIcpswapClient {
 }
 
 #[derive(Default)]
-struct RecordingWatchdog(Mutex<Vec<(String, String, String, String, String)>>);
+pub(super) struct RecordingWatchdog(Mutex<Vec<(String, String, String, String, String)>>);
 
 impl RecordingWatchdog {
-    fn events(&self) -> Vec<(String, String, String, String, String)> {
+    pub(super) fn events(&self) -> Vec<(String, String, String, String, String)> {
         self.0.lock().unwrap().clone()
     }
 }

@@ -206,8 +206,13 @@ impl IcpswapFinalizer {
                 self.notify_route_parked(route).await;
                 return self.progress_for(leg, state, None).await;
             }
+            let was_stopped = state.stopped_after_first_step();
             let (advanced, advance_error) = self.advance_current(state, checkpoint).await?;
             state = advanced;
+            // The alert goes out one time, in the advance that stops the route.
+            if !was_stopped && state.stopped_after_first_step() {
+                self.notify_route_stopped(&state).await;
+            }
             let IcpswapLegState::Route(route) = &mut state else {
                 return self.progress_for(leg, state, advance_error).await;
             };

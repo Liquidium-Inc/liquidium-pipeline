@@ -18,7 +18,8 @@ use super::{
         leg_identity, slippage_within_floor,
     },
     tests::{
-        RecordingCheckpoint, TEST_MNEMONIC, TestIcpswapClient, TestSessionFactory, planning_context, receiver, trader,
+        RecordingCheckpoint, RecordingWatchdog, TEST_MNEMONIC, TestIcpswapClient, TestSessionFactory,
+        planning_context, receiver, trader,
     },
 };
 use crate::{
@@ -724,6 +725,51 @@ async fn a_later_step_that_refunds_fails_the_leg_and_names_the_held_asset() {
     let error = progress.last_error.expect("route error");
     assert!(error.contains("stopped at step 2"), "{error}");
     assert!(error.contains("ICP"), "{error}");
+}
+
+#[tokio::test]
+async fn a_later_step_that_refunds_alerts_an_operator_one_time() {
+    let mut harness = harness(thin_direct_pools());
+    let watchdog = Arc::new(RecordingWatchdog::default());
+    harness.finalizer = harness.finalizer.with_watchdog(watchdog.clone());
+    let preview = preview(&harness, &request(&ckbtc(), &ckusdc())).await;
+    harness.workflow.set_outcome(&icp(), StepOutcome::Refund);
+    let leg = leg_from(&preview);
+    let checkpoint = RecordingCheckpoint::default();
+
+    let stopped = harness.finalizer.advance(&leg, &checkpoint).await.expect("advance");
+
+    let events = watchdog.events();
+    assert_eq!(events.len(), 1);
+    let (_, venue, pending_step, owner, details) = &events[0];
+    assert_eq!(venue, VENUE_ID);
+    assert_eq!(pending_step, "ManualSwap");
+    assert_eq!(owner, &trader().to_string());
+    assert!(details.contains("stopped at step 2"), "{details}");
+    assert!(details.contains("ICP"), "{details}");
+    assert!(details.contains("swap it by hand"), "{details}");
+
+    // A later advance of the stopped leg sends no second alert.
+    harness
+        .finalizer
+        .advance(&saved(&leg, &stopped), &checkpoint)
+        .await
+        .expect("advance");
+    assert_eq!(watchdog.events().len(), 1);
+}
+
+#[tokio::test]
+async fn a_first_step_that_refunds_sends_no_alert() {
+    let mut harness = harness(thin_direct_pools());
+    let watchdog = Arc::new(RecordingWatchdog::default());
+    harness.finalizer = harness.finalizer.with_watchdog(watchdog.clone());
+    let preview = preview(&harness, &request(&ckbtc(), &ckusdc())).await;
+    harness.workflow.set_outcome(&ckbtc(), StepOutcome::Refund);
+
+    let progress = advance_once(&harness, &preview).await;
+
+    assert_eq!(progress.status, VenueLegStatus::Recovered);
+    assert!(watchdog.events().is_empty());
 }
 
 #[tokio::test]
