@@ -1,6 +1,6 @@
 //! The delivery check before a leg back. The bridge wallet on Ethereum is shared
 //! between rows, so the transaction of a delivery must show the funds at the wallet.
-use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeRouteSpec, TransactionPayment};
+use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeProvider, BridgeRouteSpec, TransactionPayment};
 
 use super::SOURCE_BALANCE_TOLERANCE;
 use crate::bridge::runtime::BridgeRuntime;
@@ -29,6 +29,12 @@ impl DeliveryCheck {
             TransactionPayment::NotVisible => Self::Arrived,
         }
     }
+}
+
+/// True when the bot can read a delivery on the source side of the route: the Ethereum bridge wallet.
+/// The Solana bridge wallet is shared too, but no Solana read exists yet, so its balance alone decides.
+pub fn has_delivery_check(route: &BridgeRouteSpec) -> bool {
+    matches!(route.route_kind.provider(), BridgeProvider::CkEthMinter)
 }
 
 /// Returns the text only if it is an Ethereum transaction hash: `0x` and 64 hex digits.

@@ -3,8 +3,8 @@
 //! outcome mapped onto the steps.
 use super::*;
 use crate::finalizers::bridge_legs::{
-    BridgeInInputs, BridgeLegOutcome, WaitBound, advance_bridge_in, awaits_other_deposit, in_route,
-    net_of_withdraw_fee, wait_within_bound,
+    BridgeInInputs, BridgeLegOutcome, DeliveryCheck, WaitBound, advance_bridge_in, awaits_other_deposit,
+    check_delivery, evm_transaction_hash, has_delivery_check, in_route, net_of_withdraw_fee, wait_within_bound,
 };
 
 impl<C> CexVenueFinalizer<C>
@@ -78,6 +78,9 @@ where
             else {
                 return Ok(());
             };
+            if !self.withdrawal_arrived(state, bridge, route, delivered).await? {
+                return Ok(());
+            }
             bridge_amount = delivered;
         }
 
@@ -128,6 +131,52 @@ where
             }
         }
         Ok(())
+    }
+
+    /// True when the chain shows that the exchange's transaction paid this withdrawal to the bridge wallet.
+    /// False while the leg waits for that transaction. Without a readable transaction, the wallet balance decides.
+    async fn withdrawal_arrived(
+        &self,
+        state: &mut CexState,
+        bridge: &BridgeRuntime,
+        route: &BridgeRouteSpec,
+        expected: f64,
+    ) -> Result<bool, CexBackendError> {
+        // Only an Ethereum delivery can be read from the chain. On another route the wallet balance decides.
+        if !has_delivery_check(route) {
+            return Ok(true);
+        }
+        let Some(transaction) = state.withdraw.withdraw_txid.as_deref().and_then(evm_transaction_hash) else {
+            warn!(
+                "[cex] liq_id={} the exchange names no readable transaction for the withdrawal (txid={:?}); the wallet balance alone decides",
+                state.liq_id, state.withdraw.withdraw_txid
+            );
+            return Ok(true);
+        };
+        let reason = match check_delivery(bridge, route, transaction, expected)
+            .await
+            .map_err(CexBackendError::Unreachable)?
+        {
+            DeliveryCheck::Arrived => return Ok(true),
+            DeliveryCheck::NotYet(reason) => reason.to_string(),
+            // An exchange can report its fee late, and the expected amount is then too high.
+            // So a contradiction waits like a short wallet balance does, and errors at the bound.
+            DeliveryCheck::Refused(reason) => format!(
+                "the exchange reports a withdrawal of {expected} {}, but {reason}",
+                route.source_asset
+            ),
+        };
+        state.step = CexStep::WithdrawPending;
+        wait_within_bound(
+            &state.liq_id,
+            &mut WaitBound {
+                since: &mut state.withdraw.withdraw_accepted_at_ts,
+                timeout_secs: WITHDRAW_DELIVERY_TIMEOUT_SECS,
+            },
+            "bridged withdraw",
+            &reason,
+        )?;
+        Ok(false)
     }
 
     /// Whether the exchange has sent the withdrawal, and the amount the bridge
