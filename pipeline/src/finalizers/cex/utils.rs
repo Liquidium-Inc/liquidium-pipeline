@@ -24,6 +24,8 @@ pub(crate) struct TradeLeg {
 pub(super) struct SlicePreview {
     pub chunk_in: f64,
     pub preview_mid_price: f64,
+    /// The best price on the side the slice takes from.
+    pub best_price: f64,
     pub preview_impact_bps: f64,
     /// The market's taker fee, which a fill is measured net of.
     pub taker_fee_bps: f64,
