@@ -47,6 +47,9 @@ pub enum VenueStepError {
     /// The request never reached the venue, so the same request later is safe.
     #[error("{0}")]
     Unreachable(String),
+    /// Nothing is in doubt, but only an operator may let the leg go on.
+    #[error("{0}")]
+    OperatorRequired(String),
     #[error("{0}")]
     Other(String),
 }
@@ -164,7 +167,9 @@ impl VenueGate {
             }
             // Only an operator can say which row owns the provider record, or
             // whether a call without an answer moved funds.
-            Err(VenueStepError::Ambiguous(message)) => StepVerdict::Park(message),
+            Err(VenueStepError::Ambiguous(message) | VenueStepError::OperatorRequired(message)) => {
+                StepVerdict::Park(message)
+            }
             Err(VenueStepError::Other(message)) => StepVerdict::Retry(message),
         }
     }

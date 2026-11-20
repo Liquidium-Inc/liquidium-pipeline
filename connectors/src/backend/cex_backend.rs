@@ -20,6 +20,10 @@ pub enum CexBackendError {
     /// happened there. The leg waits, and the wait spends no retry budget.
     #[error("{0}")]
     Unreachable(String),
+    /// Nothing is in doubt, but only an operator may let the leg go on: a
+    /// fill broke a bound, or a hold outlasted its timeout. The leg parks.
+    #[error("{0}")]
+    OperatorRequired(String),
     /// Any backend failure that follows the normal retry/error policy.
     #[error("{0}")]
     Other(String),

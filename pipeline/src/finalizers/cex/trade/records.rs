@@ -70,8 +70,9 @@ where
             && at_oracle > 0.0
         {
             let earlier = state.trade.trade_oracle_route_keep.unwrap_or(1.0);
-            // A leg that beat the oracle gives the next ones no extra room.
-            state.trade.trade_oracle_route_keep = Some(earlier * (total_out / at_oracle).min(1.0));
+            // A leg that beat the oracle leaves the next ones that much more
+            // room, as the planner's check on the whole route assumed.
+            state.trade.trade_oracle_route_keep = Some(earlier * total_out / at_oracle);
         }
         Self::clear_pending_trade_order(state);
         state.trade.trade_pending_buy_mode = None;
