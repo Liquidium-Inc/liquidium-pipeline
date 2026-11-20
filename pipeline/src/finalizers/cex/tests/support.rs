@@ -242,7 +242,29 @@ pub(super) fn repayment_account() -> icrc_ledger_types::icrc1::account::Account 
     }
 }
 
-/// The finalizer most tests use: an anonymous liquidator and the test tunables.
+/// The configured pairs of the test exchange. The route search finds the
+/// four-leg ckBTC -> ckUSDT route of `make_execution_receipt` from them.
+pub(super) const TEST_ROUTE_PAIRS: [&str; 4] = ["CKBTC_BTC", "BTC_USDC", "USDC_USDT", "CKUSDT_USDT"];
+
+/// Whether `market` is a direct ckBTC/ckUSDT market. The test exchange has none,
+/// so a route resolves through `TEST_ROUTE_PAIRS`.
+pub(super) fn is_direct_ck_market(market: &str) -> bool {
+    matches!(market, "CKBTC_CKUSDT" | "CKUSDT_CKBTC")
+}
+
+/// Books for the four-leg route: no direct ck market, a liquid book elsewhere.
+pub(super) fn legacy_ck_route_books(cex: &mut MockCexBackend) {
+    cex.expect_get_orderbook().returning(|market, _| {
+        if is_direct_ck_market(market) {
+            Err(format!("no market {market}"))
+        } else {
+            Ok(liquid_orderbook())
+        }
+    });
+}
+
+/// The finalizer most tests use: an anonymous liquidator, the test tunables
+/// and the test exchange's pairs.
 pub(super) fn test_finalizer<C: CexBackend>(
     backend: Arc<C>,
     transfers: Arc<dyn TransferActions>,
@@ -255,6 +277,7 @@ pub(super) fn test_finalizer<C: CexBackend>(
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
+    .with_route_config(TEST_ROUTE_PAIRS.iter().map(|pair| pair.to_string()).collect(), 3)
 }
 
 pub(super) fn cksol_finalizer(cex: MockCexBackend, bridge: MockBridgeBackend) -> CexVenueFinalizer<MockCexBackend> {

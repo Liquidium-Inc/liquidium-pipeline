@@ -371,7 +371,7 @@ async fn preview_fails_when_the_exchange_refuses_the_route() {
         .expect_err("refused route");
 
     assert!(
-        error.contains("refused the route") && error.contains("not verified"),
+        error.contains("no transport that can carry") && error.contains("not verified"),
         "{error}"
     );
 }
@@ -1819,4 +1819,245 @@ async fn a_saved_withdrawal_is_written_then_sent_in_one_cycle_and_a_crash_settle
         open.cex.withdraw.withdraw_send.unwrap().phase,
         OutboundPhase::Submitted { .. }
     ));
+}
+
+/// The preview tries each transport fast first and keeps the first sound book.
+mod transport_fallback {
+    use super::*;
+    use crate::bridge::runtime::BridgeRuntime;
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, MockBridgeBackend};
+
+    const CAP_BPS: f64 = 200.0;
+
+    fn icp() -> ChainToken {
+        ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ICP".to_string(),
+            decimals: 8,
+            fee: Nat::from(10_000u64),
+        }
+    }
+
+    fn ckusdt() -> ChainToken {
+        ChainToken::Icp {
+            ledger: Principal::management_canister(),
+            symbol: "ckUSDT".to_string(),
+            decimals: 6,
+            fee: Nat::from(10_000u64),
+        }
+    }
+
+    /// Two ICP for ckUSDT.
+    fn icp_request() -> SwapRequest {
+        SwapRequest {
+            pay_asset: icp().asset_id(),
+            pay_amount: ChainTokenAmount::from_raw(icp(), Nat::from(200_000_000u64)),
+            receive_asset: ckusdt().asset_id(),
+            receive_address: None,
+            max_slippage_bps: Some(100),
+            venue_hint: Some(VENUE_ID.to_string()),
+        }
+    }
+
+    fn deep_bids(price: f64) -> OrderBook {
+        OrderBook {
+            bids: vec![OrderBookLevel {
+                price,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+            taker_fee_bps: 10.0,
+        }
+    }
+
+    /// A book that takes two ICP only at half the top price.
+    fn thin_bids(price: f64) -> OrderBook {
+        OrderBook {
+            bids: vec![
+                OrderBookLevel { price, quantity: 0.01 },
+                OrderBookLevel {
+                    price: price / 2.0,
+                    quantity: 1_000_000.0,
+                },
+            ],
+            asks: vec![],
+            taker_fee_bps: 10.0,
+        }
+    }
+
+    /// A book that takes two ICP at a quarter below the top price: thin, but less so than `thin_bids`.
+    fn less_thin_bids(price: f64) -> OrderBook {
+        OrderBook {
+            bids: vec![
+                OrderBookLevel { price, quantity: 0.01 },
+                OrderBookLevel {
+                    price: price * 0.75,
+                    quantity: 1_000_000.0,
+                },
+            ],
+            asks: vec![],
+            taker_fee_bps: 10.0,
+        }
+    }
+
+    /// MEXC with the bridge, the test cap as the sound-book limit, and `books` as its markets.
+    fn finalizer_with_books(
+        books: impl Fn(&str) -> Result<OrderBook, String> + Send + 'static,
+    ) -> CexVenueFinalizer<MockCexBackend> {
+        finalizer_with(books, |_| Ok(()))
+    }
+
+    /// As `finalizer_with_books`, with the exchange answering each route check with `check`.
+    fn finalizer_with(
+        books: impl Fn(&str) -> Result<OrderBook, String> + Send + 'static,
+        check: impl Fn(&FundingRoute) -> Result<(), FundingRouteError> + Send + 'static,
+    ) -> CexVenueFinalizer<MockCexBackend> {
+        let mut backend = MockCexBackend::new();
+        backend
+            .expect_get_withdraw_terms()
+            .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+        backend.expect_check_funding_route().returning(check);
+        backend.expect_get_orderbook().returning(move |market, _| books(market));
+        let mut bridge = MockBridgeBackend::new();
+        bridge
+            .expect_get_fee_budget()
+            .returning(|_, _, _| Ok(BridgeFeeBudget::default()));
+        let tokens = HashMap::from([(icp().asset_id(), icp()), (ckusdt().asset_id(), ckusdt())]);
+        CexVenueFinalizer::new(
+            Arc::new(backend),
+            Arc::new(MockTransferActions::new()),
+            Principal::anonymous(),
+            200.0,
+            0.0001,
+            0.7,
+        )
+        .with_token_registry(Arc::new(TokenRegistry::new(tokens)))
+        .with_bridge_runtime(BridgeRuntime::for_tests(Arc::new(bridge)))
+        .with_transport_impact_cap_bps(CAP_BPS)
+    }
+
+    /// The exit the chosen state will run: asset, network and whether it bridges.
+    fn withdraw_plan(preview: &VenueRoutePreview) -> (String, String, bool) {
+        let execution = preview
+            .initial_execution_state
+            .decode::<CexVenueExecutionState>(VENUE_ID)
+            .expect("state should decode")
+            .expect("state should be MEXC");
+        let bridge = execution.cex.withdraw.bridge;
+        (
+            bridge.withdraw_planned_asset.expect("planned asset"),
+            bridge.withdraw_planned_network.expect("planned network"),
+            bridge.withdraw_bridge_required,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_sound_direct_book_keeps_ckusdt_on_icp() {
+        let finalizer = finalizer_with_books(|market| match market {
+            "ICP_CKUSDT" | "ICP_USDT" => Ok(deep_bids(10.0)),
+            _ => Err(format!("no market {market}")),
+        });
+
+        let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &icp_request())
+            .await
+            .expect("the direct book is sound");
+
+        assert_eq!(
+            withdraw_plan(&preview),
+            ("ckUSDT".to_string(), "ICP".to_string(), false)
+        );
+        assert_eq!(preview.quote.legs[0].route_id, "ICP_CKUSDT:sell");
+    }
+
+    #[tokio::test]
+    async fn a_thin_direct_book_moves_the_exit_to_the_bridge() {
+        let finalizer = finalizer_with_books(|market| match market {
+            "ICP_CKUSDT" => Ok(thin_bids(10.0)),
+            "ICP_USDT" => Ok(deep_bids(10.0)),
+            _ => Err(format!("no market {market}")),
+        });
+
+        let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &icp_request())
+            .await
+            .expect("the bridged exit is sound");
+
+        assert_eq!(withdraw_plan(&preview), ("USDT".to_string(), "ETH".to_string(), true));
+        assert_eq!(preview.quote.legs[0].route_id, "ICP_USDT:sell");
+        assert!(preview.quote.estimated_price_impact_bps <= CAP_BPS);
+    }
+
+    #[tokio::test]
+    async fn a_missing_direct_market_moves_the_exit_to_the_bridge() {
+        let finalizer = finalizer_with_books(|market| match market {
+            "ICP_USDT" => Ok(deep_bids(10.0)),
+            _ => Err(format!("no market {market}")),
+        });
+
+        let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &icp_request())
+            .await
+            .expect("the bridged exit is sound");
+
+        assert_eq!(withdraw_plan(&preview), ("USDT".to_string(), "ETH".to_string(), true));
+    }
+
+    /// The cap chooses between transports; it does not refuse the venue. The plan's
+    /// edge check and oracle guard judge a thin quote, as they did before the cap.
+    #[tokio::test]
+    async fn when_every_transport_is_thin_the_least_thin_quote_is_returned() {
+        let finalizer = finalizer_with_books(|market| match market {
+            "ICP_CKUSDT" => Ok(thin_bids(10.0)),
+            "ICP_USDT" => Ok(less_thin_bids(10.0)),
+            _ => Err(format!("no market {market}")),
+        });
+
+        let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &icp_request())
+            .await
+            .expect("a thin quote still reaches the planner");
+
+        assert_eq!(withdraw_plan(&preview), ("USDT".to_string(), "ETH".to_string(), true));
+        assert!(preview.quote.estimated_price_impact_bps > CAP_BPS);
+    }
+
+    #[tokio::test]
+    async fn no_transport_that_can_carry_names_every_rejection() {
+        let finalizer = finalizer_with_books(|market| Err(format!("no market {market}")));
+
+        let error = MultiVenueAdapter::preview(&finalizer, &planning_context(), &icp_request())
+            .await
+            .expect_err("no transport can carry the amount");
+
+        assert!(error.contains("no transport that can carry ICP -> ckUSDT"), "{error}");
+        assert!(error.contains("ICP@ICP -> ckUSDT@ICP: "), "{error}");
+        assert!(error.contains("ICP@ICP -> USDT@ETH via bridge: "), "{error}");
+    }
+
+    /// A read that fails says nothing about the book. The venue is unavailable this
+    /// cycle; the slower transport must not stand in for an outage.
+    #[tokio::test]
+    async fn a_failed_route_read_stops_the_preview_instead_of_bridging() {
+        let bridged_probes = Arc::new(std::sync::Mutex::new(0usize));
+        let probes = bridged_probes.clone();
+        let finalizer = finalizer_with(
+            move |market| match market {
+                "ICP_CKUSDT" => Ok(deep_bids(10.0)),
+                "ICP_USDT" => {
+                    *probes.lock().unwrap() += 1;
+                    Ok(deep_bids(10.0))
+                }
+                _ => Err(format!("no market {market}")),
+            },
+            |_| {
+                Err(FundingRouteError::Unavailable(
+                    "the exchange did not answer".to_string(),
+                ))
+            },
+        );
+
+        let error = MultiVenueAdapter::preview(&finalizer, &planning_context(), &icp_request())
+            .await
+            .expect_err("an unavailable exchange is not a thin book");
+
+        assert!(error.contains("the exchange did not answer"), "{error}");
+        assert_eq!(*bridged_probes.lock().unwrap(), 0, "the bridge is not tried");
+    }
 }

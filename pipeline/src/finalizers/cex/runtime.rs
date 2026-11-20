@@ -43,7 +43,8 @@ fn build_cex_finalizer<C: CexBackend>(
     .with_token_registry(ctx.registry.clone())
     .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
     .with_outbound(ctx.trader_outbound.clone())
-    .with_route_config(available_pairs, max_hops as usize);
+    .with_route_config(available_pairs, max_hops as usize)
+    .with_transport_impact_cap_bps(config.cex_max_price_impact_bps);
     match bridge {
         Some(bridge) => finalizer.with_bridge_runtime(bridge),
         None => finalizer,

@@ -18,7 +18,7 @@ pub struct CexVenueProfile {
 }
 
 impl CexVenueProfile {
-    /// MEXC: fixed routes for the legacy ck pairs, SOL only on `SOL_USDT`, ckUSDT, ckBTC
+    /// MEXC: fixed routes for the ETH/USDC pairs, SOL only on `SOL_USDT`, ckUSDT, ckBTC
     /// and ICP on ICP, and approval bumps on direct ICP deposits so that the exchange notices them.
     pub fn mexc() -> Self {
         Self {
@@ -106,7 +106,11 @@ mod tests {
         let mexc = CexVenueProfile::mexc();
         assert_eq!((mexc.venue_id(), mexc.name()), ("mexc", "MEXC"));
         assert!(mexc.approval_bumps());
-        assert!(mexc.special_trade_legs("ckBTC", "ckUSDT").is_some());
+        assert!(mexc.special_trade_legs("ETH", "USDC").is_some());
+        assert!(
+            mexc.special_trade_legs("ckBTC", "ckUSDT").is_none(),
+            "the route search finds ck pairs"
+        );
         assert!(mexc.special_trade_legs("ICP", "ckUSDT").is_none());
         assert_eq!(mexc.sol_market(), Some("SOL_USDT"));
         assert_eq!(mexc.direct_assets(), ["ckUSDT", "ckBTC", "ICP"]);

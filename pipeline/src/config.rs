@@ -117,8 +117,9 @@ pub struct Config {
     /// Higher ICPSwap impact cap used only when an overflow remainder is below
     /// the venue minimum and the planner considers sending the full amount DEX-side.
     pub icpswap_dust_fallback_max_price_impact_bps: f64,
-    /// Highest price impact a CEX leg may carry while another CEX can take
-    /// the rest, in bps. With one CEX enabled the ceiling does not apply.
+    /// Highest price impact a CEX leg may carry, in bps. A transport whose preview
+    /// is above it is not sound, and the leg takes the next transport (the bridge).
+    /// With another CEX enabled, a leg above it also overflows to that CEX.
     pub cex_max_price_impact_bps: f64,
     /// Test-only fixed USD allocation sent to ICPSwap before routing the
     /// remainder to an overflow venue. Unset preserves the normal policy.
@@ -613,7 +614,7 @@ pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai"
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
 const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
-const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
+pub(crate) const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];

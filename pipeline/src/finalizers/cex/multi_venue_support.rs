@@ -1,15 +1,16 @@
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::BridgeRouteKind,
-    cex_backend::{CexBackend, FundingRoute},
+    cex_backend::{CexBackend, CexBackendError, FundingRoute, FundingRouteError},
 };
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
+use log::warn;
 
 use super::{finalizer::CexVenueFinalizer, utils::LIQUIDITY_EPS};
 use crate::{
     finalizers::{
-        bridge_planner::BridgePlanner,
+        bridge_planner::{BridgePlan, BridgePlanner, BridgeTransportPlan},
         cex::state::{
             CexDepositBridgeState, CexDepositState, CexRouteLeg, CexState, CexStep, CexTradeState,
             CexWithdrawBridgeState, CexWithdrawState,
@@ -31,6 +32,90 @@ pub(super) struct CexPreparedPreview {
     pub side_costs: Vec<SideCost>,
 }
 
+/// Why one transport of a leg was not used. The preview moves to the next
+/// transport on either; the message is for the operator.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum TransportRejection {
+    /// This transport cannot carry the amount: no market, too little depth, a
+    /// refused route, or a fee or minimum that leaves nothing.
+    CannotCarry { transport: String, reason: String },
+    /// Every market quoted, but the book is thin for the amount.
+    ImpactAboveCap {
+        transport: String,
+        impact_bps: f64,
+        cap_bps: f64,
+    },
+}
+
+impl std::fmt::Display for TransportRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CannotCarry { transport, reason } => write!(f, "{transport}: {reason}"),
+            Self::ImpactAboveCap {
+                transport,
+                impact_bps,
+                cap_bps,
+            } => write!(
+                f,
+                "{transport}: impact {impact_bps:.2} bps is above the {cap_bps:.2} bps cap"
+            ),
+        }
+    }
+}
+
+fn rejection_summary(rejections: &[TransportRejection]) -> String {
+    rejections
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Why one prepared state cannot be quoted.
+#[derive(Debug)]
+enum PreviewFailure {
+    /// This transport cannot carry the amount. The next transport may.
+    Transport(String),
+    /// A read failed, so nothing is known about any transport. The venue is
+    /// unavailable this cycle; a slower transport must not stand in for an outage.
+    Venue(String),
+}
+
+impl From<CexBackendError> for PreviewFailure {
+    fn from(error: CexBackendError) -> Self {
+        match error {
+            CexBackendError::BelowMinimum(reason) => Self::Transport(reason),
+            other => Self::Venue(other.to_string()),
+        }
+    }
+}
+
+impl From<FundingRouteError> for PreviewFailure {
+    fn from(error: FundingRouteError) -> Self {
+        match error {
+            FundingRouteError::BelowMinimum(reason) | FundingRouteError::Unsupported(reason) => Self::Transport(reason),
+            FundingRouteError::Unavailable(reason) => Self::Venue(reason),
+        }
+    }
+}
+
+fn transport_side_label(side: &BridgeTransportPlan) -> String {
+    if side.bridge_required {
+        format!("{}@{} via bridge", side.cex_asset, side.cex_network)
+    } else {
+        format!("{}@{}", side.cex_asset, side.cex_network)
+    }
+}
+
+/// `ICP@ICP -> USDT@ETH via bridge`: the plan as the operator reads it in a log.
+pub(super) fn transport_label(plan: &BridgePlan) -> String {
+    format!(
+        "{} -> {}",
+        transport_side_label(&plan.deposit),
+        transport_side_label(&plan.withdraw)
+    )
+}
+
 impl<B> CexVenueFinalizer<B>
 where
     B: CexBackend,
@@ -46,8 +131,20 @@ where
         receive_address: Option<String>,
     ) -> Result<CexState, String> {
         let bridge_plan = self.resolve_bridge_plan_for_assets(&pay_amount.token, &receive_token);
+        Ok(self.amount_scoped_state_for_plan(execution_id, pay_amount, receive_token, receive_address, bridge_plan))
+    }
 
-        Ok(CexState {
+    /// The venue-local state for one transport plan. The preview builds one per
+    /// candidate and keeps the state of the transport it chose.
+    fn amount_scoped_state_for_plan(
+        &self,
+        execution_id: &str,
+        pay_amount: ChainTokenAmount,
+        receive_token: ChainToken,
+        receive_address: Option<String>,
+        bridge_plan: BridgePlan,
+    ) -> CexState {
+        CexState {
             liq_id: execution_id.to_string(),
             send_saved: false,
             side_costs: Vec::new(),
@@ -132,12 +229,21 @@ where
                     withdraw_bridge_funded_at_ts: None,
                 },
             },
-        })
+        }
     }
 
     /// Resolves the receive token required by the leg's deposit/withdraw state and
     /// validates that the request's exact pay allocation is internally sound.
     pub(super) fn prepare_swap_request(&self, execution_id: &str, request: &SwapRequest) -> Result<CexState, String> {
+        let (pay_amount, receive_token, receive_address) = self.swap_request_parts(request)?;
+        self.prepare_amount_scoped_state(execution_id, pay_amount, receive_token, receive_address)
+    }
+
+    /// The exact pay amount, the resolved receive token and the payout address of a request.
+    fn swap_request_parts(
+        &self,
+        request: &SwapRequest,
+    ) -> Result<(ChainTokenAmount, ChainToken, Option<String>), String> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
             return Err(format!(
                 "{} request pay asset does not match pay amount token",
@@ -149,12 +255,11 @@ where
             .as_ref()
             .ok_or_else(|| "CEX multi-venue adapter requires a token registry".to_string())?;
         let receive_token = registry.resolve(&request.receive_asset)?;
-        self.prepare_amount_scoped_state(
-            execution_id,
+        Ok((
             request.pay_amount.clone(),
             receive_token,
             request.receive_address.clone(),
-        )
+        ))
     }
 
     /// Converts a completed venue-local state into the generic execution
@@ -238,15 +343,20 @@ where
     }
 
     /// Quotes and prepares the exact request amount without performing a CEX
-    /// side effect. Resolved markets are saved into the existing `CexState`,
-    /// which remains the only execution state of the CEX step machine.
+    /// side effect. The transports are tried fast first. The first one whose book
+    /// is sound wins: every market quotes the amount, and the impact is at or
+    /// under the cap. When every transport that quotes is thin, the least thin one
+    /// is returned: the cap chooses between transports, it does not refuse the
+    /// venue, and the plan's edge check and oracle guard judge the quote as before.
+    /// Resolved markets are saved into the chosen `CexState`, which remains the
+    /// only execution state of the CEX step machine.
     pub(super) async fn preview_swap_request(
         &self,
         execution_id: &str,
         request: &SwapRequest,
     ) -> Result<CexPreparedPreview, String> {
-        let mut state = self.prepare_swap_request(execution_id, request)?;
-        if state.size_in.value == Nat::from(0u8) {
+        let (pay_amount, receive_token, receive_address) = self.swap_request_parts(request)?;
+        if pay_amount.value == 0u8 {
             return Err(format!(
                 "{} cannot quote a non-positive pay amount",
                 self.profile.name()
@@ -255,12 +365,82 @@ where
         if let Some(requested_bps) = request.max_slippage_bps {
             amount_after_bps_haircut(&Nat::from(0u8), requested_bps)?;
         }
+        let pair = format!("{} -> {}", pay_amount.token.symbol(), receive_token.symbol());
+        let cap_bps = self.transport_impact_cap_bps;
+        let mut rejections: Vec<TransportRejection> = Vec::new();
+        let mut least_thin: Option<(String, CexPreparedPreview)> = None;
+        for plan in self.bridge_plan_candidates(&pay_amount.token, &receive_token) {
+            let transport = transport_label(&plan);
+            let state = self.amount_scoped_state_for_plan(
+                execution_id,
+                pay_amount.clone(),
+                receive_token.clone(),
+                receive_address.clone(),
+                plan,
+            );
+            let preview = match self.preview_prepared_state(request, state).await {
+                Ok(preview) => preview,
+                Err(PreviewFailure::Transport(reason)) => {
+                    rejections.push(TransportRejection::CannotCarry { transport, reason });
+                    continue;
+                }
+                Err(PreviewFailure::Venue(reason)) => {
+                    return Err(format!(
+                        "{} cannot quote {pair} ({transport}): {reason}",
+                        self.profile.name()
+                    ));
+                }
+            };
+            let impact_bps = preview.quote.estimated_price_impact_bps;
+            if impact_bps <= cap_bps {
+                if !rejections.is_empty() {
+                    warn!(
+                        "[cex] liq_id={execution_id} {} takes {transport} for {pair}: the faster transports are not sound: {}",
+                        self.profile.name(),
+                        rejection_summary(&rejections)
+                    );
+                }
+                return Ok(preview);
+            }
+            rejections.push(TransportRejection::ImpactAboveCap {
+                transport: transport.clone(),
+                impact_bps,
+                cap_bps,
+            });
+            if least_thin
+                .as_ref()
+                .is_none_or(|(_, best)| impact_bps < best.quote.estimated_price_impact_bps)
+            {
+                least_thin = Some((transport, preview));
+            }
+        }
+        if let Some((transport, preview)) = least_thin {
+            warn!(
+                "[cex] liq_id={execution_id} {} takes {transport} for {pair} with the least impact; every transport is above the cap: {}",
+                self.profile.name(),
+                rejection_summary(&rejections)
+            );
+            return Ok(preview);
+        }
+        Err(format!(
+            "{} has no transport that can carry {pair}: {}",
+            self.profile.name(),
+            rejection_summary(&rejections)
+        ))
+    }
+
+    /// Quotes one prepared state: the funding route, the trade legs and what
+    /// arrives after fees and the return bridge.
+    async fn preview_prepared_state(
+        &self,
+        request: &SwapRequest,
+        mut state: CexState,
+    ) -> Result<CexPreparedPreview, PreviewFailure> {
         let mut side_costs = Vec::new();
         let initial_amount = self.preview_trade_input(&state, &mut side_costs).await?;
         if initial_amount <= LIQUIDITY_EPS {
-            return Err(format!(
-                "{} cannot quote a non-positive pay amount",
-                self.profile.name()
+            return Err(PreviewFailure::Transport(
+                "the deposit fees leave nothing to trade".to_string(),
             ));
         }
         // The exchange confirms, before any funds move, that it credits this
@@ -272,18 +452,23 @@ where
                 deposit_amount: initial_amount,
                 withdraw_asset: <Self as BridgePlanner>::planned_withdraw_asset(&state),
                 withdraw_network: <Self as BridgePlanner>::planned_withdraw_network(&state),
-                withdraw_address: self.planned_withdraw_address(&state)?,
+                withdraw_address: self.planned_withdraw_address(&state).map_err(PreviewFailure::Venue)?,
             })
-            .await
-            .map_err(|error| format!("{} refused the route: {error}", self.profile.name()))?;
+            .await?;
+        // Order book reads are untyped, so a failed read counts as a market that
+        // cannot carry the amount. A typed read error is a follow-up.
         let legs = self
             .resolve_trade_legs_for_amount(
                 &<Self as BridgePlanner>::planned_deposit_asset(&state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(&state),
                 initial_amount,
             )
-            .await?;
-        let route_preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;
+            .await
+            .map_err(PreviewFailure::Transport)?;
+        let route_preview = self
+            .preview_resolved_trade_route(&legs, initial_amount)
+            .await
+            .map_err(PreviewFailure::Transport)?;
 
         state.trade.trade_resolved_legs = legs
             .iter()
@@ -346,8 +531,9 @@ where
         let conservative_haircut_bps = self
             .quote_route_fee_bps
             .checked_add(self.quote_delay_buffer_bps)
-            .ok_or_else(|| "CEX conservative quote haircut overflowed u32".to_string())?;
-        let conservative_value = amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps)?;
+            .ok_or_else(|| PreviewFailure::Venue("CEX conservative quote haircut overflowed u32".to_string()))?;
+        let conservative_value =
+            amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps).map_err(PreviewFailure::Venue)?;
 
         Ok(CexPreparedPreview {
             state,
@@ -359,21 +545,25 @@ where
     }
 
     /// The amount that reaches the exchange to trade, sized as the deposit sizes it.
-    async fn preview_trade_input(&self, state: &CexState, side_costs: &mut Vec<SideCost>) -> Result<f64, String> {
+    async fn preview_trade_input(
+        &self,
+        state: &CexState,
+        side_costs: &mut Vec<SideCost>,
+    ) -> Result<f64, PreviewFailure> {
         if !state.deposit.bridge.deposit_bridge_required {
             let (_, executable_pay) = Self::compute_fee_adjusted_deposit_transfer(
                 &state.deposit.deposit_asset,
                 &state.size_in,
                 self.deposit_fee_count(&state.deposit.deposit_asset),
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
             return Ok(executable_pay.to_f64());
         }
-        let bridge = self.bridge_runtime()?;
-        let route = Self::deposit_route(state, &<Self as BridgePlanner>::planned_deposit_asset(state))?;
-        let arrival = Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in)
-            .await
-            .map_err(|error| error.to_string())?;
+        // A bridged candidate exists only with a bridge and a route, so these are configuration faults.
+        let bridge = self.bridge_runtime().map_err(PreviewFailure::Venue)?;
+        let route = Self::deposit_route(state, &<Self as BridgePlanner>::planned_deposit_asset(state))
+            .map_err(PreviewFailure::Venue)?;
+        let arrival =
+            Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
         side_costs.extend(arrival.sizing.fee_budget.side_costs);
         Ok(arrival.expected_amount)
     }
@@ -385,22 +575,24 @@ where
         state: &CexState,
         trade_out: f64,
         side_costs: &mut Vec<SideCost>,
-    ) -> Result<f64, String> {
+    ) -> Result<f64, PreviewFailure> {
         let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
+        // Untyped like the order book reads: an unknown asset or network and a
+        // failed read both count against this transport.
         let terms = self
             .backend
             .get_withdraw_terms(&planned_asset, &planned_network)
-            .await?;
+            .await
+            .map_err(PreviewFailure::Transport)?;
         // The exchange refuses a smaller withdrawal, and the leg would end as dust.
         if trade_out < terms.minimum {
-            return Err(format!(
-                "{} {planned_asset} withdrawal of {trade_out} is below its minimum {}",
-                self.profile.name(),
+            return Err(PreviewFailure::Transport(format!(
+                "{planned_asset} withdrawal of {trade_out} is below its minimum {}",
                 terms.minimum
-            ));
+            )));
         }
-        let mut net = Self::net_of_withdraw_fee(trade_out, terms.fee)?;
+        let mut net = Self::net_of_withdraw_fee(trade_out, terms.fee).map_err(PreviewFailure::Transport)?;
 
         let (true, Some(route)) = (
             state.withdraw.bridge.withdraw_bridge_required,
@@ -408,16 +600,16 @@ where
         ) else {
             return Ok(net);
         };
-        let bridge = self.bridge_runtime()?;
+        let bridge = self.bridge_runtime().map_err(PreviewFailure::Venue)?;
         let budget = bridge
             .backend
             .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
-            .await?;
+            .await
+            .map_err(PreviewFailure::Venue)?;
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
             net = Self::solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)
-                .await
-                .map_err(|error| error.to_string())?
+                .await?
                 .to_f64();
         }
         side_costs.extend(budget.side_costs);

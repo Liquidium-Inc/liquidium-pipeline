@@ -237,8 +237,9 @@ ICPSWAP_TEST_ALLOCATION_USD=1
 MEXC_TEST_ALLOCATION_USD=10
 # Allow full ICPSwap up to 1.5% impact only when the CEX remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
-# The CEX side is a waterfall: MEXC takes what it can quote within this impact
-# ceiling, Kraken takes the rest. With one CEX enabled the ceiling does not apply.
+# A CEX transport above this impact is not sound: a listed asset then moves
+# through the bridge instead of its direct ck market. With Kraken enabled, a
+# MEXC leg above it also overflows to Kraken.
 CEX_MAX_PRICE_IMPACT_BPS=200
 
 # CEX (MEXC) - Optional

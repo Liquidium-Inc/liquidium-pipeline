@@ -92,9 +92,10 @@ fn ckusdt_token() -> ChainToken {
     }
 }
 
-/// The bridge has a ckUSDT route, but MEXC lists ckUSDT, so it never pays for the bridge.
+/// MEXC lists ckUSDT, so the fastest plan keeps it on ICP. The bridge's ckUSDT
+/// route is the second candidate, for a preview that finds the direct book thin.
 #[test]
-fn mexc_keeps_ckusdt_on_icp_although_the_bridge_has_a_route() {
+fn mexc_keeps_ckusdt_on_icp_first_and_offers_the_bridge_second() {
     let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
         .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
@@ -105,6 +106,12 @@ fn mexc_keeps_ckusdt_on_icp_although_the_bridge_has_a_route() {
     assert!(!plan.withdraw.bridge_required);
     assert_eq!(plan.withdraw.cex_asset, "ckUSDT");
     assert_eq!(plan.withdraw.cex_network, "ICP");
+
+    let candidates = finalizer.bridge_plan_candidates(&ckbtc_token(), &ckusdt_token());
+    assert_eq!(candidates.len(), 2, "ckBTC has no exchange bridge route, ckUSDT has one");
+    assert!(candidates[1].withdraw.bridge_required);
+    assert_eq!(candidates[1].withdraw.cex_asset, "USDT");
+    assert_eq!(candidates[1].withdraw.cex_network, "ETH");
 
     let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdt_token(), &ckbtc_token());
     assert!(!plan.deposit.bridge_required);
