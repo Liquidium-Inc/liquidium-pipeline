@@ -38,6 +38,11 @@ where
         for leg in legs {
             // The fee comes from the same source the fills are accounted with.
             let preview = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            // Every slice is held to the oracle, so a market it cannot price
+            // would take the deposit and then only hold.
+            self.oracle_price_bound(leg, 1.0)
+                .await
+                .map_err(|error| error.to_string())?;
             // Orders go out at the room the cap leaves after the fee.
             Self::price_room_or_err(
                 &leg.side,

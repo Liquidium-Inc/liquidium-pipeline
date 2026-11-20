@@ -91,6 +91,7 @@ where
         let mut forced_next_buy_mode: Option<BuyOrderInputMode> = None;
 
         self.sanitize_pending_trade_state_for_leg(state, leg);
+        self.adopt_legacy_oracle_record(state, leg_idx, total_out);
 
         // Keep slicing until the leg input is consumed (or considered dust).
         while remaining_in > LIQUIDITY_EPS {
@@ -305,17 +306,18 @@ where
                 return Err(err.into());
             }
 
-            // A fill past the oracle bound (an exchange that refused the limit
-            // order and took a market order) stops the leg.
+            // A fill past the oracle bound (an order read back from before the
+            // bound, or an exchange that ignored the limit) parks the leg, so
+            // the next cycle cannot carry the fill on to the next leg.
             if let Some(bound) = oracle_bound
                 && Self::is_worse_price(&leg.side, exec_price, bound)
             {
                 let err = format!(
-                    "slice on {} {} filled at {} past the oracle bound {} (client_id={})",
+                    "slice on {} {} filled at {} past the oracle bound {} (client_id={}); an operator must decide",
                     leg.market, leg.side, exec_price, bound, pending.client_order_id
                 );
                 state.last_error = Some(err.clone());
-                return Err(err.into());
+                return Err(CexBackendError::OperatorRequired(err));
             }
 
             // Emit slice execution log with route and quality context.
@@ -356,7 +358,7 @@ where
     ///
     /// An oracle that cannot answer sent nothing to the venue, so the leg
     /// waits as it does for an unreachable venue, then reaches an operator.
-    pub(super) async fn oracle_price_bound(
+    pub(in crate::finalizers::cex) async fn oracle_price_bound(
         &self,
         leg: &TradeLeg,
         earlier_keep: f64,
@@ -379,14 +381,38 @@ where
             base_price / quote_price
         };
         // Earlier legs that already used the discount leave this one the oracle price.
-        let route_keep = 1.0 - self.max_oracle_discount_bps / BPS_PER_RATIO_UNIT;
-        let leg_keep = (route_keep / earlier_keep).min(1.0);
+        let leg_keep = (self.oracle_route_keep() / earlier_keep).min(1.0);
         let bound = if leg.side.eq_ignore_ascii_case("sell") {
             oracle_price * leg_keep
         } else {
             oracle_price / leg_keep
         };
         Ok(Some((oracle_price, bound)))
+    }
+
+    /// The least share of oracle value the whole route may keep.
+    fn oracle_route_keep(&self) -> f64 {
+        1.0 - self.max_oracle_discount_bps / BPS_PER_RATIO_UNIT
+    }
+
+    /// A row saved before the oracle bound has no oracle record. Its finished
+    /// legs count as having spent the route's whole discount, and its fills on
+    /// this leg count at the oracle price, so no later leg gets the room twice.
+    pub(in crate::finalizers::cex) fn adopt_legacy_oracle_record(
+        &self,
+        state: &mut CexState,
+        leg_idx: usize,
+        total_out: f64,
+    ) {
+        if self.price_oracle.is_none() {
+            return;
+        }
+        if leg_idx > 0 && state.trade.trade_oracle_route_keep.is_none() {
+            state.trade.trade_oracle_route_keep = Some(self.oracle_route_keep());
+        }
+        if total_out > 0.0 && state.trade.trade_progress_oracle_out.is_none() {
+            state.trade.trade_progress_oracle_out = Some(total_out);
+        }
     }
 
     /// The order price whose fill, after the taker fee, is no worse than `bound`.
@@ -421,8 +447,8 @@ where
     }
 
     /// Holds the leg while the book cannot fill within the oracle bound. The
-    /// leg retries each cycle; once the hold outlasts its timeout the error
-    /// spends the retry budget, so the row parks with an alert. Only a fill ends the hold.
+    /// leg retries each cycle; once the hold outlasts its timeout the leg
+    /// parks with an alert, and a release starts the hold again. Only a fill ends the hold.
     fn hold_for_oracle(
         state: &mut CexState,
         leg: &TradeLeg,
@@ -436,7 +462,9 @@ where
         let err = format!("{} {}: {reason} (held {held}s)", leg.market, leg.side);
         state.last_error = Some(err.clone());
         if held >= ORACLE_HOLD_TIMEOUT_SECS {
-            return Err(format!("{err}; an operator must decide").into());
+            return Err(CexBackendError::OperatorRequired(format!(
+                "{err}; an operator must decide"
+            )));
         }
         warn!("[cex] liq_id={} {}; retrying next cycle", state.liq_id, err);
         Ok(None)

@@ -29,6 +29,10 @@ fn oracle(prices: &'static [(&'static str, u128)]) -> Arc<MockPriceOracle> {
     Arc::new(oracle)
 }
 
+/// Oracle prices, in cents, for the assets the ckBTC -> ckUSDT route trades
+/// after its first leg, so route admission can price every market.
+const ROUTE_PRICES: &[(&str, u128)] = &[("BTC", 10_000_000), ("USDC", 100)];
+
 /// A ckBTC -> ckUSDT finalizer whose first leg, CKBTC_BTC, has `bids`, and
 /// whose orders each fill whole at `fill_price` net. CKBTC and BTC are both
 /// BTC to the oracle, so that market prices at 1 without asking it.
@@ -59,7 +63,7 @@ fn finalizer_with_book(bids: Vec<(f64, f64)>, fill_price: f64) -> (F, Orders) {
             })
         });
     let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
-        .with_price_oracle(oracle(&[]), DISCOUNT_BPS);
+        .with_price_oracle(oracle(ROUTE_PRICES), DISCOUNT_BPS);
     (finalizer, orders)
 }
 
@@ -109,14 +113,24 @@ async fn a_book_repriced_below_the_oracle_holds_before_any_order() {
 }
 
 #[tokio::test]
-async fn a_hold_that_lasts_spends_the_retry_budget() {
+async fn a_hold_that_lasts_parks_for_an_operator() {
     let (finalizer, orders) = finalizer_with_bid(0.95);
     let mut state = trade_state(&finalizer).await;
     state.trade.trade_oracle_hold_since_ts = Some(now_ts() - 31 * 60);
 
     let error = finalizer.trade(&mut state).await.expect_err("an operator decides");
 
-    assert!(matches!(error, CexBackendError::Other(_)), "{error:?}");
+    assert!(matches!(error, CexBackendError::OperatorRequired(_)), "{error:?}");
+    assert!(matches!(
+        crate::finalizers::multi_venue::VenueStepError::from(error),
+        crate::finalizers::multi_venue::VenueStepError::OperatorRequired(_)
+    ));
+    assert!(orders.lock().unwrap().is_empty());
+
+    // A release starts the hold again, so the leg waits another full timeout.
+    use crate::finalizers::multi_venue::VenueLeg;
+    finalizer.after_release(&mut state);
+    finalizer.trade(&mut state).await.expect("a released hold waits again");
     assert!(orders.lock().unwrap().is_empty());
 }
 
@@ -203,8 +217,68 @@ async fn a_market_order_fill_past_the_bound_stops_the_leg() {
         .await
         .expect_err("the fill breached the bound");
 
+    // A retry would find no input left and carry the fill on, so the leg parks.
+    assert!(matches!(error, CexBackendError::OperatorRequired(_)), "{error:?}");
     assert!(error.to_string().contains("oracle bound"), "{error}");
     assert_eq!(state.trade.trade_slices.len(), 1, "the breaching fill is recorded");
+}
+
+#[tokio::test]
+async fn a_leg_that_beat_the_oracle_leaves_the_next_more_room() {
+    // 2% over the oracle: the planner admitted the route on its end-to-end
+    // value, so the next leg may use the extra 2%.
+    let (finalizer, _) = finalizer_with_bid(1.02);
+    let mut state = trade_state(&finalizer).await;
+
+    finalizer.trade(&mut state).await.expect("the leg fills");
+
+    let kept = state.trade.trade_oracle_route_keep.expect("the leg's share is carried");
+    assert!((kept - 1.02 * 0.9995).abs() < 1e-9, "{kept}");
+}
+
+#[tokio::test]
+async fn a_row_saved_before_the_bound_spends_no_room_twice() {
+    let (finalizer, _) = finalizer_with_bid(1.0);
+    let mut state = trade_state(&finalizer).await;
+
+    // A later leg of an old row: its finished legs spent the whole discount.
+    finalizer.adopt_legacy_oracle_record(&mut state, 1, 0.0);
+    assert_eq!(state.trade.trade_oracle_route_keep, Some(0.975));
+    assert_eq!(state.trade.trade_progress_oracle_out, None);
+
+    // The first leg, part filled before the upgrade: the old fills count at the oracle price.
+    let mut state = trade_state(&finalizer).await;
+    finalizer.adopt_legacy_oracle_record(&mut state, 0, 5.0);
+    assert_eq!(state.trade.trade_oracle_route_keep, None);
+    assert_eq!(state.trade.trade_progress_oracle_out, Some(5.0));
+
+    // A row with its own record keeps it.
+    state.trade.trade_oracle_route_keep = Some(0.99);
+    finalizer.adopt_legacy_oracle_record(&mut state, 1, 5.0);
+    assert_eq!(state.trade.trade_oracle_route_keep, Some(0.99));
+    assert_eq!(state.trade.trade_progress_oracle_out, Some(5.0));
+}
+
+#[tokio::test]
+async fn a_route_the_oracle_cannot_price_is_not_admitted() {
+    let (finalizer, _) = finalizer_with_bid(1.0);
+    let leg = |market: &str| TradeLeg {
+        market: market.to_string(),
+        side: "sell".to_string(),
+    };
+
+    // CKBTC_BTC prices at 1 without the oracle, so it is admitted.
+    finalizer
+        .preview_resolved_trade_route(&[leg("CKBTC_BTC")], 1.0)
+        .await
+        .expect("a same-asset market needs no oracle price");
+    let error = finalizer
+        .preview_resolved_trade_route(&[leg("CKBTC_BTC"), leg("BTC_USD")], 1.0)
+        .await
+        .err()
+        .expect("the oracle has no BTC or USD price");
+
+    assert!(error.contains("price oracle cannot bound BTC_USD"), "{error}");
 }
 
 #[tokio::test]

@@ -97,6 +97,7 @@ impl From<CexBackendError> for VenueStepError {
             CexBackendError::BelowMinimum(message) => Self::BelowMinimum(message),
             CexBackendError::Ambiguous(message) => Self::Ambiguous(message),
             CexBackendError::Unreachable(message) => Self::Unreachable(message),
+            CexBackendError::OperatorRequired(message) => Self::OperatorRequired(message),
             CexBackendError::PendingSettlement(_) | CexBackendError::Other(_) => Self::Other(error.to_string()),
         }
     }
@@ -246,6 +247,7 @@ where
         restart_wait(&mut state.deposit.bridge.deposit_bridge_submitted_at_ts);
         restart_wait(&mut state.deposit.deposit_credit_since_ts);
         restart_wait(&mut state.trade.trade_settlement_waiting_since_ts);
+        restart_wait(&mut state.trade.trade_oracle_hold_since_ts);
         restart_wait(&mut state.withdraw.withdraw_accepted_at_ts);
     }
 
