@@ -11,6 +11,7 @@ use liquidium_pipeline_core::tokens::{
 };
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS};
 use crate::{
@@ -580,6 +581,13 @@ impl IcpswapFinalizer {
                     "ICPSwap route holds {held} after step {}: the next swap is not planned ({error})",
                     route.finished.len() + 1
                 );
+                // One line at the first failure, so the retries that follow are not silent.
+                if route.plan_attempts == 1 {
+                    warn!(
+                        liq_id = %route.identity.liquidation_id,
+                        "[icpswap] {message}; the bot tries again for up to {MAX_ROUTE_PLAN_ATTEMPTS} cycles, then asks an operator"
+                    );
+                }
                 if route.plan_attempts >= MAX_ROUTE_PLAN_ATTEMPTS {
                     route.parked = Some(message.clone());
                     route.next_plan_at_nanos = None;
