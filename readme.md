@@ -333,7 +333,7 @@ Quick reference:
 | `BRIDGE_CKBTC_MINTER_CANISTER` | The ckBTC minter; defaults to `mqygn-kiaaa-aaaar-qaadq-cai`. |
 | `BRIDGE_CKBTC_LEDGER_CANISTER` | The ckBTC ledger the minter burns from; defaults to `mxzaz-hqaaa-aaaar-qaada-cai`. |
 | `RIFT_VENUE_ALLOWLIST`, `RIFT_VENUE_BLOCKLIST` | Comma-separated Rift venue names that may, or never may, route an order. A venue's own confirmation count sets a leg's duration, and Rift does not report it. Measured on 2026-11-10 for ckBTC: the OTC route took 120 minutes to deliver, `near_intents` 16, so `RIFT_VENUE_BLOCKLIST=rift_otc` is the shipped default. |
-| `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. |
+| `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. An order can pass the cap by less than `CEX_MIN_EXEC_USD`: a rest that small is not a leg for any venue, so Rift takes it too. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -929,7 +929,7 @@ A Rift leg takes these steps, each saved before it acts:
 4. The order status until Rift delivers. An underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide. A refunded order parks too; the operator finds the refund transaction and answers `landed <tx>`, which ends the leg as refunded and reports the row failed. The funds sit at the refund address, outside the pipeline.
 5. The ckERC20 bridge brings an Ethereum payout back to ICP as its ck form. A Bitcoin payout goes to the ckBTC minter's address for the final account, so the minter mints ckBTC straight into it once the deposit has four confirmations; the leg only asks the minter until it does. The minter takes its check fee out of the deposit, and the preview takes it off the receive.
 
-Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
+Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. A Rift order has no minimum output: Rift swaps at the market price when the deposit arrives, and the deposit needs the time of the bridge out to get there. The bot holds the quote to the planned floor before it creates the order, and it cannot stop the swap after the funds left. `CEX_DELAY_BUFFER_BPS` is the only room for a price move in that time, and a delivery below the floor is logged as a warning. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
 
 ## Native Simulator
 
