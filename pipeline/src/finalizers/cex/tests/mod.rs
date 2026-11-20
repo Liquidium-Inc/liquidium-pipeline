@@ -39,6 +39,7 @@ mod execution_records;
 mod fill_accounting;
 mod fuzz;
 mod operator_answers;
+mod oracle_bound;
 mod planning;
 mod price_limited_orders;
 mod route_costs;

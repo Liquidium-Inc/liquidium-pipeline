@@ -163,9 +163,15 @@ where
                 Ok((impact, residual))
             })?;
 
-        self.build_slice_preview(&leg.market, "bid", chunk, orderbook.taker_fee_bps, |amount| {
-            simulate_sell_from_bids(bids, amount)
-        })
+        let best_price = bids.first().map_or(0.0, |level| level.price);
+        self.build_slice_preview(
+            &leg.market,
+            "bid",
+            chunk,
+            best_price,
+            orderbook.taker_fee_bps,
+            |amount| simulate_sell_from_bids(bids, amount),
+        )
     }
 
     /// Build one buy-side preview slice (quote -> base), including fallback to hard cap.
@@ -184,9 +190,15 @@ where
                 Ok((impact, residual))
             })?;
 
-        self.build_slice_preview(&leg.market, "ask", chunk, orderbook.taker_fee_bps, |amount| {
-            simulate_buy_from_asks(asks, amount)
-        })
+        let best_price = asks.first().map_or(0.0, |level| level.price);
+        self.build_slice_preview(
+            &leg.market,
+            "ask",
+            chunk,
+            best_price,
+            orderbook.taker_fee_bps,
+            |amount| simulate_buy_from_asks(asks, amount),
+        )
     }
 
     /// Resolve final chunk size when soft-target sizing returns no usable chunk.
@@ -235,6 +247,7 @@ where
         market: &str,
         liquidity_side: &str,
         chunk: f64,
+        best_price: f64,
         taker_fee_bps: f64,
         mut simulate_fill: F,
     ) -> Result<SlicePreview, String>
@@ -252,6 +265,7 @@ where
         Ok(SlicePreview {
             chunk_in: chunk,
             preview_mid_price: avg_price,
+            best_price,
             preview_impact_bps: impact,
             taker_fee_bps,
         })
