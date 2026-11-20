@@ -91,6 +91,8 @@ fn pool(numerator: u64, denominator: u64, impact_bps: f64) -> Pool {
 
 #[derive(Clone)]
 enum StepOutcome {
+    /// The step pays its minimum, not its quote.
+    FillAtMinimum,
     Refund,
     Fail(String),
 }
@@ -218,6 +220,13 @@ impl IcpswapFinalizerLogic for ScriptedWorkflow {
         match outcome {
             Some(StepOutcome::Fail(error)) => return Err(error),
             Some(StepOutcome::Refund) => state.step = IcpswapStep::Refunded,
+            Some(StepOutcome::FillAtMinimum) => {
+                let minimum = state.plan.amount_out_minimum.value.clone();
+                let fees = state.plan.output_ledger_fee.value.clone() * Nat::from(2u8);
+                state.trade.gross_output_amount = Some(minimum.clone());
+                state.settlement.transfer.credited_amount = Some(minimum - fees);
+                state.step = IcpswapStep::Completed;
+            }
             None => {
                 state.trade.gross_output_amount = Some(state.plan.gross_quoted_out.value.clone());
                 state.settlement.transfer.credited_amount = Some(state.plan.net_expected_output().value);
@@ -286,6 +295,24 @@ async fn preview(harness: &Harness, request: &SwapRequest) -> VenueRoutePreview 
         .preview(&planning_context(), request)
         .await
         .expect("preview")
+}
+
+/// Runs one advance of a new leg for the preview.
+async fn advance_once(harness: &Harness, preview: &VenueRoutePreview) -> VenueLegProgress {
+    harness
+        .finalizer
+        .advance(&leg_from(preview), &RecordingCheckpoint::default())
+        .await
+        .expect("advance")
+}
+
+/// Returns the floor of the last step of the planned route.
+fn last_floor(preview: &VenueRoutePreview) -> ChainTokenAmount {
+    route_of(&preview.initial_execution_state)
+        .floors
+        .last()
+        .cloned()
+        .expect("last floor")
 }
 
 fn leg_from(preview: &VenueRoutePreview) -> VenueLegState {
@@ -485,26 +512,48 @@ async fn each_step_trades_what_the_step_before_it_paid() {
 async fn the_last_step_never_accepts_less_than_the_floor() {
     let harness = harness(thin_direct_pools());
     let preview = preview(&harness, &request(&ckbtc(), &ckusdc())).await;
-    let floor = route_of(&preview.initial_execution_state)
-        .floors
-        .last()
-        .cloned()
-        .expect("last floor");
-    // The second pool now quotes 2% less than at planning: inside the 5% floor.
-    harness.workflow.set_pool(&icp(), &ckusdc(), pool(98, 100, 40.0));
+    let floor = last_floor(&preview);
+    // The second pool now quotes 8% less than at planning. The first step paid its quote,
+    // so its unused 5% leaves about 2% for this swap.
+    harness.workflow.set_pool(&icp(), &ckusdc(), pool(92, 100, 40.0));
 
-    let progress = harness
-        .finalizer
-        .advance(&leg_from(&preview), &RecordingCheckpoint::default())
-        .await
-        .expect("advance");
+    let progress = advance_once(&harness, &preview).await;
 
     let route = route_of(&progress.execution);
     let last_plan = &route.current.state.plan;
     assert!(last_plan.amount_out_minimum.value >= floor.value);
-    // 5% was allowed at planning; 2% is used, so about 3% is left for this swap.
     assert!(last_plan.max_slippage_bps < 500);
-    assert!(last_plan.max_slippage_bps >= 290);
+    assert!(last_plan.max_slippage_bps >= 180);
+}
+
+#[tokio::test]
+async fn a_first_step_at_its_minimum_leaves_the_next_step_its_full_slippage() {
+    let harness = harness(thin_direct_pools());
+    let preview = preview(&harness, &request(&ckbtc(), &ckusdc())).await;
+    let floor = last_floor(&preview);
+    harness.workflow.set_outcome(&ckbtc(), StepOutcome::FillAtMinimum);
+
+    let progress = advance_once(&harness, &preview).await;
+
+    assert_eq!(progress.status, VenueLegStatus::Completed);
+    let last_plan = route_of(&progress.execution).current.state.plan;
+    assert!(last_plan.amount_out_minimum.value >= floor.value);
+    assert_eq!(last_plan.max_slippage_bps, 500);
+}
+
+#[tokio::test]
+async fn the_conservative_amount_is_the_least_that_the_whole_route_can_pay() {
+    let harness = harness(thin_direct_pools());
+    let preview = preview(&harness, &request(&ckbtc(), &ckusdc())).await;
+    let route = route_of(&preview.initial_execution_state);
+
+    // Step 1: 999,970 in, minimum 949,971, credit 949,951. Step 2 on that credit:
+    // 949,921 quoted, minimum 902,424. Two output fees leave 902,404.
+    assert_eq!(route.floors[0].value, Nat::from(949_971u64));
+    assert_eq!(route.floors[1].value, Nat::from(902_424u64));
+    assert_eq!(preview.conservative_receive.value, Nat::from(902_404u64));
+    // The expected amount still follows the quotes.
+    assert_eq!(preview.quote.receive_amount, Nat::from(999_900u64));
 }
 
 /// ckBTC -> ICP -> ckUSDC -> ckUSDT: the only good path when ICP -> ckUSDT is weak.
@@ -525,11 +574,7 @@ async fn every_step_has_a_floor_fixed_at_planning() {
     assert_eq!(planned.floors.len(), 3);
     assert_eq!(planned.floors[0], planned.current.state.plan.amount_out_minimum);
 
-    let progress = harness
-        .finalizer
-        .advance(&leg_from(&preview), &RecordingCheckpoint::default())
-        .await
-        .expect("advance");
+    let progress = advance_once(&harness, &preview).await;
 
     assert_eq!(progress.status, VenueLegStatus::Completed);
     let route = route_of(&progress.execution);
@@ -547,11 +592,7 @@ async fn a_middle_step_does_not_run_below_its_floor() {
     // The middle pool now pays 20% less than at planning.
     harness.workflow.set_pool(&icp(), &ckusdc(), pool(8, 10, 40.0));
 
-    let progress = harness
-        .finalizer
-        .advance(&leg_from(&preview), &RecordingCheckpoint::default())
-        .await
-        .expect("advance");
+    let progress = advance_once(&harness, &preview).await;
 
     assert_eq!(progress.status, VenueLegStatus::Running);
     let error = progress.last_error.expect("route error");
@@ -666,11 +707,7 @@ async fn a_first_step_that_refunds_recovers_the_collateral() {
     let preview = preview(&harness, &request(&ckbtc(), &ckusdc())).await;
     harness.workflow.set_outcome(&ckbtc(), StepOutcome::Refund);
 
-    let progress = harness
-        .finalizer
-        .advance(&leg_from(&preview), &RecordingCheckpoint::default())
-        .await
-        .expect("advance");
+    let progress = advance_once(&harness, &preview).await;
 
     assert_eq!(progress.status, VenueLegStatus::Recovered);
 }
@@ -681,11 +718,7 @@ async fn a_later_step_that_refunds_fails_the_leg_and_names_the_held_asset() {
     let preview = preview(&harness, &request(&ckbtc(), &ckusdc())).await;
     harness.workflow.set_outcome(&icp(), StepOutcome::Refund);
 
-    let progress = harness
-        .finalizer
-        .advance(&leg_from(&preview), &RecordingCheckpoint::default())
-        .await
-        .expect("advance");
+    let progress = advance_once(&harness, &preview).await;
 
     assert_eq!(progress.status, VenueLegStatus::FailedPermanent);
     let error = progress.last_error.expect("route error");
@@ -701,11 +734,7 @@ async fn a_step_error_is_retried_like_a_single_execution() {
         .workflow
         .set_outcome(&ckbtc(), StepOutcome::Fail("pool call failed".to_string()));
 
-    let progress = harness
-        .finalizer
-        .advance(&leg_from(&preview), &RecordingCheckpoint::default())
-        .await
-        .expect("advance");
+    let progress = advance_once(&harness, &preview).await;
 
     assert_eq!(progress.status, VenueLegStatus::Running);
     assert_eq!(progress.retryable_error.as_deref(), Some("pool call failed"));

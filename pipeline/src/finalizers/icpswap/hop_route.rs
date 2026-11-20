@@ -2,9 +2,10 @@
 //!
 //! Each step is one normal single-pool execution. The route plans the next
 //! step from the amount the last step really paid. Every step has a floor fixed
-//! at planning, so no step can settle below the committed plan.
+//! at planning, so no step can settle below the committed plan. The floor of a
+//! later step assumes that each step before it paid only its minimum.
 use candid::{Nat, Principal};
-use futures::future::join_all;
+use futures::future::{OptionFuture, join_all};
 use liquidium_pipeline_core::tokens::{
     asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
 };
@@ -234,19 +235,37 @@ pub struct IcpswapRouteLimits {
     pub route_bps: f64,
 }
 
-/// One quoted path: every step with the request it would trade.
+/// One quoted step of a path.
+struct QuotedStep {
+    request: SwapRequest,
+    /// The quote on what the step before is expected to pay.
+    preview: IcpswapRoutePreview,
+    /// The least gross output of this step, when each step before it paid only its minimum.
+    floor: ChainTokenAmount,
+}
+
+impl QuotedStep {
+    /// Returns what the receiver gets when this step pays only its floor.
+    fn least_credit(&self) -> Result<ChainTokenAmount, String> {
+        let net = net_forwarded_output(&self.floor.value, &self.preview.route.output_ledger_fee.value)
+            .map_err(|error| error.to_string())?;
+        Ok(ChainTokenAmount::from_raw(self.floor.token.clone(), net))
+    }
+}
+
+/// One quoted path, with its steps in order.
 struct PathQuote {
     path: Vec<ChainToken>,
-    steps: Vec<(SwapRequest, IcpswapRoutePreview)>,
+    steps: Vec<QuotedStep>,
 }
 
 impl PathQuote {
-    fn last(&self) -> &IcpswapRoutePreview {
-        &self.steps.last().expect("a quoted path has at least one step").1
+    fn last(&self) -> &QuotedStep {
+        self.steps.last().expect("a quoted path has at least one step")
     }
 
     fn net_output(&self) -> &Nat {
-        &self.last().quote.receive_amount
+        &self.last().preview.quote.receive_amount
     }
 
     /// Slippage and pool fees of all steps together, against each pool's spot.
@@ -254,7 +273,7 @@ impl PathQuote {
         let kept: f64 = self
             .steps
             .iter()
-            .map(|(_, preview)| 1.0 - preview.quote.estimated_price_impact_bps / f64::from(BPS_DENOMINATOR))
+            .map(|step| 1.0 - step.preview.quote.estimated_price_impact_bps / f64::from(BPS_DENOMINATOR))
             .product();
         (1.0 - kept) * f64::from(BPS_DENOMINATOR)
     }
@@ -284,13 +303,13 @@ impl PathQuote {
             pay_amount: request.pay_amount.value.clone(),
             receive_asset: request.receive_asset.clone(),
             receive_amount: receive,
-            mid_price: self.steps.iter().map(|(_, preview)| preview.quote.mid_price).product(),
+            mid_price: self.steps.iter().map(|step| step.preview.quote.mid_price).product(),
             exec_price,
             estimated_price_impact_bps: self.cost_bps(),
             legs: self
                 .steps
                 .iter()
-                .flat_map(|(_, preview)| preview.quote.legs.clone())
+                .flat_map(|step| step.preview.quote.legs.clone())
                 .collect(),
         }
     }
@@ -335,6 +354,15 @@ pub(super) fn hold_to_floor(plan: &mut IcpswapExecutionPlan, floor: Option<&Chai
     plan.max_slippage_bps = slippage;
     plan.amount_out_minimum = ChainTokenAmount::from_raw(plan.gross_quoted_out.token.clone(), minimum);
     Ok(())
+}
+
+/// Returns the minimum of `expected`, or that of `least` when it is lower.
+/// `least` is the same step quoted on the least that the step before can pay.
+fn lower_minimum(expected: &IcpswapExecutionPlan, least: Option<IcpswapExecutionPlan>) -> ChainTokenAmount {
+    match least {
+        Some(least) if least.amount_out_minimum.value < expected.amount_out_minimum.value => least.amount_out_minimum,
+        _ => expected.amount_out_minimum.clone(),
+    }
 }
 
 /// Refuses a plan whose slippage cap is wider than the hard maximum.
@@ -389,11 +417,10 @@ impl IcpswapFinalizer {
     }
 
     /// Quotes one path step by step. Each step trades what the step before
-    /// it is expected to pay.
+    /// it is expected to pay, and gets its floor from what that step pays at least.
     async fn quote_path(&self, request: &SwapRequest, ledgers: &[Principal]) -> Result<PathQuote, String> {
         let mut path = vec![request.pay_amount.token.clone()];
-        let mut steps: Vec<(SwapRequest, IcpswapRoutePreview)> = Vec::new();
-        let mut pay_amount = request.pay_amount.clone();
+        let mut steps: Vec<QuotedStep> = Vec::new();
 
         for (index, pair) in ledgers.windows(2).enumerate() {
             let is_last = pays_output(ledgers.len(), index);
@@ -405,18 +432,41 @@ impl IcpswapFinalizer {
                     .map(ChainToken::asset_id)
                     .ok_or_else(|| format!("path through {} has no configured token", pair[1]))?
             };
-            let step_request = self.step_request(request, pay_amount.clone(), receive_asset, is_last);
-            let preview = self
-                .workflow
-                .preview_route(&step_request)
-                .await
-                .map_err(|error| format!("step {} -> {}: {error}", pair[0], pair[1]))?;
-            refuse_wide_slippage(&preview.route)?;
-            pay_amount = preview.route.net_expected_output();
-            path.push(pay_amount.token.clone());
-            steps.push((step_request, preview));
+            let in_step = |error: String| format!("step {} -> {}: {error}", pair[0], pair[1]);
+            // The first step trades the request amount, so it has one quote only.
+            let (expected_pay, least_pay) = match steps.last() {
+                None => (request.pay_amount.clone(), None),
+                Some(before) => (
+                    before.preview.route.net_expected_output(),
+                    Some(before.least_credit().map_err(in_step)?),
+                ),
+            };
+            let step_request = self.step_request(request, expected_pay, receive_asset.clone(), is_last);
+            let least_request = least_pay.map(|pay| self.step_request(request, pay, receive_asset, is_last));
+            let least_quote = OptionFuture::from(least_request.as_ref().map(|least| self.plan_step(least)));
+            let (preview, least_preview) = futures::join!(self.plan_step(&step_request), least_quote);
+            let preview = preview.map_err(in_step)?;
+            let least_plan = least_preview.transpose().map_err(in_step)?.map(|least| least.route);
+            let floor = lower_minimum(&preview.route, least_plan);
+            path.push(floor.token.clone());
+            steps.push(QuotedStep {
+                request: step_request,
+                preview,
+                floor,
+            });
         }
         Ok(PathQuote { path, steps })
+    }
+
+    /// Quotes one pool for one step request.
+    async fn plan_step(&self, step_request: &SwapRequest) -> Result<IcpswapRoutePreview, String> {
+        let preview = self
+            .workflow
+            .preview_route(step_request)
+            .await
+            .map_err(|error| error.to_string())?;
+        refuse_wide_slippage(&preview.route)?;
+        Ok(preview)
     }
 
     /// The request of one step. It keeps the route's receiver, slippage cap and
@@ -449,30 +499,23 @@ impl IcpswapFinalizer {
         request: &SwapRequest,
         best: PathQuote,
     ) -> Result<VenueRoutePreview, String> {
-        let last_plan = &best.last().route;
-        let conservative_value =
-            net_forwarded_output(&last_plan.amount_out_minimum.value, &last_plan.output_ledger_fee.value)
-                .map_err(|error| error.to_string())?;
-        let conservative_receive =
-            ChainTokenAmount::from_raw(last_plan.gross_quoted_out.token.clone(), conservative_value);
-        let floors = best
-            .steps
-            .iter()
-            .map(|(_, preview)| preview.route.amount_out_minimum.clone())
-            .collect();
+        // The planner checks the edge on this amount, so it is the least that the whole route can pay.
+        let conservative_receive = best.last().least_credit()?;
+        let floors = best.steps.iter().map(|step| step.floor.clone()).collect();
         let quote = if best.steps.len() > 1 {
             best.quote(request)
         } else {
-            best.last().quote.clone()
+            best.last().preview.quote.clone()
         };
 
         // The selected preview is persisted before execution, so its generated
         // ID becomes the durable idempotency key used for every later advance.
         let execution_id = crate::utils::new_venue_execution_id(VENUE_ID);
         let is_route = best.steps.len() > 1;
-        let (first_request, first_preview) = best.steps.into_iter().next().expect("a quoted path has a step");
+        let first = best.steps.into_iter().next().expect("a quoted path has a step");
+        let first_request = first.request;
         let state =
-            self.prepare_execution_state(&execution_id, &context.liquidation_id, &first_request, first_preview.route)?;
+            self.prepare_execution_state(&execution_id, &context.liquidation_id, &first_request, first.preview.route)?;
         let leg = if is_route {
             if request.receive_address.is_none() {
                 return Err("ICPSwap request is missing receive_address".to_string());
