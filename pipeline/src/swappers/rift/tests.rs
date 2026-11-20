@@ -197,6 +197,30 @@ fn the_client_needs_a_parsable_base_url() {
     assert!(super::RiftClient::new("https://api.rift.trade/", Some(" ".to_string())).is_ok());
 }
 
+#[test]
+fn the_client_refuses_plain_http_except_to_this_machine() {
+    let key = || Some("secret".to_string());
+    for accepted in [
+        "https://api.rift.trade",
+        "http://127.0.0.1:23010",
+        "http://localhost:23010",
+        "http://[::1]:23010",
+    ] {
+        assert!(super::RiftClient::new(accepted, key()).is_ok(), "{accepted}");
+    }
+    for refused in [
+        "http://api.rift.trade",
+        "http://10.0.0.5:8080",
+        "http://localhost.evil.example",
+        "ftp://api.rift.trade",
+    ] {
+        let error = super::RiftClient::new(refused, key()).err().expect(refused);
+        assert!(error.contains("must use https"), "{refused}: {error}");
+        // The refusal is the same without a key: the payout address is in the request too.
+        assert!(super::RiftClient::new(refused, None).is_err(), "{refused}");
+    }
+}
+
 fn btc_to_usdt(amount_in: &str) -> RiftQuoteRequest {
     RiftQuoteRequest {
         from: RiftAsset::new("bitcoin", "btc"),

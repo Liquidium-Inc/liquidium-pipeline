@@ -328,7 +328,7 @@ Quick reference:
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
 | `CEX_KRAKEN_AVAILABLE_PAIRS` | Kraken's market allowlist. Required when `kraken` is enabled: Kraken never trades outside it, and startup stops if it is empty. |
 | `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops in Kraken's route search; defaults to 2. |
-| `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. |
+| `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. It must use `https`. Plain `http` is accepted for a loopback address only, and any other value stops the startup. |
 | `RIFT_API_KEY` | Optional. Names the integrator to Rift; without it Rift serves one request per second. |
 | `BRIDGE_CKBTC_MINTER_CANISTER` | The ckBTC minter; defaults to `mqygn-kiaaa-aaaar-qaadq-cai`. |
 | `BRIDGE_CKBTC_LEDGER_CANISTER` | The ckBTC ledger the minter burns from; defaults to `mxzaz-hqaaa-aaaar-qaada-cai`. |

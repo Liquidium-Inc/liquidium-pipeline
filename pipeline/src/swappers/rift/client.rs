@@ -1,5 +1,6 @@
 //! The Rift REST client: `POST /quote`, `POST /order`, `GET /order/{id}`.
 //! No key is needed at one request per second; a key names the integrator.
+use std::net::IpAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,7 +26,12 @@ impl RiftClient {
     /// `base_url` without a trailing slash, for example `https://api.rift.trade`.
     pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self, String> {
         let base_url = base_url.trim().trim_end_matches('/').to_string();
-        reqwest::Url::parse(&base_url).map_err(|error| format!("RIFT_API_URL: {error}"))?;
+        let url = reqwest::Url::parse(&base_url).map_err(|error| format!("RIFT_API_URL: {error}"))?;
+        if !keeps_requests_private(&url) {
+            return Err(format!(
+                "RIFT_API_URL `{base_url}` must use https; plain http is accepted for a loopback address only"
+            ));
+        }
         let http = reqwest::Client::builder()
             .timeout(CALL_TIMEOUT)
             .build()
@@ -70,6 +76,21 @@ impl RiftClient {
             retry_after_secs,
             &body.unwrap_or_default(),
         ))
+    }
+}
+
+/// True when a request to the URL cannot be read on the network: HTTPS, or plain HTTP to this machine.
+/// Each request carries the API key and the payout address, so any other URL is refused.
+fn keeps_requests_private(url: &reqwest::Url) -> bool {
+    let loopback = || {
+        let host = url.host_str().unwrap_or_default();
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => loopback(),
+        _ => false,
     }
 }
 
