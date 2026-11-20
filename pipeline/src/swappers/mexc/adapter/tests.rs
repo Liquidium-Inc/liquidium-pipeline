@@ -110,18 +110,23 @@ fn deposit_network_matches_live_mexc_labels() {
 }
 
 #[test]
-fn market_order_admission_rejects_limit_only_books() {
-    for order_types in [serde_json::json!(["LIMIT"]), serde_json::json!([])] {
+fn order_type_admission_needs_limit_and_market_orders() {
+    for (order_types, missing) in [
+        (serde_json::json!(["LIMIT"]), "MARKET"),
+        (serde_json::json!(["MARKET"]), "LIMIT"),
+        (serde_json::json!(["MARKET", "LIMIT_MAKER"]), "LIMIT"),
+        (serde_json::json!([]), "LIMIT"),
+    ] {
         let info = serde_json::json!({"orderTypes": order_types});
-        let error = MexcClient::validate_market_order_support(&info, "ETHUSDC").unwrap_err();
+        let error = MexcClient::validate_order_type_support(&info, "ETHUSDC").unwrap_err();
         assert!(error.contains("ETHUSDC"));
-        assert!(error.contains("does not support MARKET"));
+        assert!(error.contains(&format!("does not support {missing} orders")), "{error}");
     }
     for info in [
-        serde_json::json!({"orderTypes": ["LIMIT", "MARKET"]}),
+        serde_json::json!({"orderTypes": ["LIMIT", "MARKET", "LIMIT_MAKER"]}),
         serde_json::json!({}),
     ] {
-        assert!(MexcClient::validate_market_order_support(&info, "ETHUSDC").is_ok());
+        assert!(MexcClient::validate_order_type_support(&info, "ETHUSDC").is_ok());
     }
 }
 
