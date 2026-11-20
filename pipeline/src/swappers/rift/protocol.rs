@@ -1,7 +1,7 @@
 //! Rift's wire format, read into the connector types. Amounts stay decimal
 //! text; Rift sends them as text in `formatted` mode, and a number is accepted too.
 use liquidium_pipeline_connectors::backend::rift_backend::{
-    RiftAsset, RiftError, RiftOrder, RiftOrderState, RiftOrderStatus, RiftQuote, RiftQuoteRequest,
+    RiftAsset, RiftError, RiftOrder, RiftOrderRequest, RiftOrderState, RiftOrderStatus, RiftQuote, RiftQuoteRequest,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -62,6 +62,20 @@ struct OrderWire {
     amount_in: String,
     deposit_deadline: String,
     status: String,
+    from: String,
+    to: String,
+    to_address: String,
+    #[serde(default)]
+    refund_address: Option<String>,
+}
+
+/// An order as Rift answered it, with the terms that the client checks before it returns the order.
+pub(super) struct AnsweredOrder {
+    order: RiftOrder,
+    from: RiftAsset,
+    to: RiftAsset,
+    to_address: String,
+    refund_address: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -102,15 +116,21 @@ pub(super) fn parse_quote(body: &str) -> Result<RiftQuote, RiftError> {
     })
 }
 
-pub(super) fn parse_order(body: &str) -> Result<RiftOrder, RiftError> {
+pub(super) fn parse_order(body: &str) -> Result<AnsweredOrder, RiftError> {
     let wire: OrderWire = serde_json::from_str(body).map_err(|error| malformed("order", error))?;
-    Ok(RiftOrder {
-        id: wire.id,
-        quote_id: wire.quote_id,
-        deposit_address: wire.deposit_address,
-        amount_in: wire.amount_in,
-        deposit_deadline: wire.deposit_deadline,
-        status: RiftOrderStatus::from_api(&wire.status),
+    Ok(AnsweredOrder {
+        from: asset(&wire.from)?,
+        to: asset(&wire.to)?,
+        to_address: wire.to_address,
+        refund_address: wire.refund_address,
+        order: RiftOrder {
+            id: wire.id,
+            quote_id: wire.quote_id,
+            deposit_address: wire.deposit_address,
+            amount_in: wire.amount_in,
+            deposit_deadline: wire.deposit_deadline,
+            status: RiftOrderStatus::from_api(&wire.status),
+        },
     })
 }
 
@@ -182,15 +202,63 @@ pub(super) fn matched_quote(request: &RiftQuoteRequest, quote: RiftQuote) -> Res
     Ok(quote)
 }
 
-/// Returns the order only if it belongs to our quote and has a deposit address.
-pub(super) fn matched_order(quote_id: &str, order: RiftOrder) -> Result<RiftOrder, RiftError> {
-    if order.quote_id != quote_id || order.deposit_address.trim().is_empty() {
-        return Err(RiftError::Malformed(format!(
-            "Rift order {} answers quote `{}` with deposit address `{}`, but the request was quote {quote_id}",
-            order.id, order.quote_id, order.deposit_address
-        )));
+/// True when two addresses are the same. Hex and bech32 addresses compare without case, for example
+/// `0xAbC` and `0xabc`; any other address must be equal as written.
+fn same_address(left: &str, right: &str) -> bool {
+    let (left, right) = (left.trim(), right.trim());
+    let caseless = |address: &str| {
+        let lower = address.to_ascii_lowercase();
+        lower.starts_with("0x") || lower.starts_with("bc1")
+    };
+    left == right || (caseless(left) && left.eq_ignore_ascii_case(right))
+}
+
+/// Returns the order only if each of its terms is what the bot asked for and no deposit reached it yet.
+/// The bot pays the deposit address of the order, so one wrong term refuses the order.
+pub(super) fn matched_order(request: &RiftOrderRequest, answer: AnsweredOrder) -> Result<RiftOrder, RiftError> {
+    let order = answer.order;
+    let refund_address = answer.refund_address.unwrap_or_default();
+    // One row for each term: true when it is right, and what the order has when it is not.
+    let terms = [
+        (
+            order.quote_id == request.quote_id,
+            format!("quote `{}`, not {}", order.quote_id, request.quote_id),
+        ),
+        (!order.deposit_address.trim().is_empty(), "no deposit address".to_string()),
+        (
+            answer.from == request.from && answer.to == request.to,
+            format!(
+                "the pair {} -> {}, not {} -> {}",
+                answer.from.as_str(),
+                answer.to.as_str(),
+                request.from.as_str(),
+                request.to.as_str()
+            ),
+        ),
+        (
+            same_amount(&order.amount_in, &request.amount_in),
+            format!("the amount {}, not {}", order.amount_in, request.amount_in),
+        ),
+        (
+            same_address(&answer.to_address, &request.to_address),
+            format!("the payout address `{}`, not {}", answer.to_address, request.to_address),
+        ),
+        (
+            same_address(&refund_address, &request.refund_address),
+            format!("the refund address `{refund_address}`, not {}", request.refund_address),
+        ),
+        (
+            order.status == RiftOrderStatus::AwaitingDeposit,
+            format!("the status {}, not awaiting_deposit", order.status.as_api()),
+        ),
+    ];
+    match terms.into_iter().find(|(right, _)| !right) {
+        Some((_, found)) => Err(RiftError::Malformed(format!(
+            "Rift order {} does not match the request: it has {found}",
+            order.id
+        ))),
+        None => Ok(order),
     }
-    Ok(order)
 }
 
 /// Returns the status only if it is for the order that we asked about.

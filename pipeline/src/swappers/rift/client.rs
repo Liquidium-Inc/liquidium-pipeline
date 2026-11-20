@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::rift_backend::{
-    RiftBackend, RiftError, RiftOrder, RiftOrderState, RiftQuote, RiftQuoteRequest,
+    RiftBackend, RiftError, RiftOrder, RiftOrderRequest, RiftOrderState, RiftQuote, RiftQuoteRequest,
 };
 use serde_json::json;
 
@@ -101,20 +101,16 @@ impl RiftBackend for RiftClient {
         matched_quote(request, parse_quote(&answer)?)
     }
 
-    async fn create_order(
-        &self,
-        quote_id: &str,
-        to_address: &str,
-        refund_address: Option<String>,
-    ) -> Result<RiftOrder, RiftError> {
-        let mut body = json!({ "quote_id": quote_id, "to_address": to_address });
-        if let Some(refund_address) = refund_address {
-            body["refund_address"] = json!(refund_address);
-        }
+    async fn create_order(&self, request: &RiftOrderRequest) -> Result<RiftOrder, RiftError> {
+        let body = json!({
+            "quote_id": request.quote_id,
+            "to_address": request.to_address,
+            "refund_address": request.refund_address,
+        });
         let answer = self
             .send(self.request(reqwest::Method::POST, "/order").json(&body))
             .await?;
-        matched_order(quote_id, parse_order(&answer)?)
+        matched_order(request, parse_order(&answer)?)
     }
 
     async fn order_state(&self, order_id: &str) -> Result<RiftOrderState, RiftError> {

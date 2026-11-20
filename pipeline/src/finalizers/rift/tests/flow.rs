@@ -57,7 +57,7 @@ async fn a_leg_pays_the_order_through_the_bridge_and_mints_what_rift_delivered()
         .returning(|request| Ok(quote(&request.amount_in, "99.5")));
     rift.expect_create_order()
         .times(1)
-        .returning(|_, _, _| Ok(order("100")));
+        .returning(|_| Ok(order("100")));
     rift.expect_order_state()
         .times(1)
         .returning(|_| Ok(order_state(RiftOrderStatus::Delivered, Some("99.4"))));
@@ -162,7 +162,7 @@ async fn a_bridge_minimum_before_funding_ends_the_leg_with_its_funds_in_the_trad
     let mut rift = MockRiftBackend::new();
     rift.expect_quote()
         .returning(|request| Ok(quote(&request.amount_in, "99.5")));
-    rift.expect_create_order().returning(|_, _, _| Ok(order("100")));
+    rift.expect_create_order().returning(|_| Ok(order("100")));
     let mut bridge = MockBridgeBackend::new();
     bridge
         .expect_get_fee_budget()
@@ -273,7 +273,7 @@ async fn the_quote_id_is_durable_before_the_order_is_created() {
         .returning(|request| Ok(quote(&request.amount_in, "99.5")));
     rift.expect_create_order()
         .times(1)
-        .returning(|_, _, _| Ok(order("100")));
+        .returning(|_| Ok(order("100")));
     let finalizer = finalizer(rift, free_bridge(), MockOutboundSender::new());
     let context = VenuePlanningContext {
         liquidation_id: "2".to_string(),

@@ -1,6 +1,6 @@
 //! The wire format as Rift sends it, and the typed failures per status.
 use liquidium_pipeline_connectors::backend::rift_backend::{
-    RiftAsset, RiftError, RiftOrderStatus, RiftQuoteRequest, RiftVenueLists,
+    RiftAsset, RiftError, RiftOrderRequest, RiftOrderStatus, RiftQuoteRequest, RiftVenueLists,
 };
 
 use super::client::quote_body;
@@ -91,13 +91,33 @@ fn an_asset_without_a_chain_is_malformed() {
     assert!(matches!(error, RiftError::Malformed(_)), "{error}");
 }
 
+/// An order answer in the shape of Rift's API reference, with the fields that the client ignores.
+const ORDER: &str = r#"{
+  "id": "o1", "quote_id": "q1", "vault_id": "v",
+  "from": "ethereum.usdc", "to": "ethereum.usdt",
+  "amount_in": "100", "amount_out": null, "payout_tx": null, "format": "formatted",
+  "deposit_address": "0xdeposit", "deposit_tx": null,
+  "to_address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72",
+  "refund_address": "0x1111111111111111111111111111111111111111",
+  "status": "awaiting_deposit",
+  "deposit_deadline": "2026-11-16T07:40:36Z", "created_at": "2026-11-09T07:40:36Z"
+}"#;
+
+/// The request that `ORDER` answers.
+fn order_request() -> RiftOrderRequest {
+    RiftOrderRequest {
+        quote_id: "q1".to_string(),
+        from: RiftAsset::new("ethereum", "usdc"),
+        to: RiftAsset::new("ethereum", "usdt"),
+        amount_in: "100".to_string(),
+        to_address: "0x8ba1f109551bd432803012645ac136ddd64dba72".to_string(),
+        refund_address: "0x1111111111111111111111111111111111111111".to_string(),
+    }
+}
+
 #[test]
 fn an_order_carries_its_deposit_address_deadline_and_status() {
-    let order = parse_order(
-        r#"{"id":"o1","quote_id":"q1","vault_id":"v","deposit_address":"0xdeposit",
-            "amount_in":"3699.400709","deposit_deadline":"2026-11-16T07:40:36Z","status":"awaiting_deposit"}"#,
-    )
-    .expect("order");
+    let order = matched_order(&order_request(), parse_order(ORDER).expect("order")).expect("matched");
     assert_eq!((order.id.as_str(), order.quote_id.as_str()), ("o1", "q1"));
     assert_eq!(order.deposit_address, "0xdeposit");
     assert_eq!(order.status, RiftOrderStatus::AwaitingDeposit);
@@ -206,21 +226,66 @@ fn a_quote_for_another_pair_or_amount_is_malformed() {
     ));
 }
 
+/// `ORDER` with one field replaced by the given JSON value.
+fn order_with(field: &str, value: serde_json::Value) -> String {
+    let mut order: serde_json::Value = serde_json::from_str(ORDER).expect("order json");
+    order[field] = value;
+    order.to_string()
+}
+
 #[test]
-fn an_order_from_another_quote_or_with_no_address_is_malformed() {
-    let order = |quote_id: &str, address: &str| {
-        parse_order(&format!(
-            r#"{{"id":"o1","quote_id":"{quote_id}","deposit_address":"{address}","amount_in":"1",
-                "deposit_deadline":"2026-11-16T07:40:36Z","status":"awaiting_deposit"}}"#
-        ))
-        .expect("order")
-    };
-    assert!(matched_order("q1", order("q1", "0xdeposit")).is_ok());
-    assert!(matches!(
-        matched_order("q1", order("q2", "0xdeposit")),
-        Err(RiftError::Malformed(_))
-    ));
-    assert!(matches!(matched_order("q1", order("q1", " ")), Err(RiftError::Malformed(_))));
+fn an_order_with_one_wrong_term_is_malformed_and_names_the_term() {
+    use serde_json::json;
+    let request = order_request();
+    // The payout address differs in case only, so it is the same address.
+    assert!(matched_order(&request, parse_order(ORDER).expect("order")).is_ok());
+
+    for (field, value, named) in [
+        ("quote_id", json!("q2"), "quote"),
+        ("deposit_address", json!(" "), "no deposit address"),
+        ("from", json!("ethereum.dai"), "the pair"),
+        ("to", json!("ethereum.usdc"), "the pair"),
+        ("amount_in", json!("100.01"), "the amount"),
+        ("to_address", json!("0x9999999999999999999999999999999999999999"), "the payout address"),
+        ("refund_address", json!("0x9999999999999999999999999999999999999999"), "the refund address"),
+        ("refund_address", json!(null), "the refund address"),
+        ("status", json!("funded"), "the status"),
+        ("status", json!("expired"), "the status"),
+    ] {
+        let answer = parse_order(&order_with(field, value.clone())).expect("parsed");
+        let error = matched_order(&request, answer).expect_err(field);
+        assert!(
+            matches!(error, RiftError::Malformed(ref text) if text.contains(named)),
+            "{field}={value}: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_order_answer_without_its_terms_is_malformed() {
+    for field in ["from", "to", "to_address"] {
+        let mut order: serde_json::Value = serde_json::from_str(ORDER).expect("order json");
+        order.as_object_mut().expect("object").remove(field);
+        assert!(
+            matches!(parse_order(&order.to_string()), Err(RiftError::Malformed(_))),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn only_hex_and_bech32_addresses_compare_without_case() {
+    let mut request = order_request();
+    // A base58 address is case-sensitive, so another case is another address.
+    request.to_address = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT".to_string();
+    let exact = order_with("to_address", serde_json::json!("1BoatSLRHtKNngkdXEeobR76b53LETtpyT"));
+    assert!(matched_order(&request, parse_order(&exact).expect("order")).is_ok());
+    let other_case = order_with("to_address", serde_json::json!("1boatslrhtknngkdxeeobr76b53lettpyt"));
+    assert!(matched_order(&request, parse_order(&other_case).expect("order")).is_err());
+
+    request.to_address = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string();
+    let upper = order_with("to_address", serde_json::json!("BC1QAR0SRRR7XFKVY5L643LYDNW9RE59GTZZWF5MDQ"));
+    assert!(matched_order(&request, parse_order(&upper).expect("order")).is_ok());
 }
 
 #[test]

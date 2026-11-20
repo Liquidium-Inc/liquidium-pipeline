@@ -1,6 +1,8 @@
 //! The order: a fresh quote checked against the planned floor, saved, then the
 //! order Rift creates from it. The order names the deposit address the bridge pays.
-use liquidium_pipeline_connectors::backend::rift_backend::{RiftAsset, RiftBackend, RiftError, RiftQuoteRequest};
+use liquidium_pipeline_connectors::backend::rift_backend::{
+    RiftAsset, RiftBackend, RiftError, RiftOrderRequest, RiftQuoteRequest,
+};
 use log::info;
 
 use super::{RiftVenueFinalizer, VenueStepError, decimal_text, rift_amount};
@@ -62,11 +64,17 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
 
         let refund_address = self.refund_address(state).await?;
         let to_address = self.delivery_address(state).await?;
-        let order = match self
-            .backend
-            .create_order(&quote_id, &to_address, Some(refund_address.clone()))
-            .await
-        {
+        // The order must have the pair and the amount of the quote, and the two addresses.
+        let RiftQuoteRequest { from, to, amount_in, .. } = self.quote_request(state);
+        let order_request = RiftOrderRequest {
+            quote_id: quote_id.clone(),
+            from,
+            to,
+            amount_in,
+            to_address: to_address.clone(),
+            refund_address: refund_address.clone(),
+        };
+        let order = match self.backend.create_order(&order_request).await {
             Ok(order) => order,
             // Nothing was created. The next cycle takes a new quote.
             Err(RiftError::QuoteExpired(reason)) => {
