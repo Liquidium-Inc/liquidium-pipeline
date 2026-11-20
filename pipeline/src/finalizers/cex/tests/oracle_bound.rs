@@ -1,6 +1,7 @@
 //! DEV-3463: the planner checks a quote against the oracle, but the slices
 //! trade later on a fresh book. Every slice order is held to the oracle too.
 use super::*;
+use crate::finalizers::cex::state::CexTradeSlice;
 use crate::price_oracle::price_oracle::MockPriceOracle;
 use liquidium_pipeline_connectors::backend::cex_backend::{PriceLimit, SwapExecutionOptions};
 
@@ -224,39 +225,99 @@ async fn a_market_order_fill_past_the_bound_stops_the_leg() {
 }
 
 #[tokio::test]
-async fn a_leg_that_beat_the_oracle_leaves_the_next_more_room() {
-    // 2% over the oracle: the planner admitted the route on its end-to-end
-    // value, so the next leg may use the extra 2%.
+async fn a_leg_that_beat_the_oracle_gives_the_next_no_extra_room() {
+    // 2% over the oracle may only be the oracle's mark of the asset in between.
     let (finalizer, _) = finalizer_with_bid(1.02);
     let mut state = trade_state(&finalizer).await;
 
     finalizer.trade(&mut state).await.expect("the leg fills");
 
-    let kept = state.trade.trade_oracle_route_keep.expect("the leg's share is carried");
-    assert!((kept - 1.02 * 0.9995).abs() < 1e-9, "{kept}");
+    assert_eq!(state.trade.trade_oracle_route_keep, Some(1.0));
+}
+
+#[tokio::test]
+async fn a_fill_past_both_limits_parks_before_the_slippage_error() {
+    // 8% under the book and past the oracle bound: the plain slippage error
+    // would let a retry find no input left and advance.
+    let (finalizer, _) = finalizer_with_book(vec![(0.98, 1_000.0)], 0.90);
+    let mut state = trade_state(&finalizer).await;
+
+    let error = finalizer.trade(&mut state).await.expect_err("the fill breached both");
+
+    assert!(matches!(error, CexBackendError::OperatorRequired(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_resumed_order_is_judged_by_the_bound_it_went_out_with() {
+    // The order went out when the oracle allowed 0.96. Its fill at 0.97 is
+    // read back after the oracle rose, when today's bound is 0.975.
+    let (finalizer, orders) = finalizer_with_book(vec![(0.98, 1_000.0)], 0.97);
+    let mut state = trade_state(&finalizer).await;
+    state.trade.trade_pending_client_order_id = Some("liq-42-l1-s1-a".to_string());
+    state.trade.trade_pending_market = Some("CKBTC_BTC".to_string());
+    state.trade.trade_pending_side = Some("sell".to_string());
+    state.trade.trade_pending_oracle_bound = Some(0.96);
+
+    finalizer.trade(&mut state).await.expect("the fill met its own bound");
+
+    assert_eq!(orders.lock().unwrap().len(), 1);
+    assert_eq!(state.trade.trade_pending_oracle_bound, None);
+    assert_eq!(state.trade.trade_leg_index, Some(1));
 }
 
 #[tokio::test]
 async fn a_row_saved_before_the_bound_spends_no_room_twice() {
     let (finalizer, _) = finalizer_with_bid(1.0);
-    let mut state = trade_state(&finalizer).await;
+    let leg = TradeLeg {
+        market: "CKBTC_BTC".to_string(),
+        side: "sell".to_string(),
+    };
 
     // A later leg of an old row: its finished legs spent the whole discount.
-    finalizer.adopt_legacy_oracle_record(&mut state, 1, 0.0);
+    let mut state = trade_state(&finalizer).await;
+    finalizer
+        .adopt_legacy_oracle_record(&mut state, &leg, 1, 0.0)
+        .await
+        .unwrap();
     assert_eq!(state.trade.trade_oracle_route_keep, Some(0.975));
     assert_eq!(state.trade.trade_progress_oracle_out, None);
 
-    // The first leg, part filled before the upgrade: the old fills count at the oracle price.
+    // The first leg, part filled before the upgrade: 5 in for 4.5 out. The
+    // fills are valued from their input, so the leg's loss stays counted.
     let mut state = trade_state(&finalizer).await;
-    finalizer.adopt_legacy_oracle_record(&mut state, 0, 5.0);
+    state.trade.trade_slices.push(CexTradeSlice {
+        leg_index: 0,
+        market: leg.market.clone(),
+        side: leg.side.clone(),
+        amount_in: 5.0,
+        amount_out: 4.5,
+        mid_price: 1.0,
+        exec_price: 0.9,
+        slippage_bps: 1_000.0,
+    });
+    finalizer
+        .adopt_legacy_oracle_record(&mut state, &leg, 0, 4.5)
+        .await
+        .unwrap();
     assert_eq!(state.trade.trade_oracle_route_keep, None);
     assert_eq!(state.trade.trade_progress_oracle_out, Some(5.0));
 
     // A row with its own record keeps it.
     state.trade.trade_oracle_route_keep = Some(0.99);
-    finalizer.adopt_legacy_oracle_record(&mut state, 1, 5.0);
+    finalizer
+        .adopt_legacy_oracle_record(&mut state, &leg, 1, 4.5)
+        .await
+        .unwrap();
     assert_eq!(state.trade.trade_oracle_route_keep, Some(0.99));
     assert_eq!(state.trade.trade_progress_oracle_out, Some(5.0));
+
+    // Output with no recorded input cannot be valued: an operator decides.
+    let mut state = trade_state(&finalizer).await;
+    let error = finalizer
+        .adopt_legacy_oracle_record(&mut state, &leg, 0, 4.5)
+        .await
+        .expect_err("no recorded input");
+    assert!(matches!(error, CexBackendError::OperatorRequired(_)), "{error:?}");
 }
 
 #[tokio::test]
@@ -269,16 +330,25 @@ async fn a_route_the_oracle_cannot_price_is_not_admitted() {
 
     // CKBTC_BTC prices at 1 without the oracle, so it is admitted.
     finalizer
-        .preview_resolved_trade_route(&[leg("CKBTC_BTC")], 1.0)
+        .preview_resolved_trade_route(&[leg("CKBTC_BTC")], 1.0, RouteStage::Admission)
         .await
         .expect("a same-asset market needs no oracle price");
     let error = finalizer
-        .preview_resolved_trade_route(&[leg("CKBTC_BTC"), leg("BTC_USD")], 1.0)
+        .preview_resolved_trade_route(&[leg("CKBTC_BTC"), leg("BTC_USD")], 1.0, RouteStage::Admission)
         .await
         .err()
         .expect("the oracle has no BTC or USD price");
 
     assert!(error.contains("price oracle cannot bound BTC_USD"), "{error}");
+
+    // A leg execution would hold (5% under the oracle) is refused too.
+    let (finalizer, _) = finalizer_with_bid(0.95);
+    let error = finalizer
+        .preview_resolved_trade_route(&[leg("CKBTC_BTC")], 1.0, RouteStage::Admission)
+        .await
+        .err()
+        .expect("past the oracle bound");
+    assert!(error.contains("past its oracle bound"), "{error}");
 }
 
 #[tokio::test]

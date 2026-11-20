@@ -95,6 +95,7 @@ where
         state.trade.trade_pending_market = None;
         state.trade.trade_pending_side = None;
         state.trade.trade_pending_requested_in = None;
+        state.trade.trade_pending_oracle_bound = None;
     }
 
     /// Normalize pending-order WAL fields before processing a leg.
