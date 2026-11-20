@@ -1,4 +1,4 @@
-//! Places and reads orders: the IOC order with its market fallback, the fill
+//! Places and reads orders: the IOC or market order of a slice, the fill
 //! report of a final order, and recovery of a fill by client order id.
 use super::*;
 
@@ -123,63 +123,43 @@ impl MexcClient {
         candidates
     }
 
-    /// Submits the IOC order when there is one, else the market order. A
-    /// definite refusal of the IOC order placed nothing, so the market order
-    /// follows under the same client id.
+    /// Submits the slice's one order. A refused IOC order is an error: no
+    /// market order follows, since it would fill at any price.
     pub(super) async fn submit_order(
         &self,
         ex: &MexcSpotApiClientWithAuthentication,
         candidates: &[String],
         order_side: OrderSide,
-        market_order: Option<MarketOrder>,
-        ioc_order: Option<IocOrder>,
+        order: SliceOrder,
         client_order_id: Option<&str>,
         market: &str,
         side: &str,
     ) -> Result<(String, String), CexBackendError> {
+        let (order_type, quantity, price, quote_order_quantity) = match order {
+            SliceOrder::Ioc(ioc) => (
+                v3::enums::OrderType::ImmediateOrCancel,
+                Some(ioc.quantity),
+                Some(ioc.price),
+                None,
+            ),
+            SliceOrder::Market(market_order) => (
+                v3::enums::OrderType::Market,
+                market_order.quantity,
+                None,
+                market_order.quote_order_quantity,
+            ),
+        };
         let mut last_err: Option<String> = None;
         for candidate in candidates {
-            if let Some(ioc) = ioc_order {
-                let placed = ex
-                    .order(OrderParams {
-                        symbol: candidate,
-                        side: order_side,
-                        order_type: v3::enums::OrderType::ImmediateOrCancel,
-                        quantity: Some(ioc.quantity),
-                        new_client_order_id: client_order_id,
-                        price: Some(ioc.price),
-                        quote_order_quantity: None,
-                    })
-                    .await;
-                match placed {
-                    Ok(ok) => return Self::placed_order(candidate, ok.order_id, market, side),
-                    Err(e) if is_bad_symbol(&e) => {
-                        last_err = Some(format!("Swap err: {}", format_mexc_api_error(&e)));
-                        continue;
-                    }
-                    Err(e) if is_ioc_refusal(&e) && market_order.is_some() => {
-                        warn!(
-                            "[mexc] IOC order refused for {} {} ({}); sending a market order",
-                            candidate,
-                            side,
-                            format_mexc_api_error(&e)
-                        );
-                    }
-                    Err(e) => return Err(Self::order_error(&e)),
-                }
-            }
-            let Some(market_order) = market_order else {
-                return Err("Swap err: no order could be built".to_string().into());
-            };
             match ex
                 .order(OrderParams {
                     symbol: candidate,
                     side: order_side,
-                    order_type: v3::enums::OrderType::Market,
-                    quantity: market_order.quantity,
+                    order_type,
+                    quantity,
                     new_client_order_id: client_order_id,
-                    price: None,
-                    quote_order_quantity: market_order.quote_order_quantity,
+                    price,
+                    quote_order_quantity,
                 })
                 .await
             {

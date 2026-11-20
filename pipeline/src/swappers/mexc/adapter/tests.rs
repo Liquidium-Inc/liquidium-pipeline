@@ -511,11 +511,7 @@ async fn submit(endpoint: String) -> Result<(String, String), CexBackendError> {
             &ex,
             &["ICPUSDT".to_string()],
             OrderSide::Sell,
-            Some(MarketOrder {
-                quantity: Some(Decimal::new(45, 2)),
-                quote_order_quantity: None,
-            }),
-            Some(IocOrder {
+            SliceOrder::Ioc(IocOrder {
                 quantity: Decimal::new(45, 2),
                 price: Decimal::new(2559, 3),
             }),
@@ -526,36 +522,27 @@ async fn submit(endpoint: String) -> Result<(String, String), CexBackendError> {
         .await
 }
 
-/// Audit S3: IOC first; a refused IOC order placed nothing, so a market
-/// order follows under the same client id.
+/// DEV-3462: MEXC refusing the IOC type (30041) must not turn the slice into
+/// a market order, which would fill at any price the book offers.
 #[tokio::test]
-async fn a_refused_ioc_order_falls_back_to_a_market_order() {
+async fn a_refused_ioc_order_type_sends_no_market_order() {
     let refused = r#"{"code":30041,"msg":"current order type can not place order"}"#;
-    let (endpoint, server) = serve(vec![(400, refused), (200, ACCEPTED)]).await;
+    // The server would accept a market order, so only the adapter stops one.
+    let (endpoint, mut server) = serve(vec![(400, refused), (200, ACCEPTED)]).await;
 
-    let placed = tokio::time::timeout(std::time::Duration::from_secs(5), submit(endpoint))
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), submit(endpoint))
         .await
         .unwrap()
-        .expect("the market order is placed");
+        .expect_err("a refused IOC order is an error");
 
-    assert_eq!(placed, ("ICPUSDT".to_string(), "market-1".to_string()));
-    let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 2);
     assert!(
-        requests[0].contains("type=IMMEDIATE_OR_CANCEL") && requests[0].contains("price=2.559"),
-        "{}",
-        requests[0]
+        matches!(&error, CexBackendError::Other(message) if message.contains("CurrentOrderTypeCanNotPlaceOrder")),
+        "{error}"
     );
-    assert!(
-        requests[1].contains("type=MARKET") && !requests[1].contains("price="),
-        "{}",
-        requests[1]
-    );
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.contains("newClientOrderId=lqclient1"))
-    );
+    // The server ends only after a second request, which would be the market order.
+    let second = tokio::time::timeout(std::time::Duration::from_millis(300), &mut server).await;
+    assert!(second.is_err(), "a second order was sent: {second:?}");
+    server.abort();
 }
 
 /// An answer that may hide a placed order never gets a second order.
@@ -573,8 +560,7 @@ async fn an_ambiguous_ioc_error_sends_no_market_order() {
     assert_eq!(server.await.unwrap().len(), 1);
 }
 
-/// Only an unsupported order type sends the market order. Any other refusal
-/// of the IOC order, such as its price, must not become an order without a limit.
+/// A refusal of the IOC price must not become an order without a limit.
 #[tokio::test]
 async fn a_refused_ioc_price_sends_no_market_order() {
     let refused = r#"{"code":30010,"msg":"no valid trade price"}"#;
