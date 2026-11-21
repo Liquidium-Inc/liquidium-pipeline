@@ -53,6 +53,28 @@ fn request(input: &ChainToken, output: &ChainToken) -> SwapRequest {
     }
 }
 
+/// A request that pays `amount` base units.
+fn request_paying(input: &ChainToken, output: &ChainToken, amount: u64) -> SwapRequest {
+    let mut request = request(input, output);
+    request.pay_amount = ChainTokenAmount::from_raw(input.clone(), Nat::from(amount));
+    request
+}
+
+/// A venue over the 500 and 3,000 fee tiers, with 10 as the ledger fee of both tokens.
+fn venue_with_two_tiers(
+    client: MockIcpswapReadClient,
+    input: &ChainToken,
+    output: &ChainToken,
+) -> IcpswapVenue<MockIcpswapReadClient> {
+    IcpswapVenue::new(
+        Arc::new(client),
+        vec![metadata(input.clone()), metadata(output.clone())],
+        vec![Nat::from(500u64), Nat::from(3_000u64)],
+        100,
+    )
+    .expect("venue")
+}
+
 fn pool_data(pool: Principal, token0: Principal, token1: Principal, fee: Nat) -> IcpswapPoolData {
     IcpswapPoolData {
         key: format!("{}_{}_{}", token0, token1, fee),
@@ -265,7 +287,7 @@ async fn reports_every_failure_when_no_pool_is_usable() {
     assert!(matches!(error, IcpswapQuoteError::NoUsablePools { failures } if failures.len() == 2));
 }
 
-/// Liquidation 955: the other tiers have no pool, and the one pool quotes less than its two output fees.
+/// Liquidation 955: the other tier has no pool, and at the pool's price the amount is worth less than the fees.
 #[tokio::test]
 async fn a_pool_quote_below_the_output_fees_is_too_small() {
     let input = chain_token(native_icp_ledger(), "ICP", 10);
@@ -283,21 +305,17 @@ async fn a_pool_quote_below_the_output_fees_is_too_small() {
         }
         Ok(pool_data(principal(6), input_ledger, output_ledger, fee.clone()))
     });
-    // The output fee budget is two fees of 10.
+    // 45 less three input fees leaves 15, worth 15 at the 1:1 price: under the two output fees of 10.
     client.expect_quote().times(1).returning(|_, _| Ok(Nat::from(15u64)));
     client
         .expect_pool_metadata()
         .times(1)
         .returning(move |_| Ok(pool_metadata(input_ledger, output_ledger)));
 
-    let venue = IcpswapVenue::new(
-        Arc::new(client),
-        vec![metadata(input.clone()), metadata(output.clone())],
-        vec![Nat::from(500u64), Nat::from(3_000u64)],
-        100,
-    )
-    .expect("venue");
-    let error = venue.preview_route(&request(&input, &output)).await.unwrap_err();
+    let error = venue_with_two_tiers(client, &input, &output)
+        .preview_route(&request_paying(&input, &output, 45))
+        .await
+        .unwrap_err();
 
     assert!(error.is_below_fees(), "{error}");
     assert!(matches!(error, IcpswapQuoteError::OutputBelowFees { ref failures } if failures.len() == 2));
@@ -331,14 +349,78 @@ async fn a_quote_below_the_fees_is_not_too_small_while_another_pool_fails() {
         Ok(pool_metadata(input_ledger, output_ledger))
     });
 
-    let venue = IcpswapVenue::new(
-        Arc::new(client),
-        vec![metadata(input.clone()), metadata(output.clone())],
-        vec![Nat::from(500u64), Nat::from(3_000u64)],
-        100,
-    )
-    .expect("venue");
-    let error = venue.preview_route(&request(&input, &output)).await.unwrap_err();
+    let error = venue_with_two_tiers(client, &input, &output)
+        .preview_route(&request_paying(&input, &output, 45))
+        .await
+        .unwrap_err();
+
+    assert!(!error.is_below_fees(), "{error}");
+    assert!(matches!(error, IcpswapQuoteError::NoUsablePools { .. }));
+}
+
+/// A lookup that got no answer may hide the deep pool, so it is no proof that the tier has none.
+#[tokio::test]
+async fn a_pool_lookup_without_an_answer_is_not_a_missing_pool() {
+    let input = chain_token(native_icp_ledger(), "ICP", 10);
+    let output = chain_token(principal(2), "OUTPUT", 10);
+    let (input_ledger, output_ledger) = (native_icp_ledger(), principal(2));
+
+    let mut client = MockIcpswapReadClient::new();
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
+    client.expect_get_pool().times(2).returning(move |_, _, fee| {
+        if fee == &Nat::from(3_000u64) {
+            return Err(IcpswapClientError::Transport {
+                canister: principal(9),
+                method: "getPool",
+                message: "timeout".to_string(),
+            });
+        }
+        Ok(pool_data(principal(5), input_ledger, output_ledger, fee.clone()))
+    });
+    client.expect_quote().times(1).returning(|_, _| Ok(Nat::from(15u64)));
+    client
+        .expect_pool_metadata()
+        .times(1)
+        .returning(move |_| Ok(pool_metadata(input_ledger, output_ledger)));
+
+    let error = venue_with_two_tiers(client, &input, &output)
+        .preview_route(&request_paying(&input, &output, 45))
+        .await
+        .unwrap_err();
+
+    assert!(!error.is_below_fees(), "{error}");
+    assert!(matches!(error, IcpswapQuoteError::NoUsablePools { .. }));
+}
+
+/// A drained pool quotes almost nothing for any amount. Its price says the amount is worth more, so it is no minimum.
+#[tokio::test]
+async fn a_drained_pool_is_not_too_small() {
+    let input = chain_token(native_icp_ledger(), "ICP", 10);
+    let output = chain_token(principal(2), "OUTPUT", 10);
+    let (input_ledger, output_ledger) = (native_icp_ledger(), principal(2));
+
+    let mut client = MockIcpswapReadClient::new();
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
+    client.expect_get_pool().times(2).returning(move |_, _, fee| {
+        if fee == &Nat::from(500u64) {
+            return Err(IcpswapClientError::Protocol {
+                method: "getPool",
+                error: IcpswapError::CommonError,
+            });
+        }
+        Ok(pool_data(principal(6), input_ledger, output_ledger, fee.clone()))
+    });
+    // 100,000 at the 1:1 price is worth 99,970 after the input fees, but the pool pays 15.
+    client.expect_quote().times(1).returning(|_, _| Ok(Nat::from(15u64)));
+    client
+        .expect_pool_metadata()
+        .times(1)
+        .returning(move |_| Ok(pool_metadata(input_ledger, output_ledger)));
+
+    let error = venue_with_two_tiers(client, &input, &output)
+        .preview_route(&request(&input, &output))
+        .await
+        .unwrap_err();
 
     assert!(!error.is_below_fees(), "{error}");
     assert!(matches!(error, IcpswapQuoteError::NoUsablePools { .. }));
