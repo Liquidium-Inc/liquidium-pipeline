@@ -197,6 +197,7 @@ mod tests {
             debt_ref_price: Nat::from(0u8),
             ref_price_at: 0,
             debt_approval_needed: false,
+            supply_funded: false,
             min_collateral_amount: Nat::from(0u8),
         };
 
@@ -223,6 +224,7 @@ mod tests {
             }),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         }
     }
 
