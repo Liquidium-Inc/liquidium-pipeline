@@ -830,10 +830,12 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         icpswap_refusal: Option<IcpswapRefusal>,
     ) -> Result<Vec<VenueRoutePreview>, IcpswapFirstPlannerError> {
-        // With no other venue, ICPSwap's own minimum is the answer of every enabled venue.
-        if self.overflow_venue_ids.is_empty()
-            && let Some(IcpswapRefusal::BelowMinimum(reason)) = icpswap_refusal
-        {
+        // With no other venue that carries the pair, ICPSwap's own minimum is the answer of every venue.
+        let no_other_venue = !self
+            .overflow_venue_ids
+            .iter()
+            .any(|venue_id| self.carries(input, venue_id, &input.total_pay.value));
+        if no_other_venue && let Some(IcpswapRefusal::BelowMinimum(reason)) = icpswap_refusal {
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(reason));
         }
         self.ordered_overflow_previews(input, input.total_pay.value.clone())

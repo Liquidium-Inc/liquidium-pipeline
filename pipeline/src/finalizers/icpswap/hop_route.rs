@@ -482,6 +482,10 @@ impl IcpswapFinalizer {
                 floor,
             });
         }
+        // The route's least output must cover the fees of the last step, or the path cannot be planned.
+        if let (Some(last), Some(pair)) = (steps.last(), ledgers.windows(2).last()) {
+            last.least_credit().map_err(|error| in_step(error, pair))?;
+        }
         Ok(PathQuote { path, steps })
     }
 

@@ -858,3 +858,19 @@ async fn an_amount_below_the_fees_on_some_paths_only_is_unavailable() {
 
     assert!(matches!(error, VenueAmountError::Unavailable(_)), "{error}");
 }
+
+/// 104 units pay 54 through ICP, but the least the route pays is 19, under the 20 of output fees.
+/// The route ranks first, so it must drop out on its own for the direct pool to be chosen.
+#[tokio::test]
+async fn a_route_whose_least_output_cannot_pay_the_fees_gives_way_to_another_path() {
+    let harness = harness(thin_direct_pools());
+
+    let preview = harness
+        .finalizer
+        .preview(&planning_context(), &request_paying(&ckbtc(), &ckusdc(), 104))
+        .await
+        .expect("the direct pool can take it");
+
+    let leg = IcpswapLegState::decode(&preview.initial_execution_state).expect("decode leg");
+    assert!(matches!(leg, IcpswapLegState::Single(_)));
+}

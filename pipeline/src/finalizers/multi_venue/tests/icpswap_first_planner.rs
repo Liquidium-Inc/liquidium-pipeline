@@ -412,6 +412,19 @@ fn icpswap_below_fees() -> PlannerAdapter {
     }
 }
 
+/// An exchange that can never carry the pair.
+fn exchange_without_the_pair() -> PlannerAdapter {
+    PlannerAdapter {
+        venue_id: MEXC_VENUE_ID,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        responder: Box::new(|_| Err("a venue that does not carry the pair must not be quoted".into())),
+        validation_error: None,
+        preview_forbidden: true,
+        minimum_pay: None,
+        carries_pair: false,
+    }
+}
+
 // Input construction
 
 #[test]
@@ -2057,6 +2070,39 @@ async fn with_icpswap_alone_its_minimum_is_below_every_venue_minimum() {
         matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)),
         "{error}"
     );
+}
+
+/// Without a price the exchange minimum cannot be checked, so the exchanges themselves decide. None carries the pair here.
+#[tokio::test]
+async fn dust_that_no_other_venue_carries_is_below_every_venue_minimum() {
+    let planner = planner(icpswap_below_fees(), exchange_without_the_pair(), config(8.0));
+    let mut input = input_with_pay_token(native_icp());
+    input.pay_reference_price_usd = None;
+
+    let error = planner.plan(&input, QUOTED_AT).await.expect_err("no venue can take it");
+
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)),
+        "{error}"
+    );
+}
+
+/// An ICPSwap outage is no minimum, so the row still waits when no other venue carries the pair.
+#[tokio::test]
+async fn an_icpswap_outage_waits_when_no_other_venue_carries_the_pair() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_| {
+        Err("temporary pool outage".to_string())
+    });
+    let planner = planner(icpswap, exchange_without_the_pair(), config(8.0));
+    let mut input = input_with_pay_token(native_icp());
+    input.pay_reference_price_usd = None;
+
+    let error = planner
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("nothing can take it now");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)), "{error}");
 }
 
 #[tokio::test]
