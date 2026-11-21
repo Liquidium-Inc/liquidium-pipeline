@@ -55,9 +55,35 @@ pub struct ExecutionReceipt {
 }
 
 impl ExecutionReceipt {
+    /// Returns the receipt of a liquidation that the canister answered.
+    /// The normal call and the recovery of an interrupted call both use it, so their rows are the same.
+    pub fn from_result(request: ExecutorRequest, liquidation: LiquidationResult) -> Self {
+        let status = match (&liquidation.status, &liquidation.collateral_tx.status) {
+            (LiquidationStatus::FailedLiquidation(error), _) => ExecutionStatus::FailedLiquidation(error.clone()),
+            (_, TransferStatus::Success) => ExecutionStatus::Success,
+            (_, TransferStatus::Pending) => ExecutionStatus::CollateralTransferFailed("collateral pending".to_string()),
+            (_, TransferStatus::Failed(error)) => ExecutionStatus::CollateralTransferFailed(error.clone()),
+        };
+        // A failed liquidation keeps the default, as before. No retry reads this flag.
+        let change_received = matches!(status, ExecutionStatus::FailedLiquidation(_))
+            || matches!(liquidation.change_tx.status, TransferStatus::Success);
+        Self {
+            request,
+            liquidation_result: Some(liquidation),
+            status,
+            change_received,
+        }
+    }
+
     /// Takes the pool's current view of the liquidation. A collateral transfer
     /// that has landed clears its earlier failure. Returns whether anything changed.
-    pub fn apply_pool_view(&mut self, fresh: LiquidationResult) -> bool {
+    pub fn apply_pool_view(&mut self, mut fresh: LiquidationResult) -> bool {
+        // For a share payout, the pool reports the seized value. The receipt keeps the amount that the withdraw paid.
+        if let Some(current) = &self.liquidation_result
+            && current.collateral_share_receiver.is_some()
+        {
+            fresh.amounts.collateral_received = current.amounts.collateral_received.clone();
+        }
         let collateral_landed = matches!(fresh.collateral_tx.status, TransferStatus::Success);
         let change_received = matches!(fresh.change_tx.status, TransferStatus::Success);
         let mut changed = false;
@@ -153,31 +179,22 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     }
                 };
 
-                receipt.liquidation_result = Some(liq.clone());
-                if let LiquidationStatus::FailedLiquidation(err) = &liq.status {
+                // A missing change must not stop the receipt: the WAL is the only handoff of the
+                // collateral to the finalizer. The batch end reports the unpaid change (audit L04).
+                let receipt = ExecutionReceipt::from_result(executor_request.clone(), liq.clone());
+                if let ExecutionStatus::FailedLiquidation(err) = &receipt.status {
                     warn!(
                         "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | {summary} | err={err}",
                         liq.id
                     );
-                    receipt.status = ExecutionStatus::FailedLiquidation(err.clone());
-                    return self.save_failed(&intent_id, Some(liq.id.to_string()), receipt, err).await;
+                    let err = err.clone();
+                    return self.save_failed(&intent_id, Some(liq.id.to_string()), receipt, &err).await;
                 }
-
-                // A missing change must not stop the receipt: the WAL is the only handoff of the
-                // collateral to the finalizer. The batch end reports the unpaid change (audit L04).
-                receipt.change_received = matches!(liq.change_tx.status, TransferStatus::Success);
-
-                let collateral_error = match &liq.collateral_tx.status {
-                    TransferStatus::Success => None,
-                    TransferStatus::Pending => Some("collateral pending".to_string()),
-                    TransferStatus::Failed(err) => Some(err.clone()),
-                };
-                if let Some(error) = collateral_error {
+                if matches!(receipt.status, ExecutionStatus::CollateralTransferFailed(_)) {
                     info!(
                         "[executor] 🧱 collateral_tx status={:?} liq_id={}",
                         liq.collateral_tx.status, liq.id
                     );
-                    receipt.status = ExecutionStatus::CollateralTransferFailed(error);
                 }
 
                 debug!("Executed liquidation {:?}", liq);
@@ -348,6 +365,7 @@ mod tests {
                 debt_amount: Nat::from(11_244u64),
                 receiver_address: p("2vxsx-fae"),
                 buy_bad_debt: false,
+                collateral_as_shares: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: debt_asset.asset_id(),
@@ -390,7 +408,66 @@ mod tests {
                 status: TransferStatus::Success,
             },
             id,
+            collateral_share_receiver: None,
         }
+    }
+
+    /// The finalizer reads the pool again while the change is pending.
+    /// For a share payout, the swap must still use the amount that the withdraw paid.
+    #[test]
+    fn a_pool_view_does_not_undo_the_withdrawn_amount_of_a_share_payout() {
+        let token = ChainToken::Icp {
+            ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+            symbol: "ICP".to_string(),
+            decimals: 8,
+            fee: Nat::from(10_000u64),
+        };
+        let mut seized = make_liquidation_result(7);
+        seized.amounts.collateral_received = Nat::from(100_000u64);
+        seized.collateral_share_receiver = Some(p("2vxsx-fae"));
+        seized.change_tx.status = TransferStatus::Pending;
+
+        let mut arrived = seized.clone();
+        arrived.amounts.collateral_received = Nat::from(99_980u64);
+        let mut receipt = ExecutionReceipt {
+            request: make_request(p("2vxsx-fae"), token),
+            liquidation_result: Some(arrived),
+            status: ExecutionStatus::Success,
+            change_received: false,
+        };
+
+        let mut fresh = seized.clone();
+        fresh.change_tx.status = TransferStatus::Success;
+        assert!(receipt.apply_pool_view(fresh), "the change landed");
+
+        let liquidation = receipt.liquidation_result.unwrap();
+        assert_eq!(liquidation.amounts.collateral_received, Nat::from(99_980u64));
+        assert_eq!(liquidation.change_tx.status, TransferStatus::Success);
+        assert!(receipt.change_received);
+    }
+
+    /// A token payout keeps the old rule: the pool's view replaces the saved result.
+    #[test]
+    fn a_pool_view_replaces_the_result_of_a_token_payout() {
+        let token = ChainToken::Icp {
+            ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+            symbol: "ICP".to_string(),
+            decimals: 8,
+            fee: Nat::from(10_000u64),
+        };
+        let mut receipt = ExecutionReceipt {
+            request: make_request(p("2vxsx-fae"), token),
+            liquidation_result: Some(make_liquidation_result(7)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let mut fresh = make_liquidation_result(7);
+        fresh.amounts.collateral_received = Nat::from(5u8);
+        receipt.apply_pool_view(fresh);
+        assert_eq!(
+            receipt.liquidation_result.unwrap().amounts.collateral_received,
+            Nat::from(5u8)
+        );
     }
 
     fn inflow_record() -> LiquidationInflowRecord {

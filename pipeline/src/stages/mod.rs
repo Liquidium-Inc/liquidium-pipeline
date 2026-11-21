@@ -4,4 +4,6 @@ pub mod export;
 pub mod finalize;
 pub mod opportunity;
 pub mod settlement_watcher;
+#[path = "share_withdraw/share_withdraw_watcher.rs"]
+pub mod share_withdraw_watcher;
 pub mod simple_strategy;

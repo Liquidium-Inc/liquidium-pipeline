@@ -1,4 +1,5 @@
 use candid::{Nat, Principal};
+use liquidium_pipeline_connectors::backend::ledger_history_backend::IndexLedgerHistory;
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
     collections::{HashMap, HashSet},
@@ -37,6 +38,10 @@ use crate::{
     },
     operator::OperatorDesk,
     liquidation::collateral_service::CollateralService,
+    liquidation::intent_recovery::IntentRecovery,
+    liquidation::share_payout_policy::LiquidityPayoutPolicy,
+    liquidation::share_position_adapter::{LendingSharePositions, SharePositions},
+    stages::share_withdraw_watcher::ShareWithdrawWatcher,
     persistance::{
         FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,
         WalStore, sqlite::SqliteWalStore,
@@ -187,6 +192,16 @@ async fn park_unresumable_row(db: &SqliteWalStore, row_id: &str, reason: String)
     db.update_failure(row_id, ResultStatus::Unresumable, reason, false)
         .await
         .map_err(|error| format!("failed to mark unfinished WAL row {row_id} unresumable: {error}"))
+}
+
+/// Returns the canister calls for supply shares. The liquidator identity signs them.
+fn share_positions(ctx: &PipelineContext) -> Arc<dyn SharePositions> {
+    Arc::new(LendingSharePositions::new(
+        ctx.agent.clone(),
+        Arc::new(IndexLedgerHistory::new(ctx.agent.clone())),
+        ctx.config.lending_canister,
+        ctx.config.liquidator_principal,
+    ))
 }
 
 #[instrument(name = "liquidation.init", skip_all, err)]
@@ -366,6 +381,15 @@ async fn init(
     )
     .with_watchdog(wd)
     .with_venue_native_symbols(venue_native_symbols);
+    // The switch decides only new liquidations. The bot withdraws rows that already hold shares, also when the switch is off.
+    let strategy = if config.share_payout_enabled {
+        strategy.with_share_payout(Arc::new(LiquidityPayoutPolicy::new(
+            share_positions(&ctx),
+            config.share_payout_liquidity_margin_bps,
+        )))
+    } else {
+        strategy
+    };
 
     let exporter = Arc::new(ExportStage {
         path: config.export_path.clone(),
@@ -502,6 +526,19 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     let debt_asset_principals = debt_asset_principals(&ctx.registry);
     let debt_assets = debt_assets_as_text(&debt_asset_principals);
 
+    if config.share_payout_enabled {
+        info!(
+            share_payout = true,
+            liquidity_margin_bps = config.share_payout_liquidity_margin_bps,
+            "Share payout enabled: a liquidation takes the collateral as supply shares when the pool cannot pay tokens"
+        );
+    } else {
+        warn!(
+            share_payout = false,
+            "Share payout disabled by SHARE_PAYOUT_ENABLED=false: a pool without liquidity gets a smaller or failed liquidation"
+        );
+    }
+
     info!(
         network = %config.ic_url,
         liquidator_principal = %config.liquidator_principal.to_text(),
@@ -570,10 +607,39 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         ))
     });
 
+    let share_withdrawals = Arc::new({
+        let watcher = ShareWithdrawWatcher::new(
+            wal.clone(),
+            share_positions(&ctx),
+            config.trader_principal,
+            config.liquidator_principal,
+        );
+        match slack_watchdog.clone() {
+            Some(watchdog) => watcher.with_watchdog(watchdog),
+            None => watcher,
+        }
+    });
+
+    let intent_recovery = Arc::new({
+        let recovery = IntentRecovery::new(
+            ctx.agent.clone(),
+            wal.clone(),
+            Arc::new(IndexLedgerHistory::new(ctx.agent.clone())),
+            config.lending_canister,
+            config.liquidator_principal,
+        );
+        match slack_watchdog.clone() {
+            Some(watchdog) => recovery.with_watchdog(watchdog),
+            None => recovery,
+        }
+    });
+
     let _execution_worker = match spawn_execution_worker(
         finalizer,
         wal,
         settlement,
+        share_withdrawals,
+        intent_recovery,
         exporter,
         config.enabled_swap_venues.clone(),
         config.icpswap_mnemonic.clone(),
@@ -770,6 +836,7 @@ mod tests {
                     debt_amount: Nat::from(100_000u64),
                     receiver_address: Principal::from_slice(&[4]),
                     buy_bad_debt: false,
+                    collateral_as_shares: None,
                 },
                 swap_args: Some(request),
                 debt_asset: output,

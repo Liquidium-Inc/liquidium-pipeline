@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::stages::executor::ExecutionReceipt;
 
-use super::{FinalizerMetaV2, MultiVenueAllocationSnapshot};
+use super::{FinalizerMetaV2, MultiVenueAllocationSnapshot, ShareHolding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
@@ -24,6 +24,9 @@ pub enum ResultStatus {
     /// The committed route cannot be reconstructed with the current binary or
     /// configuration. The row is visible to operators but never auto-polled.
     Unresumable = 8,
+    /// The liquidation paid the collateral as supply shares.
+    /// Only the share withdraw step works on the row.
+    HeldAsShares = 9,
 }
 
 impl From<i32> for ResultStatus {
@@ -40,6 +43,7 @@ impl From<i32> for ResultStatus {
             6 => ResultStatus::WaitingProfit,
             7 => ResultStatus::OperatorRequired,
             8 => ResultStatus::Unresumable,
+            9 => ResultStatus::HeldAsShares,
             _ => ResultStatus::FailedPermanent,
         }
     }
@@ -57,6 +61,9 @@ pub struct LiqMetaWrapper {
     pub venue_execution: Option<VenueExecutionState>,
     #[serde(default)]
     pub meta_v2: Option<FinalizerMetaV2>,
+    /// The state of a share payout. It is `None` for a token payout.
+    #[serde(default)]
+    pub share_holding: Option<ShareHolding>,
 }
 
 impl LiqMetaWrapper {
@@ -69,6 +76,7 @@ impl LiqMetaWrapper {
             profit_snapshot: None,
             venue_execution: None,
             meta_v2: None,
+            share_holding: None,
         }
     }
 }

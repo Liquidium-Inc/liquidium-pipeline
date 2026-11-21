@@ -141,6 +141,7 @@ pub(super) struct WalCounts {
     pub(super) waiting_profit: i64,
     pub(super) operator_required: i64,
     pub(super) unresumable: i64,
+    pub(super) held_as_shares: i64,
     pub(super) total: i64,
 }
 
@@ -156,6 +157,7 @@ impl WalCounts {
         out.waiting_profit = *map.get(&ResultStatus::WaitingProfit).unwrap_or(&0);
         out.operator_required = *map.get(&ResultStatus::OperatorRequired).unwrap_or(&0);
         out.unresumable = *map.get(&ResultStatus::Unresumable).unwrap_or(&0);
+        out.held_as_shares = *map.get(&ResultStatus::HeldAsShares).unwrap_or(&0);
         out.total = out.enqueued
             + out.inflight
             + out.succeeded
@@ -164,7 +166,8 @@ impl WalCounts {
             + out.waiting_collateral
             + out.waiting_profit
             + out.operator_required
-            + out.unresumable;
+            + out.unresumable
+            + out.held_as_shares;
         out
     }
 }

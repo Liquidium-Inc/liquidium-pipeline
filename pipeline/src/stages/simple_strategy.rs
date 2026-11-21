@@ -6,13 +6,14 @@ use std::{
 use crate::config::ConfigTrait;
 use crate::constants::repay_buffer_native_units;
 use crate::executors::executor::ExecutorRequest;
+use crate::liquidation::share_payout_policy::SharePayoutPolicy;
 
 use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::liquidation::settlement_speed::{SettlementSpeed, debt_return_speed, pair_speeds};
 use crate::stage::PipelineStage;
 
-use candid::{Int, Nat};
+use candid::{Int, Nat, Principal};
 use futures::TryFutureExt;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
@@ -116,6 +117,8 @@ where
     /// ICP assets that an enabled exchange lists itself. Empty makes every venue leg slow, but
     /// coverage and same-asset pairs still shape the ranking.
     venue_native_symbols: Vec<String>,
+    /// Decides when a liquidation takes the collateral as supply shares. `None` keeps every payout in tokens.
+    share_payout: Option<Arc<dyn SharePayoutPolicy>>,
 }
 
 impl<C, R, U> SimpleLiquidationStrategy<C, R, U>
@@ -139,7 +142,14 @@ where
             approval_state,
             watchdog: noop_watchdog(),
             venue_native_symbols: Vec::new(),
+            share_payout: None,
         }
+    }
+
+    /// Turns on the share payout for pools that cannot pay the seized collateral.
+    pub fn with_share_payout(mut self, policy: Arc<dyn SharePayoutPolicy>) -> Self {
+        self.share_payout = Some(policy);
+        self
     }
 
     pub fn with_watchdog(mut self, wd: Arc<dyn Watchdog>) -> Self {
@@ -151,6 +161,19 @@ where
     pub fn with_venue_native_symbols(mut self, symbols: Vec<String>) -> Self {
         self.venue_native_symbols = symbols;
         self
+    }
+
+    /// True when the collateral pool cannot pay `seized` as tokens. The request then asks for supply shares.
+    async fn needs_share_payout(&self, pool: Principal, token: &ChainToken, seized: &Nat) -> bool {
+        let Some(policy) = &self.share_payout else {
+            return false;
+        };
+        if *seized == 0u8 || !policy.wants_shares(pool, seized.clone()).await {
+            return false;
+        }
+        let amount = ChainTokenAmount::from_raw(token.clone(), seized.clone());
+        info!("🧾 Share payout: pool {pool} cannot pay {} now", amount.formatted());
+        true
     }
 
     fn debt_approval_needed(&self, token: &ChainToken) -> bool {
@@ -450,11 +473,14 @@ where
             let max_balance = available_balance.clone() - debt_fee_total.clone();
 
             // We buy as much bad debt as we can, capped by wallet balance and position size.
-            let repay_amount = if max_balance.clone() < debt_position.debt_amount {
-                max_balance
-            } else {
-                debt_position.debt_amount.clone()
-            };
+            let expected_repaid = debt_position.debt_amount.clone().min(max_balance.clone());
+            // The offer adds a buffer, because interest increases the debt between the scan and the call.
+            // The canister returns the unused part as change.
+            let repay_buffer = Nat::from(repay_buffer_native_units(
+                &repayment_token.symbol(),
+                repayment_token.decimals(),
+            ));
+            let repay_amount = (debt_position.debt_amount.clone() + repay_buffer).min(max_balance);
 
             if repay_amount == 0u64 {
                 continue;
@@ -463,12 +489,12 @@ where
             // No collateral to seize, so amount_received is zero and profit is strictly negative.
             let amount_received: Nat = Nat::from(0u64);
             let profit = Int::from(amount_received.clone())
-                - Int::from(repay_amount.clone())
+                - Int::from(expected_repaid.clone())
                 - Int::from(debt_fee_total.clone());
 
             info!(
                 "🧯 Bad debt buy: repay={} {} | profit={} {}",
-                Self::native_to_units(&repay_amount, repayment_token.decimals()),
+                Self::native_to_units(&expected_repaid, repayment_token.decimals()),
                 repayment_token.symbol(),
                 Self::signed_native_to_units(&profit, repayment_token.decimals()),
                 repayment_token.symbol()
@@ -502,6 +528,7 @@ where
                     // No swap follows, so the main account that paid gets it back directly (audit L03).
                     receiver_address: self.config.get_liquidator_principal(),
                     buy_bad_debt: true,
+                    collateral_as_shares: None,
                 },
                 ref_price: 0u32.into(),
                 debt_ref_price: 0u32.into(),
@@ -761,10 +788,11 @@ where
             // debt.
             let expected_repaid_debt = estimation.repaid_debt.clone();
 
-            // Add only explicitly configured repay buffers; unspecified assets get no bump.
-            let repay_buffer = repay_buffer_native_units(&repayment_token.symbol())
-                .map(Nat::from)
-                .unwrap_or_else(|| Nat::from(0u8));
+            // Every asset gets a buffer, because the canister rounds the debt up.
+            let repay_buffer = Nat::from(repay_buffer_native_units(
+                &repayment_token.symbol(),
+                repayment_token.decimals(),
+            ));
             // Target = full debt plus the buffer, but never more than what we can actually spend.
             let desired_repay = (debt_position.debt_amount.clone() + repay_buffer).min(max_balance.clone());
             // Only bump up the repay amount; never reduce what the estimator already chose.
@@ -842,7 +870,7 @@ where
 
             let min_collateral_amount = if buy_bad_debt {
                 Self::min_collateral_for_bad_debt(
-                    gross_estimated_collateral,
+                    gross_estimated_collateral.clone(),
                     self.config.get_bad_debt_collateral_slippage_bps(),
                 )
             } else {
@@ -880,9 +908,18 @@ where
                 continue;
             }
 
-            // Swaps run from the trader account. Without a swap the collateral goes
-            // straight back to the main account that paid the debt (audit L03).
-            let collateral_receiver = if swap_args.is_some() {
+            let as_shares = self
+                .needs_share_payout(
+                    collateral_position.pool_id,
+                    &collateral_token,
+                    &gross_estimated_collateral,
+                )
+                .await;
+
+            // The trader account receives collateral for a swap (audit L03).
+            // A share payout goes to the main account, because the canister pays shares only to the caller.
+            let pays_trader = swap_args.is_some() && !as_shares;
+            let collateral_receiver = if pays_trader {
                 self.config.get_trader_principal()
             } else {
                 self.config.get_liquidator_principal()
@@ -897,6 +934,7 @@ where
                     debt_amount: estimation.repaid_debt.clone(),
                     receiver_address: collateral_receiver,
                     buy_bad_debt,
+                    collateral_as_shares: as_shares.then_some(true),
                 },
                 ref_price: estimation.ref_price,
                 debt_ref_price: estimation.debt_price,
@@ -943,6 +981,7 @@ mod tests {
     use crate::approval_state::ApprovalState;
     use crate::config::MockConfigTrait;
     use crate::liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait};
+    use crate::liquidation::share_payout_policy::MockSharePayoutPolicy;
     use candid::{Nat, Principal};
     use liquidium_pipeline_core::account::actions::MockAccountInfo;
     use liquidium_pipeline_core::tokens::token_registry::MockTokenRegistryTrait;
@@ -1351,6 +1390,161 @@ mod tests {
             p("aaaaa-aa"),
             "a swap runs from the trader account"
         );
+    }
+
+    fn never_asked_policy() -> MockSharePayoutPolicy {
+        let mut policy = MockSharePayoutPolicy::new();
+        policy.expect_wants_shares().times(0);
+        policy
+    }
+
+    /// A ckUSDC debt with ICP collateral, which needs a swap. The trader and the liquidator are different accounts.
+    fn swap_case() -> (
+        SimpleLiquidationStrategy<MockConfigTrait, MockTokenRegistryTrait, MockCollateralServiceTrait>,
+        LiquidatebleUser,
+    ) {
+        let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let icp_pool = p("en2mt-fyaaa-aaaae-qkefq-cai");
+        let ckusdc_token = ChainToken::Icp {
+            ledger: ckusdc_ledger,
+            symbol: "ckUSDC".to_string(),
+            decimals: 6,
+            fee: Nat::from(10_000u64),
+        };
+        let icp_token = ChainToken::Icp {
+            ledger: p(ICP_LEDGER_PRINCIPAL),
+            symbol: "ICP".to_string(),
+            decimals: 8,
+            fee: Nat::from(10_000u64),
+        };
+
+        let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
+        registry.expect_get().returning(move |id: &AssetId| {
+            if id.address == ckusdc_ledger.to_text() {
+                Some(ckusdc_token.clone())
+            } else if id.address == ICP_LEDGER_PRINCIPAL {
+                Some(icp_token.clone())
+            } else {
+                None
+            }
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        cfg.expect_get_trader_principal().return_const(p("aaaaa-aa"));
+        cfg.expect_get_liquidator_principal().return_const(p("2vxsx-fae"));
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(200_000_000u64),
+                    repaid_debt: Nat::from(1_000_000u64),
+                    ref_price: Nat::from(10_000_000_000_000_000_000_000_000_000u128),
+                    debt_price: Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(|token: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: token.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(|token: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: token.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), Arc::new(account)));
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry,
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let borrower = p("aaaaa-aa");
+        let debt_pos = mk_position(
+            p("rw6tq-vyaaa-aaaae-qjx5a-cai"),
+            borrower,
+            ckusdc_ledger,
+            1_000_000,
+            0,
+            Assets::USDC,
+        );
+        let collateral_pos = mk_unknown_native_icp_position(icp_pool, borrower, 0, 200_000_000);
+        (strategy, mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900))
+    }
+
+    /// The canister pays shares only to the caller. Thus the request names the main account, not the trader account.
+    #[tokio::test]
+    async fn a_share_payout_request_names_the_caller_as_receiver() {
+        let (strategy, user) = swap_case();
+        let mut policy = MockSharePayoutPolicy::new();
+        policy
+            .expect_wants_shares()
+            .times(1)
+            .returning(|pool, expected_seized| {
+                assert_eq!(pool, p("en2mt-fyaaa-aaaae-qkefq-cai"));
+                // The seized amount before the ledger fee.
+                assert_eq!(expected_seized, Nat::from(200_000_000u64));
+                true
+            });
+
+        let res = strategy
+            .with_share_payout(Arc::new(policy))
+            .process(&vec![user])
+            .await
+            .unwrap();
+
+        assert_eq!(res.len(), 1);
+        let req = &res[0];
+        assert_eq!(req.liquidation.collateral_as_shares, Some(true));
+        assert_eq!(
+            req.liquidation.receiver_address,
+            p("2vxsx-fae"),
+            "the liquidator signs the call"
+        );
+        // The swap runs after the withdraw.
+        assert!(req.swap_args.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pool_that_can_pay_keeps_the_token_payout_to_the_trader() {
+        let (strategy, user) = swap_case();
+        let mut policy = MockSharePayoutPolicy::new();
+        policy.expect_wants_shares().times(1).returning(|_, _| false);
+
+        let res = strategy
+            .with_share_payout(Arc::new(policy))
+            .process(&vec![user])
+            .await
+            .unwrap();
+
+        assert_eq!(res[0].liquidation.collateral_as_shares, None);
+        assert_eq!(res[0].liquidation.receiver_address, p("aaaaa-aa"));
+    }
+
+    #[tokio::test]
+    async fn without_the_feature_no_request_asks_for_shares() {
+        let (strategy, user) = swap_case();
+        let res = strategy.process(&vec![user]).await.unwrap();
+        assert_eq!(res[0].liquidation.collateral_as_shares, None);
+        assert_eq!(res[0].liquidation.receiver_address, p("aaaaa-aa"));
     }
 
     // HF at or above 1000: no liquidation attempts.
@@ -1955,7 +2149,8 @@ mod tests {
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
-        );
+        )
+        .with_share_payout(Arc::new(never_asked_policy()));
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let borrower = p("user-pure-bad-debt");
@@ -1966,6 +2161,12 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert!(res[0].liquidation.buy_bad_debt);
         assert_eq!(res[0].min_collateral_amount, Nat::from(0u8));
+        // A purchase of bad debt seizes nothing. Thus it never asks for shares.
+        assert_eq!(res[0].liquidation.collateral_as_shares, None);
+        // The offer is the debt plus the ckUSDC buffer. An offer of exactly the debt can be 1 unit short.
+        assert_eq!(res[0].liquidation.debt_amount, Nat::from(2_000u64));
+        // The expected loss is the debt plus two ledger fees. The buffer is not in it, because it comes back as change.
+        assert_eq!(res[0].expected_profit, -1_200);
     }
 
     // Balance budgeting across multiple combos uses one wallet and skips when funds fall below fee threshold.

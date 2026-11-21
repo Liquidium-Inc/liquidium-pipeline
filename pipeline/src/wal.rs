@@ -181,6 +181,7 @@ mod tests {
                 debt_amount: Nat::from(1_000u64),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
+                collateral_as_shares: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: collateral.asset_id(),
@@ -220,6 +221,7 @@ mod tests {
                     tx_id: None,
                     status: TransferStatus::Success,
                 },
+                collateral_share_receiver: None,
             }),
             status: ExecutionStatus::Success,
             change_received: true,
@@ -358,6 +360,7 @@ mod tests {
             profit_snapshot: None,
             venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
             meta_v2: None,
+            share_holding: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
         let encoded: serde_json::Value = serde_json::from_str(&row.meta_json).expect("encoded wrapper json");

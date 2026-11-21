@@ -3,7 +3,7 @@ use std::{
     panic::AssertUnwindSafe,
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{FutureExt, StreamExt, stream};
@@ -17,6 +17,7 @@ use crate::{
         liquidation_outcome::LiquidationOutcome, multi_venue::MultiVenueFinalizer,
         profit_calculator::SimpleProfitCalculator,
     },
+    liquidation::intent_recovery::IntentRecovery,
     persistance::sqlite::SqliteWalStore,
     stage::PipelineStage,
     stages::{
@@ -24,6 +25,7 @@ use crate::{
         export::ExportStage,
         finalize::FinalizeStage,
         settlement_watcher::SettlementWatcher,
+        share_withdraw_watcher::ShareWithdrawWatcher,
     },
     watchdog::{Watchdog, WatchdogEvent},
 };
@@ -31,6 +33,10 @@ use crate::{
 const EXECUTION_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const EXECUTION_WORKER_PANIC_DELAY: Duration = Duration::from_secs(1);
 const SETTLEMENT_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
+const SHARE_WITHDRAW_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
+const INTENT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// The pause between two tries to recover interrupted liquidation calls. The first try runs at start.
+const INTENT_RECOVERY_INTERVAL: Duration = Duration::from_secs(3_600);
 const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const LIQUIDATION_NOTIFY_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,6 +44,8 @@ const LIQUIDATION_NOTIFY_CONCURRENCY: usize = 4;
 
 pub(crate) type RuntimeFinalizer = FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>;
 pub(crate) type RuntimeSettlementWatcher = SettlementWatcher<Agent, SqliteWalStore>;
+pub(crate) type RuntimeShareWithdrawWatcher = ShareWithdrawWatcher<SqliteWalStore>;
+pub(crate) type RuntimeIntentRecovery = IntentRecovery<Agent, SqliteWalStore>;
 
 /// Starts venue execution on a dedicated OS thread with its own Tokio runtime.
 ///
@@ -48,6 +56,8 @@ pub(crate) fn spawn_execution_worker(
     finalizer: Arc<RuntimeFinalizer>,
     wal: Arc<SqliteWalStore>,
     settlement: Arc<RuntimeSettlementWatcher>,
+    share_withdrawals: Arc<RuntimeShareWithdrawWatcher>,
+    intent_recovery: Arc<RuntimeIntentRecovery>,
     exporter: Arc<ExportStage>,
     enabled_venues: Vec<String>,
     icpswap_mnemonic: Arc<str>,
@@ -61,6 +71,8 @@ pub(crate) fn spawn_execution_worker(
             finalizer,
             wal,
             settlement,
+            share_withdrawals,
+            intent_recovery,
             exporter,
             enabled_venues,
             icpswap_mnemonic,
@@ -91,6 +103,8 @@ async fn run_execution_worker(
     finalizer: Arc<RuntimeFinalizer>,
     wal: Arc<SqliteWalStore>,
     settlement: Arc<RuntimeSettlementWatcher>,
+    share_withdrawals: Arc<RuntimeShareWithdrawWatcher>,
+    intent_recovery: Arc<RuntimeIntentRecovery>,
     exporter: Arc<ExportStage>,
     enabled_venues: Vec<String>,
     icpswap_mnemonic: Arc<str>,
@@ -113,10 +127,18 @@ async fn run_execution_worker(
         }
     }
 
+    let mut next_intent_recovery = Instant::now();
     loop {
+        // A recovered row is ready before the steps below run, so they take it in the same cycle.
+        if Instant::now() >= next_intent_recovery {
+            next_intent_recovery = Instant::now() + INTENT_RECOVERY_INTERVAL;
+            recover_interrupted_liquidations(intent_recovery.as_ref()).await;
+        }
+
         let cycle = run_execution_cycle(
             finalizer.as_ref(),
             settlement.as_ref(),
+            share_withdrawals.as_ref(),
             exporter.as_ref(),
             slack_watchdog.as_ref(),
             ui_enabled,
@@ -132,9 +154,25 @@ async fn run_execution_worker(
     }
 }
 
+/// Looks for the results of liquidation calls whose answer the bot did not get. A failure only logs.
+async fn recover_interrupted_liquidations(recovery: &RuntimeIntentRecovery) {
+    match timeout(INTENT_RECOVERY_TIMEOUT, recovery.resolve_ambiguous()).await {
+        Ok(Ok(summary)) if summary.recovered + summary.failed + summary.open != 0 => info!(
+            recovered = summary.recovered,
+            failed = summary.failed,
+            open = summary.open,
+            "Interrupted liquidation calls checked"
+        ),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!("Recovery of interrupted liquidation calls failed: {error}"),
+        Err(_) => warn!("Recovery of interrupted liquidation calls timed out"),
+    }
+}
+
 async fn run_execution_cycle(
     finalizer: &RuntimeFinalizer,
     settlement: &RuntimeSettlementWatcher,
+    share_withdrawals: &RuntimeShareWithdrawWatcher,
     exporter: &ExportStage,
     slack_watchdog: Option<&Arc<dyn Watchdog>>,
     ui_enabled: bool,
@@ -145,6 +183,16 @@ async fn run_execution_cycle(
         Err(_) => error!(
             timeout_ms = SETTLEMENT_STAGE_TIMEOUT.as_millis() as u64,
             "Execution worker settlement sweep timed out"
+        ),
+    }
+
+    // This step runs before the finalizer. Thus a row whose tokens arrived can swap in the same cycle.
+    match timeout(SHARE_WITHDRAW_STAGE_TIMEOUT, share_withdrawals.tick()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("Execution worker share withdraw step failed: {error}"),
+        Err(_) => error!(
+            timeout_ms = SHARE_WITHDRAW_STAGE_TIMEOUT.as_millis() as u64,
+            "Execution worker share withdraw step timed out"
         ),
     }
 
@@ -196,6 +244,16 @@ async fn run_execution_cycle(
     }
 }
 
+/// Returns `shares` when the liquidation paid the collateral as supply shares that the bot withdrew later, else `tokens`.
+fn collateral_payout(outcome: &LiquidationOutcome) -> &'static str {
+    let as_shares = outcome
+        .execution_receipt
+        .liquidation_result
+        .as_ref()
+        .is_some_and(|liquidation| liquidation.collateral_share_receiver.is_some());
+    if as_shares { "shares" } else { "tokens" }
+}
+
 /// Structured per-outcome logs consumed by journald/OTEL and auditor tooling.
 fn log_execution_results(results: &[LiquidationOutcome]) {
     let success_count = results
@@ -233,6 +291,7 @@ fn log_execution_results(results: &[LiquidationOutcome]) {
             collateral_asset = %result.request.collateral_asset.symbol(),
             debt_repaid = %result.formatted_debt_repaid(),
             collateral_received = %result.formatted_received_collateral(),
+            collateral_payout = collateral_payout(result),
             swap_output = %result.formatted_swap_output(),
             swapper = %result.formatted_swapper(),
             swap_status = %swap_status,
@@ -385,6 +444,7 @@ mod tests {
                 debt_amount: Nat::from(100_000u64),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
+                collateral_as_shares: None,
             },
             swap_args: with_swap.then(|| SwapRequest {
                 pay_asset: token.asset_id(),
@@ -431,6 +491,7 @@ mod tests {
                     status: collateral_status,
                 },
                 id,
+                collateral_share_receiver: None,
             }),
             status,
             change_received: true,

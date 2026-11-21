@@ -14,6 +14,10 @@ pub struct LiquidationRequest {
     pub debt_amount: Nat,              // Amount of debt to repay
     pub receiver_address: Principal,   // Account that receives collateral and change
     pub buy_bad_debt: bool,
+    /// `Some(true)` asks for the seized collateral as supply shares, with the caller as receiver.
+    /// An older canister ignores the flag and pays tokens.
+    #[serde(default)]
+    pub collateral_as_shares: Option<bool>,
 }
 
 pub trait Asset {
@@ -88,6 +92,59 @@ pub struct LiquidationResult {
     pub change_tx: TxStatus,
     pub collateral_tx: TxStatus,
     pub id: u128, // The liquidation id
+    /// The lending profile that holds the seized collateral as shares. It is `None` when the canister paid tokens.
+    #[serde(default)]
+    pub collateral_share_receiver: Option<Principal>,
+}
+
+/// The destination of a lending `withdraw`. The bot uses only the `Native` kind of the canister.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum WithdrawDestination {
+    Native(Principal),
+}
+
+/// Identifies the signer of a lending request as the caller of the call.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct IcpCallerAuth {
+    pub principal: Principal,
+    pub subaccount: Option<Vec<u8>>,
+}
+
+/// The signature kinds of a lending request that the bot uses.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum LendingSignature {
+    IcpCaller(IcpCallerAuth),
+}
+
+/// A lending `withdraw` request. An `amount` of 0 withdraws the whole position.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LendingWithdrawRequest {
+    pub expiry_timestamp: u64, // Seconds since Unix epoch, at most 300 s ahead
+    pub account: WithdrawDestination,
+    pub pool_id: Principal,
+    pub amount: Nat,
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SignedLendingWithdraw {
+    pub data: LendingWithdrawRequest,
+    pub signature_info: LendingSignature,
+}
+
+/// The part of the canister's `OutflowDetails` that the bot reads.
+/// `id` is also the memo of the ledger transfer that pays the withdraw.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LendingOutflow {
+    pub id: String,
+    pub amount: Nat,
+}
+
+/// The part of the canister's `PositionView` that the bot reads.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LendingPositionView {
+    pub deposited_native_now: Nat,
+    /// The supply shares. Interest does not change this number.
+    pub deposit_scaled: Nat,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -100,12 +157,15 @@ pub enum TransferStatus {
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum SignatureVerificationError {
     InvalidEthSignature,
+    IcpCallerMismatch,
     UnsupportedChain,
     InvalidSolSignature,
     InvalidEthAddress,
+    AnonymousIcpCaller,
     CouldNotDecode(String),
     ProfileNotFound,
     InvalidBtcSignature,
+    InvalidIcpSubaccount,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -127,15 +187,16 @@ pub enum ProtocolError {
     HealthFactorTooLow,
     NoLiquidity,
     SignatureExpired,
-    PoolNotfound(String),
+    PoolNotFound(String),
     BorrowingDisabled,
+    SameAssetBorrowingDisabled,
     BorrowCapExceeded,
     PoolFrozen,
     TransferFailed(String),
     AccountAlreadyLinked,
     CannotRemoveSoleAccount,
     InsufficientFunds,
-    LiquidationNotfound(String),
+    LiquidationNotFound(String),
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -198,4 +259,92 @@ pub struct LiquidatebleUser {
     pub weighted_liquidation_threshold: Nat,  // Weighted liquidation threshold (bps)
     pub positions: Vec<LiquidateblePosition>, // The user's positions
     pub total_debt: Nat,                      // Users total debt in $
+}
+
+#[cfg(test)]
+mod share_payout_tests {
+    use super::*;
+    use candid::{Decode, Encode};
+
+    /// The request of an older bot, without the share flag.
+    #[derive(CandidType, Deserialize)]
+    struct OldLiquidationRequest {
+        borrower: Principal,
+        debt_pool_id: Principal,
+        collateral_pool_id: Principal,
+        debt_amount: Nat,
+        receiver_address: Principal,
+        buy_bad_debt: bool,
+    }
+
+    /// The result of an older canister, without the share receiver.
+    #[derive(CandidType, Deserialize)]
+    struct OldLiquidationResult {
+        amounts: LiquidationAmounts,
+        collateral_asset: AssetType,
+        debt_asset: AssetType,
+        status: LiquidationStatus,
+        timestamp: u64,
+        change_tx: TxStatus,
+        collateral_tx: TxStatus,
+        id: u128,
+    }
+
+    fn request(collateral_as_shares: Option<bool>) -> LiquidationRequest {
+        LiquidationRequest {
+            borrower: Principal::anonymous(),
+            debt_pool_id: Principal::anonymous(),
+            collateral_pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(7u8),
+            receiver_address: Principal::anonymous(),
+            buy_bad_debt: false,
+            collateral_as_shares,
+        }
+    }
+
+    fn tx(status: TransferStatus) -> TxStatus {
+        TxStatus { tx_id: None, status }
+    }
+
+    #[test]
+    fn an_older_canister_reads_a_request_with_the_share_flag() {
+        let bytes = Encode!(&request(Some(true))).unwrap();
+        let old = Decode!(&bytes, OldLiquidationRequest).unwrap();
+        assert_eq!(old.debt_amount, Nat::from(7u8));
+    }
+
+    #[test]
+    fn a_request_from_an_older_bot_reads_as_no_share_payout() {
+        let old = OldLiquidationRequest {
+            borrower: Principal::anonymous(),
+            debt_pool_id: Principal::anonymous(),
+            collateral_pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(7u8),
+            receiver_address: Principal::anonymous(),
+            buy_bad_debt: false,
+        };
+        let bytes = Encode!(&old).unwrap();
+        assert_eq!(Decode!(&bytes, LiquidationRequest).unwrap().collateral_as_shares, None);
+    }
+
+    #[test]
+    fn a_result_of_an_older_canister_reads_as_a_token_payout() {
+        let old = OldLiquidationResult {
+            amounts: LiquidationAmounts {
+                collateral_received: Nat::from(5u8),
+                debt_repaid: Nat::from(4u8),
+            },
+            collateral_asset: AssetType::Unknown,
+            debt_asset: AssetType::Unknown,
+            status: LiquidationStatus::Success,
+            timestamp: 1,
+            change_tx: tx(TransferStatus::Success),
+            collateral_tx: tx(TransferStatus::Success),
+            id: 9,
+        };
+        let bytes = Encode!(&old).unwrap();
+        let result = Decode!(&bytes, LiquidationResult).unwrap();
+        assert_eq!(result.collateral_share_receiver, None);
+        assert_eq!(result.id, 9);
+    }
 }
