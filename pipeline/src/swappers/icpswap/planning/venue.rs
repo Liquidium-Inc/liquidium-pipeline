@@ -25,8 +25,8 @@ use super::{
     session::IcpswapExecutionSession,
     state::validate_execution_state,
     types::{
-        IcpswapExecutionPlan, IcpswapPoolData, IcpswapPoolMetadata, IcpswapQuoteError, IcpswapRoutePreview,
-        IcpswapState, IcpswapSwapArgs, IcpswapToken, IcpswapTokenMetadata,
+        IcpswapExecutionPlan, IcpswapPlanError, IcpswapPoolData, IcpswapPoolMetadata, IcpswapQuoteError,
+        IcpswapRoutePreview, IcpswapState, IcpswapSwapArgs, IcpswapToken, IcpswapTokenMetadata,
     },
 };
 
@@ -50,6 +50,30 @@ struct IcpswapQuoteContext {
     output_fee: Nat,
     amount_in: ChainTokenAmount,
     max_slippage_bps: u32,
+}
+
+/// Why one fee tier gave no candidate.
+enum PoolFailure {
+    /// The tier has no pool, or the pool lookup failed.
+    NoPool(String),
+    /// The pool quoted the amount, but the output does not cover the output ledger fees.
+    BelowFees(String),
+    /// The pool exists, but its quote or metadata could not be used.
+    Other(String),
+}
+
+impl From<String> for PoolFailure {
+    fn from(text: String) -> Self {
+        Self::Other(text)
+    }
+}
+
+impl PoolFailure {
+    fn into_text(self) -> String {
+        match self {
+            Self::NoPool(text) | Self::BelowFees(text) | Self::Other(text) => text,
+        }
+    }
 }
 
 struct IcpswapQuoteCandidate {
@@ -267,7 +291,17 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             }
         }
         if candidates.is_empty() {
-            return Err(IcpswapQuoteError::NoUsablePools { failures });
+            // Too small only when a pool quoted below the fees, and no pool that exists failed for another reason.
+            let below_fees = failures
+                .iter()
+                .any(|failure| matches!(failure, PoolFailure::BelowFees(_)))
+                && !failures.iter().any(|failure| matches!(failure, PoolFailure::Other(_)));
+            let failures = failures.into_iter().map(PoolFailure::into_text).collect();
+            return Err(if below_fees {
+                IcpswapQuoteError::OutputBelowFees { failures }
+            } else {
+                IcpswapQuoteError::NoUsablePools { failures }
+            });
         }
         candidates.sort_by(|left, right| {
             right
@@ -287,12 +321,12 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
         &self,
         context: &IcpswapQuoteContext,
         fee_tier: Nat,
-    ) -> Result<IcpswapQuoteCandidate, String> {
+    ) -> Result<IcpswapQuoteCandidate, PoolFailure> {
         let pool = self
             .client
             .get_pool(&context.input_descriptor, &context.output_descriptor, &fee_tier)
             .await
-            .map_err(|error| format!("fee {fee_tier}: {error}"))?;
+            .map_err(|error| PoolFailure::NoPool(format!("fee {fee_tier}: {error}")))?;
 
         validate_pool_fee(&pool, &fee_tier)?;
 
@@ -328,7 +362,13 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             ChainTokenAmount::from_raw(context.output_token.clone(), context.output_fee.clone()),
             context.max_slippage_bps,
         )
-        .map_err(|error| format!("pool {}: {error}", pool.canister_id))?;
+        .map_err(|error| {
+            let text = format!("pool {}: {error}", pool.canister_id);
+            match error {
+                IcpswapPlanError::OutputFeeExceedsQuote { .. } => PoolFailure::BelowFees(text),
+                _ => PoolFailure::Other(text),
+            }
+        })?;
 
         Ok(IcpswapQuoteCandidate {
             plan,

@@ -374,4 +374,20 @@ pub enum IcpswapQuoteError {
     Plan(#[from] IcpswapPlanError),
     #[error("no usable ICPSwap pool quote: {failures:?}")]
     NoUsablePools { failures: Vec<String> },
+    /// A pool quoted the amount, but its output does not cover the output ledger fees.
+    #[error("ICPSwap output does not cover its ledger fees: {failures:?}")]
+    OutputBelowFees { failures: Vec<String> },
+}
+
+impl IcpswapQuoteError {
+    /// True when the amount is too small for ICPSwap's ledger fees, on the input or on the output side.
+    /// The same amount fails again, so a caller can treat it as below the venue minimum.
+    pub fn is_below_fees(&self) -> bool {
+        matches!(
+            self,
+            Self::InputFeesExceedBudget { .. }
+                | Self::OutputBelowFees { .. }
+                | Self::Plan(IcpswapPlanError::OutputFeeExceedsQuote { .. })
+        )
+    }
 }

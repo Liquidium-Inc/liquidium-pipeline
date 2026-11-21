@@ -255,10 +255,20 @@ struct QuotedStep {
 
 impl QuotedStep {
     /// Returns what the receiver gets when this step pays only its floor.
-    fn least_credit(&self) -> Result<ChainTokenAmount, String> {
+    /// Fails with `BelowMinimum` when the floor does not cover the two output ledger fees.
+    fn least_credit(&self) -> Result<ChainTokenAmount, VenueAmountError> {
         let net = net_forwarded_output(&self.floor.value, &self.preview.route.output_ledger_fee.value)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| VenueAmountError::BelowMinimum(error.to_string()))?;
         Ok(ChainTokenAmount::from_raw(self.floor.token.clone(), net))
+    }
+}
+
+/// The same refusal, with the step that refused named in its text.
+fn in_step(error: VenueAmountError, pair: &[Principal]) -> VenueAmountError {
+    let name = |text: String| format!("step {} -> {}: {text}", pair[0], pair[1]);
+    match error {
+        VenueAmountError::BelowMinimum(text) => VenueAmountError::BelowMinimum(name(text)),
+        VenueAmountError::Unavailable(text) => VenueAmountError::Unavailable(name(text)),
     }
 }
 
@@ -420,14 +430,22 @@ impl IcpswapFinalizer {
                 .then_with(|| right.net_output().cmp(left.net_output()))
         });
         let Some(best) = quotes.into_iter().next() else {
-            return Err(format!("no usable ICPSwap path: {}", failures.join("; ")).into());
+            let text = failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+            // Too small only when every listed path pays less than its fees somewhere.
+            let below_fees = |failure: &VenueAmountError| matches!(failure, VenueAmountError::BelowMinimum(_));
+            if !failures.is_empty() && failures.iter().all(below_fees) {
+                return Err(VenueAmountError::BelowMinimum(format!(
+                    "every ICPSwap path pays less than its ledger fees: {text}"
+                )));
+            }
+            return Err(VenueAmountError::Unavailable(format!("no usable ICPSwap path: {text}")));
         };
         self.preview_for(context, request, best)
     }
 
     /// Quotes one path step by step. Each step trades what the step before
     /// it is expected to pay, and gets its floor from what that step pays at least.
-    async fn quote_path(&self, request: &SwapRequest, ledgers: &[Principal]) -> Result<PathQuote, String> {
+    async fn quote_path(&self, request: &SwapRequest, ledgers: &[Principal]) -> Result<PathQuote, VenueAmountError> {
         let mut path = vec![request.pay_amount.token.clone()];
         let mut steps: Vec<QuotedStep> = Vec::new();
 
@@ -441,7 +459,7 @@ impl IcpswapFinalizer {
                     .map(ChainToken::asset_id)
                     .ok_or_else(|| format!("path through {} has no configured token", pair[1]))?
             };
-            let in_step = |error: String| format!("step {} -> {}: {error}", pair[0], pair[1]);
+            let in_step = |error: VenueAmountError| in_step(error, pair);
             // The first step trades the request amount, so it has one quote only.
             let (expected_pay, least_pay) = match steps.last() {
                 None => (request.pay_amount.clone(), None),
@@ -468,12 +486,15 @@ impl IcpswapFinalizer {
     }
 
     /// Quotes one pool for one step request.
-    async fn plan_step(&self, step_request: &SwapRequest) -> Result<IcpswapRoutePreview, String> {
-        let preview = self
-            .workflow
-            .preview_route(step_request)
-            .await
-            .map_err(|error| error.to_string())?;
+    /// Fails with `BelowMinimum` when the step pays less than its ledger fees.
+    async fn plan_step(&self, step_request: &SwapRequest) -> Result<IcpswapRoutePreview, VenueAmountError> {
+        let preview = self.workflow.preview_route(step_request).await.map_err(|error| {
+            if error.is_below_fees() {
+                VenueAmountError::BelowMinimum(error.to_string())
+            } else {
+                VenueAmountError::Unavailable(error.to_string())
+            }
+        })?;
         refuse_wide_slippage(&preview.route)?;
         Ok(preview)
     }

@@ -23,7 +23,7 @@ use super::{
     },
 };
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueLegProgress, VenueRoutePreview},
+    finalizers::multi_venue::{MultiVenueAdapter, VenueAmountError, VenueLegProgress, VenueRoutePreview},
     outbound::driver::OperatorDecision,
     persistance::{VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::{
@@ -288,6 +288,13 @@ fn request(pay: &ChainToken, receive: &ChainToken) -> SwapRequest {
         max_slippage_bps: Some(500),
         venue_hint: Some(VENUE_ID.to_string()),
     }
+}
+
+/// A request that pays `pay` base units.
+fn request_paying(pay: &ChainToken, receive: &ChainToken, amount: u64) -> SwapRequest {
+    let mut request = request(pay, receive);
+    request.pay_amount = ChainTokenAmount::from_raw(pay.clone(), Nat::from(amount));
+    request
 }
 
 async fn preview(harness: &Harness, request: &SwapRequest) -> VenueRoutePreview {
@@ -818,4 +825,36 @@ fn the_slippage_left_for_the_last_swap_keeps_its_minimum_at_the_floor() {
     // Rounding goes down, so the minimum stays at or above the floor.
     assert_eq!(slippage_within_floor(&nat(1_000), &nat(999), 500), Some(10));
     assert_eq!(slippage_within_floor(&nat(3), &nat(2), 500), Some(500));
+}
+
+/// 45 units leave 15 after the three input fees, and every first step quotes 15 or less: under the 20 of output fees.
+#[tokio::test]
+async fn an_amount_below_the_fees_on_every_path_is_too_small() {
+    let harness = harness(thin_direct_pools());
+
+    let error = harness
+        .finalizer
+        .preview(&planning_context(), &request_paying(&ckbtc(), &ckusdc(), 45))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, VenueAmountError::BelowMinimum(ref text) if text.contains("ledger fees")),
+        "{error}"
+    );
+}
+
+/// A path with no pool is not a fee problem, so the amount is not called too small.
+#[tokio::test]
+async fn an_amount_below_the_fees_on_some_paths_only_is_unavailable() {
+    // ckBTC -> ckUSDC has no scripted pool, so the paths through ckUSDC fail for another reason.
+    let harness = harness(three_step_pools());
+
+    let error = harness
+        .finalizer
+        .preview(&planning_context(), &request_paying(&ckbtc(), &ckusdt(), 45))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, VenueAmountError::Unavailable(_)), "{error}");
 }

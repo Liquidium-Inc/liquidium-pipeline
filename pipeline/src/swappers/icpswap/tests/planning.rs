@@ -265,6 +265,85 @@ async fn reports_every_failure_when_no_pool_is_usable() {
     assert!(matches!(error, IcpswapQuoteError::NoUsablePools { failures } if failures.len() == 2));
 }
 
+/// Liquidation 955: the other tiers have no pool, and the one pool quotes less than its two output fees.
+#[tokio::test]
+async fn a_pool_quote_below_the_output_fees_is_too_small() {
+    let input = chain_token(native_icp_ledger(), "ICP", 10);
+    let output = chain_token(principal(2), "OUTPUT", 10);
+    let (input_ledger, output_ledger) = (native_icp_ledger(), principal(2));
+
+    let mut client = MockIcpswapReadClient::new();
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
+    client.expect_get_pool().times(2).returning(move |_, _, fee| {
+        if fee == &Nat::from(500u64) {
+            return Err(IcpswapClientError::Protocol {
+                method: "getPool",
+                error: IcpswapError::CommonError,
+            });
+        }
+        Ok(pool_data(principal(6), input_ledger, output_ledger, fee.clone()))
+    });
+    // The output fee budget is two fees of 10.
+    client.expect_quote().times(1).returning(|_, _| Ok(Nat::from(15u64)));
+    client
+        .expect_pool_metadata()
+        .times(1)
+        .returning(move |_| Ok(pool_metadata(input_ledger, output_ledger)));
+
+    let venue = IcpswapVenue::new(
+        Arc::new(client),
+        vec![metadata(input.clone()), metadata(output.clone())],
+        vec![Nat::from(500u64), Nat::from(3_000u64)],
+        100,
+    )
+    .expect("venue");
+    let error = venue.preview_route(&request(&input, &output)).await.unwrap_err();
+
+    assert!(error.is_below_fees(), "{error}");
+    assert!(matches!(error, IcpswapQuoteError::OutputBelowFees { ref failures } if failures.len() == 2));
+}
+
+/// A pool that exists and fails says nothing about the amount, so the quote is not called too small.
+#[tokio::test]
+async fn a_quote_below_the_fees_is_not_too_small_while_another_pool_fails() {
+    let input = chain_token(native_icp_ledger(), "ICP", 10);
+    let output = chain_token(principal(2), "OUTPUT", 10);
+    let (input_ledger, output_ledger) = (native_icp_ledger(), principal(2));
+
+    let mut client = MockIcpswapReadClient::new();
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
+    client.expect_get_pool().times(2).returning(move |_, _, fee| {
+        let pool = if fee == &Nat::from(500u64) {
+            principal(5)
+        } else {
+            principal(6)
+        };
+        Ok(pool_data(pool, input_ledger, output_ledger, fee.clone()))
+    });
+    client.expect_quote().times(2).returning(|_, _| Ok(Nat::from(15u64)));
+    client.expect_pool_metadata().times(2).returning(move |pool| {
+        if pool == principal(5) {
+            return Err(IcpswapClientError::Protocol {
+                method: "metadata",
+                error: IcpswapError::CommonError,
+            });
+        }
+        Ok(pool_metadata(input_ledger, output_ledger))
+    });
+
+    let venue = IcpswapVenue::new(
+        Arc::new(client),
+        vec![metadata(input.clone()), metadata(output.clone())],
+        vec![Nat::from(500u64), Nat::from(3_000u64)],
+        100,
+    )
+    .expect("venue");
+    let error = venue.preview_route(&request(&input, &output)).await.unwrap_err();
+
+    assert!(!error.is_below_fees(), "{error}");
+    assert!(matches!(error, IcpswapQuoteError::NoUsablePools { .. }));
+}
+
 #[tokio::test]
 async fn rejects_spend_budget_that_cannot_cover_transfer_and_deposit_fees() {
     let input = chain_token(native_icp_ledger(), "ICP", 10);
