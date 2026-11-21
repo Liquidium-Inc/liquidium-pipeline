@@ -25,7 +25,7 @@ use super::{
     session::IcpswapExecutionSession,
     state::validate_execution_state,
     types::{
-        IcpswapClientError, IcpswapExecutionPlan, IcpswapPlanError, IcpswapPoolData, IcpswapPoolMetadata,
+        IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapPlanError, IcpswapPoolData, IcpswapPoolMetadata,
         IcpswapQuoteError, IcpswapRoutePreview, IcpswapState, IcpswapSwapArgs, IcpswapToken, IcpswapTokenMetadata,
     },
 };
@@ -328,9 +328,12 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             .await
             .map_err(|error| {
                 let text = format!("fee {fee_tier}: {error}");
-                // A missing pool is an answer from the canister. A call that failed says nothing about the pool.
+                // Only `CommonError` is the factory's answer for a missing pool. Any other failure says nothing about the pool.
                 match error {
-                    IcpswapClientError::Protocol { .. } => PoolFailure::NoPool(text),
+                    IcpswapClientError::Protocol {
+                        error: IcpswapError::CommonError,
+                        ..
+                    } => PoolFailure::NoPool(text),
                     _ => PoolFailure::Other(text),
                 }
             })?;

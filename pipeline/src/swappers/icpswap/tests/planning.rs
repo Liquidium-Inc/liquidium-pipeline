@@ -392,6 +392,39 @@ async fn a_pool_lookup_without_an_answer_is_not_a_missing_pool() {
     assert!(matches!(error, IcpswapQuoteError::NoUsablePools { .. }));
 }
 
+/// Checks that an internal error of the factory does not count as a missing pool.
+#[tokio::test]
+async fn a_factory_internal_error_is_not_a_missing_pool() {
+    let input = chain_token(native_icp_ledger(), "ICP", 10);
+    let output = chain_token(principal(2), "OUTPUT", 10);
+    let (input_ledger, output_ledger) = (native_icp_ledger(), principal(2));
+
+    let mut client = MockIcpswapReadClient::new();
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
+    client.expect_get_pool().times(2).returning(move |_, _, fee| {
+        if fee == &Nat::from(3_000u64) {
+            return Err(IcpswapClientError::Protocol {
+                method: "getPool",
+                error: IcpswapError::InternalError("pool unavailable".to_string()),
+            });
+        }
+        Ok(pool_data(principal(5), input_ledger, output_ledger, fee.clone()))
+    });
+    client.expect_quote().times(1).returning(|_, _| Ok(Nat::from(15u64)));
+    client
+        .expect_pool_metadata()
+        .times(1)
+        .returning(move |_| Ok(pool_metadata(input_ledger, output_ledger)));
+
+    let error = venue_with_two_tiers(client, &input, &output)
+        .preview_route(&request_paying(&input, &output, 45))
+        .await
+        .unwrap_err();
+
+    assert!(!error.is_below_fees(), "{error}");
+    assert!(matches!(error, IcpswapQuoteError::NoUsablePools { .. }));
+}
+
 /// A drained pool quotes almost nothing for any amount. Its price says the amount is worth more, so it is no minimum.
 #[tokio::test]
 async fn a_drained_pool_is_not_too_small() {

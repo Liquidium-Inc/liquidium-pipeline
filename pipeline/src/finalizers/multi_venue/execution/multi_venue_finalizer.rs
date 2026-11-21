@@ -624,11 +624,11 @@ fn recovery_result(state: &RecoverySweepState) -> FinalizerResult {
             (RecoverySweepStatus::Completed, Some(txid)) => {
                 format!("No venue can swap the collateral, so it went to the recovery account (tx {txid}).")
             }
-            // Collateral below its own transfer fee stays in the trader account.
-            (RecoverySweepStatus::Completed, None) => format!(
-                "No venue can swap the collateral, and {} is below its transfer fee, so it stays in the trader account.",
-                state.amount.formatted()
-            ),
+            // Collateral at or below its own transfer fee stays in the trader account.
+            (RecoverySweepStatus::Completed, None) => {
+                "No venue can swap the collateral. It is at or below its transfer fee, so it stays in the trader account."
+                    .to_string()
+            }
             (RecoverySweepStatus::OperatorRequired, _) => state
                 .last_error
                 .clone()
