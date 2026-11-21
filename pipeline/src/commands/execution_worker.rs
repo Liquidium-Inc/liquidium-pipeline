@@ -364,25 +364,6 @@ mod tests {
 
     use super::{SqliteWalStore, build_execution_runtime, spawn_runtime_thread};
 
-    #[test]
-    fn execution_runtime_runs_on_the_named_os_thread() {
-        let runtime = build_execution_runtime().expect("execution runtime");
-        let (sender, receiver) = mpsc::channel();
-        let worker = spawn_runtime_thread(runtime, async move {
-            tokio::task::yield_now().await;
-            sender
-                .send(thread::current().name().map(str::to_owned))
-                .expect("send thread name");
-        })
-        .expect("spawn execution thread");
-
-        assert_eq!(
-            receiver.recv().expect("receive thread name").as_deref(),
-            Some("liquidation-execution")
-        );
-        worker.join().expect("execution thread should exit cleanly");
-    }
-
     fn request(with_swap: bool) -> ExecutorRequest {
         let token = ChainToken::Icp {
             ledger: Principal::anonymous(),
@@ -448,6 +429,25 @@ mod tests {
             status,
             change_received: true,
         }
+    }
+
+    #[test]
+    fn execution_runtime_runs_on_the_named_os_thread() {
+        let runtime = build_execution_runtime().expect("execution runtime");
+        let (sender, receiver) = mpsc::channel();
+        let worker = spawn_runtime_thread(runtime, async move {
+            tokio::task::yield_now().await;
+            sender
+                .send(thread::current().name().map(str::to_owned))
+                .expect("send thread name");
+        })
+        .expect("spawn execution thread");
+
+        assert_eq!(
+            receiver.recv().expect("receive thread name").as_deref(),
+            Some("liquidation-execution")
+        );
+        worker.join().expect("execution thread should exit cleanly");
     }
 
     #[tokio::test]
