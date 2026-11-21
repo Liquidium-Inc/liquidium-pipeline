@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     executors::executor::ExecutorRequest,
-    finalizers::finalizer::FinalizerResult,
+    finalizers::finalizer::{FinalizerResult, UnswappedCollateral},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
 };
 
@@ -19,6 +19,23 @@ pub struct LiquidationOutcome {
     pub round_trip_secs: Option<i64>,
 }
 impl LiquidationOutcome {
+    /// Returns `Recovered` or `Kept` for a row whose collateral no venue could swap, else the execution status.
+    pub fn formatted_status(&self) -> String {
+        match (&self.status, self.finalizer_result.unswapped) {
+            (ExecutionStatus::Success, Some(UnswappedCollateral::Recovered)) => "Recovered".to_string(),
+            (ExecutionStatus::Success, Some(UnswappedCollateral::Kept)) => "Kept".to_string(),
+            (status, _) => status.description(),
+        }
+    }
+
+    /// Returns the finalizer's reason for a successful row. A failed row has its reason in the status already.
+    pub fn note(&self) -> Option<String> {
+        match self.status {
+            ExecutionStatus::Success => self.finalizer_result.reason.clone(),
+            _ => None,
+        }
+    }
+
     fn scale(&self, amount: &Nat, decimals: u8) -> f64 {
         let raw = amount.0.to_f64().unwrap_or(0.0);
         raw / 10f64.powi(decimals as i32)

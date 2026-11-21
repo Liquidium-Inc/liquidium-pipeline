@@ -10,7 +10,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenuePlanningContext, VenueRoutePreview},
+    finalizers::multi_venue::{MultiVenueAdapter, VenueAmountError, VenuePlanningContext, VenueRoutePreview},
     liquidation::{collateral_service::USD_QUOTE_CURRENCY, liquidation_math::oracle_implied_output},
     persistance::{
         MultiVenueAllocationReason, MultiVenueExecutionOutcome, MultiVenueExecutionPlan, MultiVenueExecutionState,
@@ -472,25 +472,9 @@ pub enum IcpswapFirstPlannerError {
     BelowVenueMinimum(String),
 }
 
-/// Why ICPSwap took no part before the other venues are asked for the full amount.
-enum IcpswapRefusal {
-    /// ICPSwap said that the amount is too small, so the same amount fails again.
-    BelowMinimum(String),
-    /// Any other reason. A later try can work.
-    Other(String),
-}
-
-impl IcpswapRefusal {
-    /// ICPSwap's exact re-quote of a split leg failed. A later try can work.
-    fn exact_quote(error: &IcpswapFirstPlannerError) -> Self {
-        Self::Other(format!("ICPSwap exact quote rejected ({error})"))
-    }
-
-    fn reason(&self) -> &str {
-        match self {
-            Self::BelowMinimum(reason) | Self::Other(reason) => reason,
-        }
-    }
+/// Returns ICPSwap's refusal when its exact re-quote of a split leg failed. A later try can work.
+fn exact_quote_refusal(error: &IcpswapFirstPlannerError) -> VenueAmountError {
+    VenueAmountError::Unavailable(format!("ICPSwap exact quote rejected ({error})"))
 }
 
 pub struct IcpswapFirstPlanner {
@@ -622,11 +606,11 @@ impl IcpswapFirstPlanner {
             }
             VenuePreviewOutcome::Quoted(_) => self.plan_split_or_fallback(input, quoted_at).await,
             VenuePreviewOutcome::BelowMinimum(error) => {
-                let refusal = IcpswapRefusal::BelowMinimum(format!("ICPSwap amount below minimum ({error})"));
+                let refusal = VenueAmountError::BelowMinimum(format!("ICPSwap amount below minimum ({error})"));
                 self.plan_full_overflow_without_icpswap(input, quoted_at, refusal).await
             }
             VenuePreviewOutcome::Unavailable(error) | VenuePreviewOutcome::Invalid(error) => {
-                let refusal = IcpswapRefusal::Other(format!("ICPSwap quote rejected ({error})"));
+                let refusal = VenueAmountError::Unavailable(format!("ICPSwap quote rejected ({error})"));
                 self.plan_full_overflow_without_icpswap(input, quoted_at, refusal).await
             }
         }
@@ -775,7 +759,7 @@ impl IcpswapFirstPlanner {
             Ok(icpswap) => icpswap,
             Err(error) => {
                 return self
-                    .plan_full_overflow_without_icpswap(input, quoted_at, IcpswapRefusal::exact_quote(&error))
+                    .plan_full_overflow_without_icpswap(input, quoted_at, exact_quote_refusal(&error))
                     .await;
             }
         };
@@ -796,7 +780,7 @@ impl IcpswapFirstPlanner {
         let overflow = self
             .full_amount_overflow(
                 input,
-                Some(IcpswapRefusal::Other(
+                Some(VenueAmountError::Unavailable(
                     "full ICPSwap quote exceeds the dust-fallback price-impact limit and the below-minimum remainder cannot be split"
                         .to_string(),
                 )),
@@ -818,36 +802,33 @@ impl IcpswapFirstPlanner {
         self.build_state(input, overflow, reason, quoted_at)
     }
 
-    // Runs the complete allocation down the CEX waterfall.
-    //
-    // `fallthrough_reason` prefixes the rejection summary when the caller
-    // reached this path because another venue fell through. Its presence is
-    // load-bearing, not cosmetic: every caller that supplies one arrived here
-    // through a venue state a later retry could resolve, so those failures are
-    // never reported as a permanent below-minimum dead end.
+    // Runs the complete allocation down the CEX waterfall; `icpswap_refusal` says why ICPSwap took no part.
+    // Only an ICPSwap `BelowMinimum`, with every other venue too small or absent, ends in `BelowVenueMinimum`; any other refusal ends in `NoViableRoute`, which retries.
     async fn full_amount_overflow(
         &self,
         input: &IcpswapFirstPlanInput,
-        icpswap_refusal: Option<IcpswapRefusal>,
+        icpswap_refusal: Option<VenueAmountError>,
     ) -> Result<Vec<VenueRoutePreview>, IcpswapFirstPlannerError> {
-        // With no other venue, ICPSwap's own minimum is the answer of every enabled venue.
-        if self.overflow_venue_ids.is_empty()
-            && let Some(IcpswapRefusal::BelowMinimum(reason)) = icpswap_refusal
-        {
+        // With no other venue that carries the pair, ICPSwap's own minimum is the answer of every venue.
+        let no_other_venue = !self
+            .overflow_venue_ids
+            .iter()
+            .any(|venue_id| self.carries(input, venue_id, &input.total_pay.value));
+        if no_other_venue && let Some(VenueAmountError::BelowMinimum(reason)) = icpswap_refusal {
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(reason));
         }
         self.ordered_overflow_previews(input, input.total_pay.value.clone())
             .await
             .map_err(|error| match (error, icpswap_refusal) {
                 // Every venue, ICPSwap included, said that the amount is too small.
-                (IcpswapFirstPlannerError::BelowVenueMinimum(summary), Some(IcpswapRefusal::BelowMinimum(reason))) => {
+                (IcpswapFirstPlannerError::BelowVenueMinimum(summary), Some(VenueAmountError::BelowMinimum(reason))) => {
                     IcpswapFirstPlannerError::BelowVenueMinimum(format!("{reason}; {summary}"))
                 }
                 (
                     IcpswapFirstPlannerError::BelowVenueMinimum(summary)
                     | IcpswapFirstPlannerError::NoViableRoute(summary),
                     Some(refusal),
-                ) => IcpswapFirstPlannerError::NoViableRoute(format!("{}; {summary}", refusal.reason())),
+                ) => IcpswapFirstPlannerError::NoViableRoute(format!("{refusal}; {summary}")),
                 (error, _) => error,
             })
     }
@@ -900,7 +881,7 @@ impl IcpswapFirstPlanner {
             built => return built,
         };
         let error = IcpswapFirstPlannerError::NoViableRoute(rejected.clone());
-        self.plan_full_overflow_without_icpswap(input, quoted_at, IcpswapRefusal::exact_quote(&error))
+        self.plan_full_overflow_without_icpswap(input, quoted_at, exact_quote_refusal(&error))
             .await
             .map_err(|fallback| match fallback {
                 IcpswapFirstPlannerError::NoViableRoute(reason) => {
@@ -917,7 +898,7 @@ impl IcpswapFirstPlanner {
         &self,
         input: &IcpswapFirstPlanInput,
         quoted_at: i64,
-        refusal: IcpswapRefusal,
+        refusal: VenueAmountError,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
         let overflow = self.full_amount_overflow(input, Some(refusal)).await?;
         let reason = Self::overflow_reason(&overflow, |selected_venue_id| {
@@ -966,7 +947,7 @@ impl IcpswapFirstPlanner {
             Ok(icpswap) => icpswap,
             Err(error) => {
                 return self
-                    .plan_full_overflow_without_icpswap(input, quoted_at, IcpswapRefusal::exact_quote(&error))
+                    .plan_full_overflow_without_icpswap(input, quoted_at, exact_quote_refusal(&error))
                     .await;
             }
         };
@@ -984,7 +965,7 @@ impl IcpswapFirstPlanner {
                 self.icpswap_limit_bps(&icpswap)
             ));
             return self
-                .plan_full_overflow_without_icpswap(input, quoted_at, IcpswapRefusal::exact_quote(&error))
+                .plan_full_overflow_without_icpswap(input, quoted_at, exact_quote_refusal(&error))
                 .await;
         }
 

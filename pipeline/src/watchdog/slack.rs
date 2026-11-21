@@ -32,6 +32,19 @@ impl Watchdog for SlackWatchdog {
     }
 }
 
+/// Slack refuses the whole message when one section text is longer than 3,000 characters.
+const SECTION_TEXT_LIMIT: usize = 2_900;
+
+/// Returns the text cut to what one Slack section accepts, with `…` at the cut.
+fn within_section(text: &str) -> String {
+    if text.chars().count() <= SECTION_TEXT_LIMIT {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(SECTION_TEXT_LIMIT).collect();
+    cut.push('…');
+    cut
+}
+
 fn slack_cooldown_key(ev: &WatchdogEvent<'_>) -> Option<String> {
     match ev {
         WatchdogEvent::LowBalance { account, asset_id, .. } => Some(format!("low_balance:{account}:{asset_id}")),
@@ -131,24 +144,26 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
         }
         WatchdogEvent::Lifecycle { state, details } => {
             let text = format!("[{bot_name}] Liquidator {state}: {details}");
+            let mut blocks = vec![serde_json::json!({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!("*{bot_name}* - Liquidator {state}")
+                }
+            })];
+            // An empty section makes Slack refuse the whole alert, so the block is left out.
+            if !details.trim().is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": within_section(details)
+                    }
+                }));
+            }
             Some(serde_json::json!({
                 "text": text,
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": format!("*{bot_name}* - Liquidator {state}")
-                        }
-                    },
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": details
-                        }
-                    }
-                ]
+                "blocks": blocks
             }))
         }
         WatchdogEvent::OperatorRequired {
@@ -193,7 +208,7 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": details
+                        "text": within_section(details)
                     }
                 }));
             }
@@ -216,11 +231,10 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
             realized_profit,
             profit_delta,
             round_trip_secs,
+            note,
         } => {
             let text = format!("[{bot_name}] Liquidation finalized: {status} {liquidation_id}");
-            Some(serde_json::json!({
-                "text": text,
-                "blocks": [
+            let mut blocks = serde_json::json!([
                     {
                         "type": "section",
                         "text": {
@@ -282,7 +296,19 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
                             }
                         ]
                     }
-                ]
+            ]);
+            if let (Some(note), Some(list)) = (note, blocks.as_array_mut()) {
+                list.push(serde_json::json!({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": within_section(&format!("*Note*\n{note}"))
+                    }
+                }));
+            }
+            Some(serde_json::json!({
+                "text": text,
+                "blocks": blocks
             }))
         }
         _ => None,
@@ -292,6 +318,26 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A finished liquidation with this status and note; the other fields are fixed.
+    fn finalized(status: &str, note: Option<&str>) -> WatchdogEvent<'static> {
+        WatchdogEvent::LiquidationFinalized {
+            liquidation_id: "955".to_string(),
+            borrower: "aaaaa-aa".to_string(),
+            debt_asset: "ckUSDC".to_string(),
+            collateral_asset: "ICP".to_string(),
+            status: status.to_string(),
+            debt_repaid: "0.01 ckUSDC".to_string(),
+            collateral_received: "0.005 ICP".to_string(),
+            swap_output: "0 ckUSDC".to_string(),
+            swapper: "recovery".to_string(),
+            expected_profit: "0 ckUSDC".to_string(),
+            realized_profit: "-0.01 ckUSDC".to_string(),
+            profit_delta: "-0.010".to_string(),
+            round_trip_secs: "60".to_string(),
+            note: note.map(str::to_string),
+        }
+    }
 
     #[test]
     fn slack_payload_formats_low_balance_event() {
@@ -402,6 +448,7 @@ mod tests {
             realized_profit: "1.1 ckUSDC".to_string(),
             profit_delta: "+0.100".to_string(),
             round_trip_secs: "12".to_string(),
+            note: None,
         };
 
         let payload = slack_payload_for_event(&ev).expect("liquidation should format");
@@ -428,6 +475,7 @@ mod tests {
             realized_profit: "0 ICP".to_string(),
             profit_delta: "+0.000".to_string(),
             round_trip_secs: "-".to_string(),
+            note: None,
         };
 
         let payload = slack_payload_for_event(&ev).expect("failed liquidation should format");
@@ -461,6 +509,7 @@ mod tests {
             realized_profit: "0.1 ICP".to_string(),
             profit_delta: "+0.000".to_string(),
             round_trip_secs: "3".to_string(),
+            note: None,
         };
 
         assert!(slack_cooldown_key(&lifecycle).is_none());
@@ -468,5 +517,68 @@ mod tests {
             slack_cooldown_key(&liquidation),
             Some("liquidation_finalized:7:aaaaa-aa:ICP:ckBTC:Success".to_string())
         );
+    }
+
+    #[test]
+    fn a_note_is_the_last_block_of_a_finished_liquidation() {
+        let note = "No venue can swap the collateral, so it went to the recovery account (tx 17).";
+        let payload = slack_payload_for_event(&finalized("Recovered", Some(note))).expect("payload");
+
+        assert_eq!(payload["text"], "[liquidator] Liquidation finalized: Recovered 955");
+        let blocks = payload["blocks"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[3]["text"]["text"], format!("*Note*\n{note}"));
+    }
+
+    #[test]
+    fn a_finished_liquidation_without_a_note_has_no_note_block() {
+        let payload = slack_payload_for_event(&finalized("Success", None)).expect("payload");
+
+        assert_eq!(payload["blocks"].as_array().expect("blocks").len(), 3);
+    }
+
+    /// Slack drops the whole message when one section is too long, so a long text is cut instead.
+    #[test]
+    fn a_long_note_or_detail_is_cut_to_what_one_section_accepts() {
+        let long = "x".repeat(5_000);
+        let note = slack_payload_for_event(&finalized("Recovered", Some(&long))).expect("payload");
+        let alert = slack_payload_for_event(&WatchdogEvent::OperatorRequired {
+            execution_id: "955".to_string(),
+            venue: "finalizer".to_string(),
+            pending_step: "no_route_slow_retry".to_string(),
+            owner: "aaaaa-aa".to_string(),
+            details: long.clone(),
+        })
+        .expect("payload");
+
+        for text in [&note["blocks"][3]["text"]["text"], &alert["blocks"][2]["text"]["text"]] {
+            let text = text.as_str().expect("text");
+            assert_eq!(
+                text.chars().count(),
+                SECTION_TEXT_LIMIT + 1,
+                "the limit plus the cut mark"
+            );
+            assert!(text.ends_with('…'));
+        }
+        assert_eq!(within_section("short"), "short");
+    }
+
+    /// A stop alert that Slack refuses is the costliest alert to lose.
+    #[test]
+    fn a_stop_alert_with_a_long_or_empty_text_is_still_sent() {
+        let long = slack_payload_for_event(&WatchdogEvent::Lifecycle {
+            state: "stopped".to_string(),
+            details: "y".repeat(5_000),
+        })
+        .expect("payload");
+        let empty = slack_payload_for_event(&WatchdogEvent::Lifecycle {
+            state: "stopped".to_string(),
+            details: "  ".to_string(),
+        })
+        .expect("payload");
+
+        let cut = long["blocks"][1]["text"]["text"].as_str().expect("text");
+        assert_eq!(cut.chars().count(), SECTION_TEXT_LIMIT + 1);
+        assert_eq!(empty["blocks"].as_array().expect("blocks").len(), 1);
     }
 }

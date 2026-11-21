@@ -459,21 +459,23 @@ impl IcpswapFinalizer {
                     .map(ChainToken::asset_id)
                     .ok_or_else(|| format!("path through {} has no configured token", pair[1]))?
             };
-            let in_step = |error: VenueAmountError| in_step(error, pair);
             // The first step trades the request amount, so it has one quote only.
             let (expected_pay, least_pay) = match steps.last() {
                 None => (request.pay_amount.clone(), None),
                 Some(before) => (
                     before.preview.route.net_expected_output(),
-                    Some(before.least_credit().map_err(in_step)?),
+                    Some(before.least_credit().map_err(|error| in_step(error, pair))?),
                 ),
             };
             let step_request = self.step_request(request, expected_pay, receive_asset.clone(), is_last);
             let least_request = least_pay.map(|pay| self.step_request(request, pay, receive_asset, is_last));
             let least_quote = OptionFuture::from(least_request.as_ref().map(|least| self.plan_step(least)));
             let (preview, least_preview) = futures::join!(self.plan_step(&step_request), least_quote);
-            let preview = preview.map_err(in_step)?;
-            let least_plan = least_preview.transpose().map_err(in_step)?.map(|least| least.route);
+            let preview = preview.map_err(|error| in_step(error, pair))?;
+            let least_plan = least_preview
+                .transpose()
+                .map_err(|error| in_step(error, pair))?
+                .map(|least| least.route);
             let floor = lower_minimum(&preview.route, least_plan);
             path.push(floor.token.clone());
             steps.push(QuotedStep {
@@ -481,6 +483,10 @@ impl IcpswapFinalizer {
                 preview,
                 floor,
             });
+        }
+        // The route's least output must cover the fees of the last step, or the path cannot be planned.
+        if let (Some(last), Some(pair)) = (steps.last(), ledgers.windows(2).last()) {
+            last.least_credit().map_err(|error| in_step(error, pair))?;
         }
         Ok(PathQuote { path, steps })
     }

@@ -25,8 +25,8 @@ use super::{
     session::IcpswapExecutionSession,
     state::validate_execution_state,
     types::{
-        IcpswapExecutionPlan, IcpswapPlanError, IcpswapPoolData, IcpswapPoolMetadata, IcpswapQuoteError,
-        IcpswapRoutePreview, IcpswapState, IcpswapSwapArgs, IcpswapToken, IcpswapTokenMetadata,
+        IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapPlanError, IcpswapPoolData, IcpswapPoolMetadata,
+        IcpswapQuoteError, IcpswapRoutePreview, IcpswapState, IcpswapSwapArgs, IcpswapToken, IcpswapTokenMetadata,
     },
 };
 
@@ -54,11 +54,11 @@ struct IcpswapQuoteContext {
 
 /// Why one fee tier gave no candidate.
 enum PoolFailure {
-    /// The tier has no pool, or the pool lookup failed.
+    /// The pool canister answered that the tier has no pool.
     NoPool(String),
-    /// The pool quoted the amount, but the output does not cover the output ledger fees.
+    /// At the pool's own price the amount is worth less than the output ledger fees.
     BelowFees(String),
-    /// The pool exists, but its quote or metadata could not be used.
+    /// Any other failure: a lookup that got no answer, a thin quote, or metadata that cannot be used.
     Other(String),
 }
 
@@ -326,7 +326,17 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             .client
             .get_pool(&context.input_descriptor, &context.output_descriptor, &fee_tier)
             .await
-            .map_err(|error| PoolFailure::NoPool(format!("fee {fee_tier}: {error}")))?;
+            .map_err(|error| {
+                let text = format!("fee {fee_tier}: {error}");
+                // Only `CommonError` is the factory's answer for a missing pool. Any other failure says nothing about the pool.
+                match error {
+                    IcpswapClientError::Protocol {
+                        error: IcpswapError::CommonError,
+                        ..
+                    } => PoolFailure::NoPool(text),
+                    _ => PoolFailure::Other(text),
+                }
+            })?;
 
         validate_pool_fee(&pool, &fee_tier)?;
 
@@ -351,6 +361,8 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             pool.canister_id,
         )?;
         let estimated_price_impact_bps = quoted_price_impact_bps(&spot_output, &gross);
+        // A quote under the fees with a spot output above them means missing liquidity, not a small amount.
+        let worth_less_than_fees = spot_output < output_fee_budget(&context.output_fee);
         let plan = IcpswapExecutionPlan::new(
             pool.canister_id,
             token0,
@@ -365,7 +377,7 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
         .map_err(|error| {
             let text = format!("pool {}: {error}", pool.canister_id);
             match error {
-                IcpswapPlanError::OutputFeeExceedsQuote { .. } => PoolFailure::BelowFees(text),
+                IcpswapPlanError::OutputFeeExceedsQuote { .. } if worth_less_than_fees => PoolFailure::BelowFees(text),
                 _ => PoolFailure::Other(text),
             }
         })?;

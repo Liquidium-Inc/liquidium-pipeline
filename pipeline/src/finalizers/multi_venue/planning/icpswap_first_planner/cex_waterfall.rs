@@ -63,11 +63,10 @@ impl IcpswapFirstPlanner {
         }
         // A venue that can never carry the pair is no second exchange: it must
         // not switch the ceiling on, and it has no quote to give.
-        let (venue_ids, absent): (Vec<&String>, Vec<&String>) = self.overflow_venue_ids.iter().partition(|venue_id| {
-            self.venues
-                .adapter(venue_id)
-                .is_none_or(|adapter| adapter.carries(&input.request_for(venue_id, pay_value.clone())))
-        });
+        let (venue_ids, absent): (Vec<&String>, Vec<&String>) = self
+            .overflow_venue_ids
+            .iter()
+            .partition(|venue_id| self.carries(input, venue_id, &pay_value));
         let ceiling_applies = venue_ids.len() > 1;
         let mut legs = Vec::new();
         let mut remainder = pay_value;
@@ -223,6 +222,13 @@ impl IcpswapFirstPlanner {
             VenuePreviewOutcome::Invalid(error) => (format!("quote rejected ({error})"), false),
         };
         Ok(Err(Refusal { reason, permanent }))
+    }
+
+    /// False only when the venue is registered and can never carry this pair, whatever the amount.
+    pub(super) fn carries(&self, input: &IcpswapFirstPlanInput, venue_id: &str, pay_value: &Nat) -> bool {
+        self.venues
+            .adapter(venue_id)
+            .is_none_or(|adapter| adapter.carries(&input.request_for(venue_id, pay_value.clone())))
     }
 
     /// The most one order at this venue may carry, in pay units at the oracle

@@ -55,7 +55,22 @@ pub struct FinalizerResult {
     pub swapper: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// What happened to the collateral when no venue could swap it. `None` for every other row.
+    #[serde(default)]
+    pub unswapped: Option<UnswappedCollateral>,
 }
+
+/// What happened to collateral that no venue could swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnswappedCollateral {
+    /// It went to the recovery account.
+    Recovered,
+    /// It is below its own transfer fee, so it stays in the trader account.
+    Kept,
+}
+
+/// The swapper of a finished row whose collateral no venue could swap. `unswapped` says where that collateral is.
+pub const RECOVERY_SWAPPER: &str = "recovery";
 
 impl FinalizerResult {
     /// A finished liquidation with no swap result: no swap was needed, or the
@@ -67,6 +82,7 @@ impl FinalizerResult {
             operator_required: false,
             swapper,
             reason,
+            unswapped: None,
         }
     }
 }

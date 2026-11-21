@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult, RECOVERY_SWAPPER, UnswappedCollateral},
     finalizers::multi_venue::{
         IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, IcpswapFirstPlannerError,
         MultiVenueAdapter, VenueLegProgress,
@@ -508,6 +508,7 @@ impl MultiVenueFinalizer {
                 operator_required: false,
                 swapper: Some("multi_venue".to_string()),
                 reason: None,
+                unswapped: None,
             }),
             MultiVenueExecutionOutcome::OperatorRequired { leg_ids } => Ok(FinalizerResult {
                 swap_result: None,
@@ -515,6 +516,7 @@ impl MultiVenueFinalizer {
                 operator_required: true,
                 swapper: Some("multi_venue".to_string()),
                 reason: Some(format!("operator required for venue legs: {}", leg_ids.join(","))),
+                unswapped: None,
             }),
             MultiVenueExecutionOutcome::PartialRecovered { failed_leg_ids } => {
                 let failed_legs = failed_leg_ids
@@ -550,6 +552,7 @@ impl MultiVenueFinalizer {
                         operator_required: false,
                         swapper: Some("multi_venue".to_string()),
                         reason: Some(context),
+                        unswapped: None,
                     }),
                     None if only_floors => Err(FinalizerError::BadDebtAmountFloor(context)),
                     None => Err(FinalizerError::Permanent(context)),
@@ -561,6 +564,7 @@ impl MultiVenueFinalizer {
                 operator_required: false,
                 swapper: Some("multi_venue".to_string()),
                 reason: None,
+                unswapped: None,
             }),
         }
     }
@@ -615,22 +619,27 @@ fn recovery_result(state: &RecoverySweepState) -> FinalizerResult {
         swap_result: None,
         finalized: state.status == RecoverySweepStatus::Completed,
         operator_required: state.status == RecoverySweepStatus::OperatorRequired,
-        swapper: Some("recovery".to_string()),
+        swapper: Some(RECOVERY_SWAPPER.to_string()),
         reason: Some(match (state.status, state.txid.as_ref()) {
             (RecoverySweepStatus::Completed, Some(txid)) => {
-                format!("unrouteable collateral swept to recovery (tx {txid})")
+                format!("No venue can swap the collateral, so it went to the recovery account (tx {txid}).")
             }
-            // Collateral below its own transfer fee stays in the trader account.
-            (RecoverySweepStatus::Completed, None) => format!(
-                "unrouteable collateral {} is below its transfer fee and was left in place",
-                state.amount.formatted()
-            ),
+            // Collateral at or below its own transfer fee stays in the trader account.
+            (RecoverySweepStatus::Completed, None) => {
+                "No venue can swap the collateral. It is at or below its transfer fee, so it stays in the trader account."
+                    .to_string()
+            }
             (RecoverySweepStatus::OperatorRequired, _) => state
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "recovery sweep requires operator reconciliation".to_string()),
             (RecoverySweepStatus::ReadyToSubmit, _) => "unrouteable collateral recovery sweep is prepared".to_string(),
         }),
+        unswapped: match (state.status, state.txid.as_ref()) {
+            (RecoverySweepStatus::Completed, Some(_)) => Some(UnswappedCollateral::Recovered),
+            (RecoverySweepStatus::Completed, None) => Some(UnswappedCollateral::Kept),
+            _ => None,
+        },
     }
 }
 

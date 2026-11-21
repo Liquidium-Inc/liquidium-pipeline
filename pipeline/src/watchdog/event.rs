@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
 
+// An event lives for one notification only, so the size of its largest variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize)]
 pub enum WatchdogEvent<'a> {
     Heartbeat {
@@ -47,6 +49,8 @@ pub enum WatchdogEvent<'a> {
         realized_profit: String,
         profit_delta: String,
         round_trip_secs: String,
+        /// Why a successful row ended this way, when the numbers do not show it. For example the move to the recovery account.
+        note: Option<String>,
     },
 }
 
