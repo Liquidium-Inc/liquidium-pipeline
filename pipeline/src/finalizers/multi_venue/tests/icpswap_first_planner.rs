@@ -395,6 +395,23 @@ fn planner(
     IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc)], planner_config).expect("valid planner")
 }
 
+/// An ICPSwap that says the amount pays less than its ledger fees.
+fn icpswap_below_fees() -> PlannerAdapter {
+    PlannerAdapter {
+        venue_id: ICPSWAP_VENUE_ID,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        responder: Box::new(|_| {
+            Err(VenueAmountError::BelowMinimum(
+                "every ICPSwap path pays less than its ledger fees".to_string(),
+            ))
+        }),
+        validation_error: None,
+        preview_forbidden: false,
+        minimum_pay: None,
+        carries_pair: true,
+    }
+}
+
 // Input construction
 
 #[test]
@@ -1980,6 +1997,66 @@ async fn tiny_collateral_does_not_preview_mexc_when_icpswap_is_unavailable() {
     );
     assert!(error.to_string().contains("MEXC amount is below its minimum"));
     assert!(mexc_calls.lock().expect("calls lock").is_empty());
+}
+
+/// Liquidation 955: about one cent of ICP, which neither ICPSwap nor the exchange can take.
+#[tokio::test]
+async fn dust_that_icpswap_and_every_exchange_refuse_is_below_every_venue_minimum() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |_| {
+        Err("a below-minimum amount must not be quoted".to_string())
+    });
+    let planner = planner(icpswap_below_fees(), mexc, config(8.0));
+    let mut input = input_with_pay_token(native_icp());
+    input.total_pay.value = Nat::from(500_000u64);
+    input.pay_reference_price_usd = Some(2.0);
+
+    let error = planner
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("no venue can take dust");
+
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("ICPSwap amount below minimum"), "{error}");
+    assert!(
+        error.to_string().contains("MEXC amount is below its minimum"),
+        "{error}"
+    );
+    assert!(mexc_calls.lock().expect("calls lock").is_empty());
+}
+
+/// ICPSwap's minimum alone is no dead end: an exchange that can take the amount gets all of it.
+#[tokio::test]
+async fn an_amount_below_the_icpswap_fees_goes_to_an_exchange_that_takes_it() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+
+    let state = planner(icpswap_below_fees(), mexc, config(0.0))
+        .plan(&input_with_pay_token(native_icp()), QUOTED_AT)
+        .await
+        .expect("an exchange plan");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+}
+
+#[tokio::test]
+async fn with_icpswap_alone_its_minimum_is_below_every_venue_minimum() {
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap_below_fees())], config(8.0)).expect("planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(native_icp()), QUOTED_AT)
+        .await
+        .expect_err("ICPSwap cannot take it");
+
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)),
+        "{error}"
+    );
 }
 
 #[tokio::test]
