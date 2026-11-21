@@ -16,6 +16,13 @@ pub(super) struct IocOrder {
     pub(super) price: Decimal,
 }
 
+/// The one order a slice sends: IOC when it has a price limit, else market.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SliceOrder {
+    Ioc(IocOrder),
+    Market(MarketOrder),
+}
+
 impl MexcClient {
     async fn fetch_ask_levels(
         &self,
