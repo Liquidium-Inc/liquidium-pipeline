@@ -65,6 +65,16 @@ where
         state.trade.trade_leg_index = Some((leg_idx + 1) as u32);
         state.trade.trade_progress_remaining_in = None;
         state.trade.trade_progress_total_out = None;
+        // The leg's share of oracle value carries the rest of the route's discount.
+        if let Some(at_oracle) = state.trade.trade_progress_oracle_out.take()
+            && at_oracle > 0.0
+        {
+            let earlier = state.trade.trade_oracle_route_keep.unwrap_or(1.0);
+            // A leg that beat the oracle gives the next ones no extra room: the
+            // gain may only be the oracle's mark of the asset in between.
+            // Route admission holds every leg to this same rule.
+            state.trade.trade_oracle_route_keep = Some(earlier * (total_out / at_oracle).min(1.0));
+        }
         Self::clear_pending_trade_order(state);
         state.trade.trade_pending_buy_mode = None;
         state.trade.trade_inverse_retry_count = 0;

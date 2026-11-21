@@ -7,7 +7,7 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use liquidium_pipeline_core::types::side_cost::SideCost;
 use log::warn;
 
-use super::{finalizer::CexVenueFinalizer, utils::LIQUIDITY_EPS};
+use super::{finalizer::CexVenueFinalizer, route_preview::RouteStage, utils::LIQUIDITY_EPS};
 use crate::{
     finalizers::{
         bridge_legs::{
@@ -213,6 +213,10 @@ where
                 trade_inverse_retry_count: 0,
                 trade_unexecutable_residual_in: None,
                 trade_settlement_waiting_since_ts: None,
+                trade_oracle_hold_since_ts: None,
+                trade_oracle_route_keep: None,
+                trade_progress_oracle_out: None,
+                trade_pending_oracle_bound: None,
                 trade_applied_client_order_ids: Vec::new(),
             },
             withdraw: CexWithdrawState {
@@ -469,11 +473,12 @@ where
                 &<Self as BridgePlanner>::planned_deposit_asset(&state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(&state),
                 initial_amount,
+                RouteStage::Admission,
             )
             .await
             .map_err(PreviewFailure::Transport)?;
         let route_preview = self
-            .preview_resolved_trade_route(&legs, initial_amount)
+            .preview_resolved_trade_route(&legs, initial_amount, RouteStage::Admission)
             .await
             .map_err(PreviewFailure::Transport)?;
 

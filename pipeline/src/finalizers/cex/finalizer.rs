@@ -37,6 +37,7 @@ use crate::{
     finalizers::bridge_planner::BridgePlanner,
     finalizers::cex::state::{CexState, CexStep},
     outbound::driver::{OutboundError, OutboundRecord, step_outbound},
+    price_oracle::price_oracle::PriceOracle,
     swappers::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
@@ -94,6 +95,11 @@ where
     /// contract into the full chain token needed by deposits and withdrawals.
     /// Legacy receipt-based execution does not need this dependency.
     pub token_registry: Option<Arc<dyn TokenRegistryTrait>>,
+    /// Holds every slice order to the oracle price, so a book that moved after
+    /// planning cannot fill far below it. `None` skips the check.
+    pub(super) price_oracle: Option<Arc<dyn PriceOracle>>,
+    /// How far a whole route may fill below the oracle, as the planner allows a quote.
+    pub(super) max_oracle_discount_bps: f64,
     /// `approve_bumps` is only touched in short synchronous sections.
     approve_bumps: Mutex<HashMap<String, u8>>,
     /// `market_locks` is acquired/held in async trade flow, so it uses Tokio's async mutex.
@@ -175,6 +181,13 @@ where
         self
     }
 
+    /// Holds every route to `max_discount_bps` below the oracle price.
+    pub fn with_price_oracle(mut self, price_oracle: Arc<dyn PriceOracle>, max_discount_bps: u32) -> Self {
+        self.price_oracle = Some(price_oracle);
+        self.max_oracle_discount_bps = f64::from(max_discount_bps);
+        self
+    }
+
     pub fn with_quote_costs(mut self, route_fee_bps: u32, delay_buffer_bps: u32) -> Self {
         self.quote_route_fee_bps = route_fee_bps;
         self.quote_delay_buffer_bps = delay_buffer_bps;
@@ -241,6 +254,8 @@ where
             transport_impact_cap_bps: crate::config::DEFAULT_CEX_MAX_PRICE_IMPACT_BPS,
             bridge: None,
             token_registry: None,
+            price_oracle: None,
+            max_oracle_discount_bps: 0.0,
             approve_bumps: Mutex::new(HashMap::new()),
             market_locks: TokioMutex::new(HashMap::new()),
             multi_venue_armed_intents: Mutex::new(HashSet::new()),
