@@ -25,7 +25,7 @@ use num_traits::ToPrimitive;
 use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
-        finalizer::{Finalizer, FinalizerError, FinalizerResult},
+        finalizer::{Finalizer, FinalizerError, FinalizerResult, UnswappedCollateral},
         multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueLegProgress, VenueRoutePreview},
         profit_calculator::SimpleProfitCalculator,
     },
@@ -820,6 +820,7 @@ async fn below_minimum_route_sweeps_exact_collateral_minus_fee_to_recovery() {
     assert!(completed.finalized);
     assert!(!completed.operator_required);
     assert_eq!(completed.swapper.as_deref(), Some("recovery"));
+    assert_eq!(completed.unswapped, Some(UnswappedCollateral::Recovered));
     // No venue is touched: the sweep exists because none could execute.
     assert_eq!(mexc.calls(), 0);
     let state = committed_recovery_state(&wal);
@@ -1116,7 +1117,39 @@ async fn completed_recovery_sweep_is_not_transferred_again() {
 
     assert!(result.finalized);
     assert!(!result.operator_required);
+    assert_eq!(result.unswapped, Some(UnswappedCollateral::Recovered));
     assert_eq!(committed_recovery_state(&wal).status, RecoverySweepStatus::Completed);
+}
+
+/// Collateral at or below its own transfer fee never moves, so the row says it was kept.
+#[tokio::test]
+async fn collateral_below_its_transfer_fee_is_kept_in_the_trader_account() {
+    let mut receipt = receipt();
+    // The ICP ledger fee is 10,000, so nothing is left to send.
+    receipt
+        .liquidation_result
+        .as_mut()
+        .expect("result")
+        .amounts
+        .collateral_received = Nat::from(10_000u64);
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(0);
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let result = finalizer.finalize(&wal, receipt).await.expect("nothing to sweep");
+
+    assert!(result.finalized);
+    assert_eq!(result.unswapped, Some(UnswappedCollateral::Kept));
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("stays in the trader account"))
+    );
 }
 
 /// An error from the ledger may or may not have applied the transfer, so the

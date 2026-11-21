@@ -759,6 +759,7 @@ mod tests {
                 operator_required: false,
                 swapper: Some("noop".to_string()),
                 reason: None,
+                unswapped: None,
             })
         }
     }
@@ -779,6 +780,7 @@ mod tests {
                 operator_required: true,
                 swapper: Some("mexc".to_string()),
                 reason: Some("ambiguous MEXC submission".to_string()),
+                unswapped: None,
             })
         }
     }

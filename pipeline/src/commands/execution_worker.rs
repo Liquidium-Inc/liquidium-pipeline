@@ -271,7 +271,7 @@ fn liquidation_finalized_event(outcome: &LiquidationOutcome) -> WatchdogEvent<'s
         borrower: outcome.request.liquidation.borrower.to_text(),
         debt_asset: outcome.request.debt_asset.symbol(),
         collateral_asset: outcome.request.collateral_asset.symbol(),
-        status: outcome.status.description(),
+        status: outcome.formatted_status(),
         debt_repaid: outcome.formatted_debt_repaid(),
         collateral_received: outcome.formatted_received_collateral(),
         swap_output: outcome.formatted_swap_output(),
@@ -280,6 +280,7 @@ fn liquidation_finalized_event(outcome: &LiquidationOutcome) -> WatchdogEvent<'s
         realized_profit: outcome.formatted_realized_profit(),
         profit_delta: outcome.formatted_profit_delta(),
         round_trip_secs: outcome.formatted_round_trip_secs(),
+        note: outcome.note(),
     }
 }
 
@@ -362,7 +363,12 @@ mod tests {
         swappers::model::SwapRequest,
     };
 
-    use super::{SqliteWalStore, build_execution_runtime, spawn_runtime_thread};
+    use super::{SqliteWalStore, build_execution_runtime, liquidation_finalized_event, spawn_runtime_thread};
+    use crate::finalizers::{
+        finalizer::{FinalizerResult, UnswappedCollateral},
+        liquidation_outcome::LiquidationOutcome,
+    };
+    use crate::watchdog::WatchdogEvent;
 
     fn request(with_swap: bool) -> ExecutorRequest {
         let token = ChainToken::Icp {
@@ -428,6 +434,36 @@ mod tests {
             }),
             status,
             change_received: true,
+        }
+    }
+
+    /// A finished outcome of liquidation 7 with this finalizer result and status.
+    fn outcome(result: FinalizerResult, status: ExecutionStatus) -> LiquidationOutcome {
+        let receipt = receipt(7, TransferStatus::Success, true);
+        LiquidationOutcome {
+            request: receipt.request.clone(),
+            execution_receipt: receipt,
+            finalizer_result: result,
+            status,
+            expected_profit: 0,
+            realized_profit: 0,
+            round_trip_secs: Some(60),
+        }
+    }
+
+    /// A finished row whose collateral no venue could swap, with the reason the finalizer gave.
+    fn unswapped(collateral: UnswappedCollateral, reason: &str) -> FinalizerResult {
+        FinalizerResult {
+            unswapped: Some(collateral),
+            ..FinalizerResult::finished_without_swap(Some("recovery".to_string()), Some(reason.to_string()))
+        }
+    }
+
+    /// The status and note of the Slack message for an outcome.
+    fn status_and_note(outcome: &LiquidationOutcome) -> (String, Option<String>) {
+        match liquidation_finalized_event(outcome) {
+            WatchdogEvent::LiquidationFinalized { status, note, .. } => (status, note),
+            other => panic!("unexpected event {other:?}"),
         }
     }
 
@@ -497,5 +533,52 @@ mod tests {
         assert!(store.mark_accepted("bad", "10", &receipt).await.is_err());
         assert_eq!(store.get_intent("bad").await.unwrap().unwrap().status, LiquidationIntentStatus::Submitting);
         assert!(store.get_result("10").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn collateral_moved_to_recovery_reports_recovered_with_its_reason() {
+        let reason = "No venue can swap the collateral, so it went to the recovery account (tx 17).";
+        let recovered = outcome(
+            unswapped(UnswappedCollateral::Recovered, reason),
+            ExecutionStatus::Success,
+        );
+
+        assert_eq!(
+            status_and_note(&recovered),
+            ("Recovered".to_string(), Some(reason.to_string()))
+        );
+    }
+
+    /// Nothing moved, so the status must not send the operator to the recovery account.
+    #[test]
+    fn collateral_below_its_transfer_fee_reports_kept_with_its_reason() {
+        let reason = "No venue can swap the collateral, and 0.0001 ICP is below its transfer fee, so it stays in the trader account.";
+        let kept = outcome(unswapped(UnswappedCollateral::Kept, reason), ExecutionStatus::Success);
+
+        assert_eq!(status_and_note(&kept), ("Kept".to_string(), Some(reason.to_string())));
+    }
+
+    #[test]
+    fn a_swap_without_a_reason_reports_success_and_no_note() {
+        let swapped = outcome(
+            FinalizerResult::finished_without_swap(Some("multi_venue".to_string()), None),
+            ExecutionStatus::Success,
+        );
+
+        assert_eq!(status_and_note(&swapped), ("Success".to_string(), None));
+    }
+
+    /// A failed row has its reason in the status already, so the note would only repeat it.
+    #[test]
+    fn a_failed_row_has_no_note() {
+        let failed = outcome(
+            FinalizerResult::finished_without_swap(None, Some("no route".to_string())),
+            ExecutionStatus::SwapFailed("finalizer permanent failure: no route".to_string()),
+        );
+
+        assert_eq!(
+            status_and_note(&failed),
+            ("SwapFailed: finalizer permanent failure: no route".to_string(), None)
+        );
     }
 }
