@@ -376,6 +376,16 @@ fn thin_direct_pools() -> Arc<ScriptedWorkflow> {
     ])
 }
 
+/// ckBTC -> ICP -> ckUSDC -> ckUSDT: the only good path when ICP -> ckUSDT is weak.
+fn three_step_pools() -> Arc<ScriptedWorkflow> {
+    ScriptedWorkflow::with_pools(&[
+        (&ckbtc(), &icp(), pool(1, 1, 30.0)),
+        (&icp(), &ckusdt(), pool(87, 100, 1_300.0)),
+        (&icp(), &ckusdc(), pool(1, 1, 40.0)),
+        (&ckusdc(), &ckusdt(), pool(1, 1, 30.0)),
+    ])
+}
+
 #[tokio::test]
 async fn a_thin_direct_pool_gives_way_to_the_route_through_icp() {
     let harness = harness(thin_direct_pools());
@@ -562,16 +572,6 @@ async fn the_conservative_amount_is_the_least_that_the_whole_route_can_pay() {
     assert_eq!(preview.conservative_receive.value, Nat::from(902_404u64));
     // The expected amount still follows the quotes.
     assert_eq!(preview.quote.receive_amount, Nat::from(999_900u64));
-}
-
-/// ckBTC -> ICP -> ckUSDC -> ckUSDT: the only good path when ICP -> ckUSDT is weak.
-fn three_step_pools() -> Arc<ScriptedWorkflow> {
-    ScriptedWorkflow::with_pools(&[
-        (&ckbtc(), &icp(), pool(1, 1, 30.0)),
-        (&icp(), &ckusdt(), pool(87, 100, 1_300.0)),
-        (&icp(), &ckusdc(), pool(1, 1, 40.0)),
-        (&ckusdc(), &ckusdt(), pool(1, 1, 30.0)),
-    ])
 }
 
 #[tokio::test]

@@ -82,6 +82,40 @@ async fn start_anvil() -> (
     (anvil, provider, helper)
 }
 
+/// Runtime code that emits one ERC-20 `Transfer(from, to, amount)` log on any call.
+fn transfer_emitter(from: Address, to: Address, amount: U256) -> Bytes {
+    let mut code = Vec::new();
+    // MSTORE(0, amount): the log data.
+    code.push(0x7f);
+    code.extend_from_slice(&amount.to_be_bytes::<32>());
+    code.extend_from_slice(&[0x60, 0x00, 0x52]);
+    // LOG3 reads offset, size, topic0, topic1, topic2 from the top of the stack.
+    for topic in [
+        to.into_word(),
+        from.into_word(),
+        alloy::primitives::keccak256("Transfer(address,address,uint256)"),
+    ] {
+        code.push(0x7f);
+        code.extend_from_slice(topic.as_slice());
+    }
+    code.extend_from_slice(&[0x60, 0x20, 0x60, 0x00, 0xa3, 0x00]);
+    Bytes::from(code)
+}
+
+/// Sends a call from the anvil key and returns its hash. Nothing is mined.
+async fn send_call(provider: &impl Provider<AnyNetwork>, to: Address, value: U256) -> alloy::primitives::TxHash {
+    use alloy::network::TransactionBuilder;
+    let request = alloy::rpc::types::TransactionRequest::default()
+        .with_to(to)
+        .with_value(value)
+        .with_gas_limit(200_000);
+    *provider
+        .send_transaction(alloy::serde::WithOtherFields::new(request))
+        .await
+        .expect("the call is sent")
+        .tx_hash()
+}
+
 #[tokio::test]
 #[ignore = "needs anvil on PATH"]
 async fn anvil_a_signed_helper_deposit_lands_once() {
@@ -181,40 +215,6 @@ async fn anvil_an_approve_after_signed_deposits_takes_the_next_nonce() {
         .await
         .expect("the second approve takes the nonce after the deposits");
     miner.abort();
-}
-
-/// Runtime code that emits one ERC-20 `Transfer(from, to, amount)` log on any call.
-fn transfer_emitter(from: Address, to: Address, amount: U256) -> Bytes {
-    let mut code = Vec::new();
-    // MSTORE(0, amount): the log data.
-    code.push(0x7f);
-    code.extend_from_slice(&amount.to_be_bytes::<32>());
-    code.extend_from_slice(&[0x60, 0x00, 0x52]);
-    // LOG3 reads offset, size, topic0, topic1, topic2 from the top of the stack.
-    for topic in [
-        to.into_word(),
-        from.into_word(),
-        alloy::primitives::keccak256("Transfer(address,address,uint256)"),
-    ] {
-        code.push(0x7f);
-        code.extend_from_slice(topic.as_slice());
-    }
-    code.extend_from_slice(&[0x60, 0x20, 0x60, 0x00, 0xa3, 0x00]);
-    Bytes::from(code)
-}
-
-/// Sends a call from the anvil key and returns its hash. Nothing is mined.
-async fn send_call(provider: &impl Provider<AnyNetwork>, to: Address, value: U256) -> alloy::primitives::TxHash {
-    use alloy::network::TransactionBuilder;
-    let request = alloy::rpc::types::TransactionRequest::default()
-        .with_to(to)
-        .with_value(value)
-        .with_gas_limit(200_000);
-    *provider
-        .send_transaction(alloy::serde::WithOtherFields::new(request))
-        .await
-        .expect("the call is sent")
-        .tx_hash()
 }
 
 #[tokio::test]

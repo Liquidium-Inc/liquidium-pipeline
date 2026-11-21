@@ -28,6 +28,46 @@ const QUOTE: &str = r#"{
   "format": "formatted"
 }"#;
 
+/// An order answer in the shape of Rift's API reference, with the fields that the client ignores.
+const ORDER: &str = r#"{
+  "id": "o1", "quote_id": "q1", "vault_id": "v",
+  "from": "ethereum.usdc", "to": "ethereum.usdt",
+  "amount_in": "100", "amount_out": null, "payout_tx": null, "format": "formatted",
+  "deposit_address": "0xdeposit", "deposit_tx": null,
+  "to_address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72",
+  "refund_address": "0x1111111111111111111111111111111111111111",
+  "status": "awaiting_deposit",
+  "deposit_deadline": "2026-11-16T07:40:36Z", "created_at": "2026-11-09T07:40:36Z"
+}"#;
+
+/// The request that `ORDER` answers.
+fn order_request() -> RiftOrderRequest {
+    RiftOrderRequest {
+        quote_id: "q1".to_string(),
+        from: RiftAsset::new("ethereum", "usdc"),
+        to: RiftAsset::new("ethereum", "usdt"),
+        amount_in: "100".to_string(),
+        to_address: "0x8ba1f109551bd432803012645ac136ddd64dba72".to_string(),
+        refund_address: "0x1111111111111111111111111111111111111111".to_string(),
+    }
+}
+
+fn btc_to_usdt(amount_in: &str) -> RiftQuoteRequest {
+    RiftQuoteRequest {
+        from: RiftAsset::new("bitcoin", "btc"),
+        to: RiftAsset::new("ethereum", "usdt"),
+        amount_in: amount_in.to_string(),
+        venues: RiftVenueLists::default(),
+    }
+}
+
+/// `ORDER` with one field replaced by the given JSON value.
+fn order_with(field: &str, value: serde_json::Value) -> String {
+    let mut order: serde_json::Value = serde_json::from_str(ORDER).expect("order json");
+    order[field] = value;
+    order.to_string()
+}
+
 /// A venue list pins or blocks Rift's venues on the quote; the order inherits
 /// the route. Empty lists send nothing, so Rift stays free to choose.
 #[test]
@@ -89,30 +129,6 @@ fn an_asset_without_a_chain_is_malformed() {
     )
     .expect_err("no chain");
     assert!(matches!(error, RiftError::Malformed(_)), "{error}");
-}
-
-/// An order answer in the shape of Rift's API reference, with the fields that the client ignores.
-const ORDER: &str = r#"{
-  "id": "o1", "quote_id": "q1", "vault_id": "v",
-  "from": "ethereum.usdc", "to": "ethereum.usdt",
-  "amount_in": "100", "amount_out": null, "payout_tx": null, "format": "formatted",
-  "deposit_address": "0xdeposit", "deposit_tx": null,
-  "to_address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72",
-  "refund_address": "0x1111111111111111111111111111111111111111",
-  "status": "awaiting_deposit",
-  "deposit_deadline": "2026-11-16T07:40:36Z", "created_at": "2026-11-09T07:40:36Z"
-}"#;
-
-/// The request that `ORDER` answers.
-fn order_request() -> RiftOrderRequest {
-    RiftOrderRequest {
-        quote_id: "q1".to_string(),
-        from: RiftAsset::new("ethereum", "usdc"),
-        to: RiftAsset::new("ethereum", "usdt"),
-        amount_in: "100".to_string(),
-        to_address: "0x8ba1f109551bd432803012645ac136ddd64dba72".to_string(),
-        refund_address: "0x1111111111111111111111111111111111111111".to_string(),
-    }
 }
 
 #[test]
@@ -221,15 +237,6 @@ fn the_client_refuses_plain_http_except_to_this_machine() {
     }
 }
 
-fn btc_to_usdt(amount_in: &str) -> RiftQuoteRequest {
-    RiftQuoteRequest {
-        from: RiftAsset::new("bitcoin", "btc"),
-        to: RiftAsset::new("ethereum", "usdt"),
-        amount_in: amount_in.to_string(),
-        venues: RiftVenueLists::default(),
-    }
-}
-
 /// The client returns an answer only when it belongs to the request. An answer
 /// for another quote or order must not reach the plan or the steps.
 #[test]
@@ -248,13 +255,6 @@ fn a_quote_for_another_pair_or_amount_is_malformed() {
         matched_quote(&btc_to_usdt("not a number"), quote()),
         Err(RiftError::Malformed(_))
     ));
-}
-
-/// `ORDER` with one field replaced by the given JSON value.
-fn order_with(field: &str, value: serde_json::Value) -> String {
-    let mut order: serde_json::Value = serde_json::from_str(ORDER).expect("order json");
-    order[field] = value;
-    order.to_string()
 }
 
 #[test]

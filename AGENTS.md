@@ -6,6 +6,7 @@
 - Do not use cargo fmt --all, format only lines that have been touched.
 - Before creating, renaming, or moving files, inspect the surrounding module and follow its existing naming and directory conventions. Use role-specific names such as `<domain>_finalizer.rs`, `<domain>_adapter.rs` and `<domain>_utils.rs` for core files; do not introduce generic core names or a new folder structure without explicit agreement.
 - When a module mixes several concerns, group its files in lifecycle folders and keep module names stable with `#[path]`, as `swappers/icpswap` and `finalizers/cex` do. The core file keeps the main type and its flow, and declares each part, for example `#[path = "deposit/funding.rs"] mod funding;`. Tests go in a `tests/` folder, one file per area, with shared builders in `tests/mod.rs`. Split files with pure moves first (no logic change), and refactor in a separate commit.
+- In a test module, put every helper, builder, test double and constant above the first test. Never place a helper between tests or after them.
 - Code comments and doc strings: two sentences at most, in plain words. Say directly what the code does or returns, and when. Start with the action ("Returns…", "True when…", "Stops if…"). Add a short example when the rule is abstract.
   - Good: `/// Returns the status only if it is for the order that we asked about.`
   - Good: ``/// True when two decimal texts are the same number, for example `1.5` and `1.50`.``
