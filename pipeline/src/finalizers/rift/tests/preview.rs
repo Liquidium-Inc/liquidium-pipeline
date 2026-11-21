@@ -79,7 +79,10 @@ async fn preview_refuses_the_route_while_the_bridge_wallet_lacks_return_gas() {
     let error = finalizer.preview(&context(), &request(100_010_000)).await.unwrap_err();
 
     // 0.01 ETH of gas at the quoted price, plus the 25 percent margin.
-    assert!(error.contains("holds 0.001 ETH, below the 0.0125 ETH"), "{error}");
+    assert!(
+        error.to_string().contains("holds 0.001 ETH, below the 0.0125 ETH"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -91,7 +94,7 @@ async fn preview_refuses_a_quote_that_pays_nothing() {
 
     let error = finalizer.preview(&context(), &request(100_010_000)).await.unwrap_err();
 
-    assert!(error.contains("quotes nothing"), "{error}");
+    assert!(error.to_string().contains("quotes nothing"), "{error}");
 }
 
 #[tokio::test]
@@ -204,7 +207,7 @@ async fn a_payout_under_the_deposit_minimum_is_refused_at_preview() {
 
     let error = finalizer.preview(&context(), &request).await.unwrap_err();
 
-    assert!(error.contains("deposit minimum"), "{error}");
+    assert!(error.to_string().contains("deposit minimum"), "{error}");
 }
 
 /// A ckETH receive needs no minter call of its own: Rift pays ETH to the

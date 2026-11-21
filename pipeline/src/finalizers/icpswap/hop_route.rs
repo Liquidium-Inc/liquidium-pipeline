@@ -15,7 +15,7 @@ use tracing::warn;
 
 use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS};
 use crate::{
-    finalizers::multi_venue::{OperatorQuestion, VenuePlanningContext, VenueRoutePreview},
+    finalizers::multi_venue::{OperatorQuestion, VenueAmountError, VenuePlanningContext, VenueRoutePreview},
     outbound::driver::OperatorDecision,
     persistance::{VenueExecutionState, VenueLegStatus},
     swappers::{
@@ -399,10 +399,10 @@ impl IcpswapFinalizer {
         &self,
         context: &VenuePlanningContext,
         request: &SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         let paths = listed_paths(&request.pay_amount.token, &request.receive_asset);
         if paths.is_empty() {
-            return Err(unsupported_pair(request).to_string());
+            return Err(unsupported_pair(request).to_string().into());
         }
         let mut quotes = Vec::new();
         let mut failures = Vec::new();
@@ -420,7 +420,7 @@ impl IcpswapFinalizer {
                 .then_with(|| right.net_output().cmp(left.net_output()))
         });
         let Some(best) = quotes.into_iter().next() else {
-            return Err(format!("no usable ICPSwap path: {}", failures.join("; ")));
+            return Err(format!("no usable ICPSwap path: {}", failures.join("; ")).into());
         };
         self.preview_for(context, request, best)
     }
@@ -507,7 +507,7 @@ impl IcpswapFinalizer {
         context: &VenuePlanningContext,
         request: &SwapRequest,
         best: PathQuote,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         // The planner checks the edge on this amount, so it is the least that the whole route can pay.
         let conservative_receive = best.last().least_credit()?;
         let floors = best.steps.iter().map(|step| step.floor.clone()).collect();
@@ -527,7 +527,7 @@ impl IcpswapFinalizer {
             self.prepare_execution_state(&execution_id, &context.liquidation_id, &first_request, first.preview.route)?;
         let leg = if is_route {
             if request.receive_address.is_none() {
-                return Err("ICPSwap request is missing receive_address".to_string());
+                return Err("ICPSwap request is missing receive_address".into());
             }
             IcpswapLegState::Route(Box::new(IcpswapRouteState {
                 route_version: ROUTE_STATE_VERSION,

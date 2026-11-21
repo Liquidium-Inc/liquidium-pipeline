@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     finalizers::multi_venue::{
-        MultiVenueAdapter, OperatorQuestion, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview,
+        MultiVenueAdapter, OperatorQuestion, VenueAmountError, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview,
     },
     outbound::driver::OperatorDecision,
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
@@ -240,11 +240,11 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         &self,
         context: &crate::finalizers::multi_venue::VenuePlanningContext,
         request: &crate::swappers::model::SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         // Re-checked at the execution adapter boundary so a future planner or
         // forced-venue caller cannot bypass the venue policy.
         if self.trader.subaccount.is_some() {
-            return Err("ICPSwap requires the trader's default ledger account".to_string());
+            return Err("ICPSwap requires the trader's default ledger account".into());
         }
         self.preview_paths(context, request).await
     }

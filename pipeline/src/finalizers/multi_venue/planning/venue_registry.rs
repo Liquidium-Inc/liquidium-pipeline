@@ -130,14 +130,20 @@ async fn preview_with_amount_check(
     context: &VenuePlanningContext,
     request: &SwapRequest,
 ) -> VenuePreviewOutcome {
-    match adapter.check_amount(request).await {
-        Err(VenueAmountError::BelowMinimum(reason)) => return VenuePreviewOutcome::BelowMinimum(reason),
-        Err(VenueAmountError::Unavailable(error)) => return VenuePreviewOutcome::Unavailable(error),
-        Ok(()) => {}
+    if let Err(error) = adapter.check_amount(request).await {
+        return refused(error);
     }
     match adapter.preview(context, request).await {
         Ok(preview) => VenuePreviewOutcome::Quoted(preview),
-        Err(error) => VenuePreviewOutcome::Unavailable(error),
+        Err(error) => refused(error),
+    }
+}
+
+/// Returns the outcome of a venue that refused the amount.
+fn refused(error: VenueAmountError) -> VenuePreviewOutcome {
+    match error {
+        VenueAmountError::BelowMinimum(reason) => VenuePreviewOutcome::BelowMinimum(reason),
+        VenueAmountError::Unavailable(error) => VenuePreviewOutcome::Unavailable(error),
     }
 }
 

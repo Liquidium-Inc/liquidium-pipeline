@@ -305,7 +305,7 @@ async fn preview_refuses_an_output_below_the_mexc_withdrawal_minimum() {
     )
     .await
     .expect_err("MEXC would refuse the withdrawal and leave the output as dust");
-    assert!(error.contains("below its minimum"), "{error}");
+    assert!(error.to_string().contains("below its minimum"), "{error}");
 }
 
 #[tokio::test]
@@ -375,7 +375,7 @@ async fn preview_fails_when_the_exchange_refuses_the_route() {
         .expect_err("refused route");
 
     assert!(
-        error.contains("no transport that can carry") && error.contains("not verified"),
+        error.to_string().contains("no transport that can carry") && error.to_string().contains("not verified"),
         "{error}"
     );
 }
@@ -385,7 +385,7 @@ fn adapter_configuration_rejects_a_missing_token_registry_before_preview() {
     let error = MultiVenueAdapter::validate_configuration(&finalizer_without_registry())
         .expect_err("registry is required for adapter registration");
 
-    assert!(error.contains("token registry"));
+    assert!(error.to_string().contains("token registry"));
 }
 
 #[tokio::test]
@@ -402,7 +402,7 @@ async fn preview_rejects_zero_amount_before_orderbook_io() {
         .await
         .expect_err("zero amount must be rejected");
 
-    assert!(error.contains("non-positive pay amount"));
+    assert!(error.to_string().contains("non-positive pay amount"));
 }
 
 #[tokio::test]
@@ -415,7 +415,7 @@ async fn preview_rejects_slippage_above_ten_thousand_bps() {
         .await
         .expect_err("invalid basis-point limit must not be clamped");
 
-    assert!(error.contains("exceeds 10000"));
+    assert!(error.to_string().contains("exceeds 10000"));
 }
 
 #[test]
@@ -497,7 +497,7 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
         progress
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("ambiguous submission state"))
+            .is_some_and(|error| error.to_string().contains("ambiguous submission state"))
     );
 
     // Once an operator explicitly re-enqueues the parked row, recovery clears
@@ -864,7 +864,7 @@ async fn restart_surfaces_a_failed_deposit_bridge_without_resubmitting() {
     // spends retry budget, and is never resubmitted from here.
     assert_eq!(progress.status, VenueLegStatus::Running);
     let error = progress.retryable_error.expect("bridge failure is reported");
-    assert!(error.contains("minter rejected the deposit"), "{error}");
+    assert!(error.to_string().contains("minter rejected the deposit"), "{error}");
     let execution = progress
         .execution
         .decode::<CexVenueExecutionState>(VENUE_ID)
@@ -1060,7 +1060,7 @@ async fn adapter_rejects_a_mutated_committed_allocation() {
     let error = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect_err("mutated allocation must be rejected");
-    assert!(error.contains("persisted allocation"));
+    assert!(error.to_string().contains("persisted allocation"));
 }
 
 #[tokio::test]
@@ -1125,7 +1125,7 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
         failed
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("too small to reserve ledger fee")),
+            .is_some_and(|error| error.to_string().contains("too small to reserve ledger fee")),
         "{:?}",
         failed.last_error
     );
@@ -1349,7 +1349,7 @@ async fn venue_settlement_rejection_waits_instead_of_spending_the_retry_budget()
         waiting
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("Oversold"))
+            .is_some_and(|error| error.to_string().contains("Oversold"))
     );
 
     let execution = waiting
@@ -1581,7 +1581,10 @@ mod bridged_deposit_restart {
         assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
         assert!(progress.retryable_error.is_none());
         let error = progress.last_error.clone().expect("reason for the operator");
-        assert!(error.contains("2 unclaimed provider records match"), "{error}");
+        assert!(
+            error.to_string().contains("2 unclaimed provider records match"),
+            "{error}"
+        );
         let execution = decode(&progress);
         assert!(execution.gate.operator_required);
         assert!(matches!(
@@ -1977,9 +1980,15 @@ mod transport_fallback {
             .await
             .expect_err("no transport can carry the amount");
 
-        assert!(error.contains("no transport that can carry ICP -> ckUSDT"), "{error}");
-        assert!(error.contains("ICP@ICP -> ckUSDT@ICP: "), "{error}");
-        assert!(error.contains("ICP@ICP -> USDT@ETH via bridge: "), "{error}");
+        assert!(
+            error.to_string().contains("no transport that can carry ICP -> ckUSDT"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("ICP@ICP -> ckUSDT@ICP: "), "{error}");
+        assert!(
+            error.to_string().contains("ICP@ICP -> USDT@ETH via bridge: "),
+            "{error}"
+        );
     }
 
     /// A read that fails says nothing about the book. The venue is unavailable this
@@ -2008,7 +2017,7 @@ mod transport_fallback {
             .await
             .expect_err("an unavailable exchange is not a thin book");
 
-        assert!(error.contains("the exchange did not answer"), "{error}");
+        assert!(error.to_string().contains("the exchange did not answer"), "{error}");
         assert_eq!(*bridged_probes.lock().unwrap(), 0, "the bridge is not tried");
     }
 }

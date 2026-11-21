@@ -469,10 +469,10 @@ impl MultiVenueAdapter for ScriptedAdapter {
         &self,
         _context: &VenuePlanningContext,
         request: &SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         self.preview_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = &self.preview_failure {
-            return Err(error.clone());
+            return Err(error.clone().into());
         }
         let pay = request
             .pay_amount

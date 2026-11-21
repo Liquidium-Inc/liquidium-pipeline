@@ -16,12 +16,27 @@ pub struct VenuePlanningContext {
     pub liquidation_id: String,
 }
 
+/// Why a venue refused an amount. The planner matches on the variant.
 #[derive(Debug, thiserror::Error)]
 pub enum VenueAmountError {
+    /// The amount is too small for the venue, so the same amount fails again.
     #[error("{0}")]
     BelowMinimum(String),
+    /// The venue gave no answer this time, for example during an outage. A later try can work.
     #[error("{0}")]
     Unavailable(String),
+}
+
+impl From<String> for VenueAmountError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for VenueAmountError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,9 +137,12 @@ pub trait MultiVenueAdapter: Send + Sync {
     }
 
     /// Produces an amount-scoped quote and initial execution state without
-    /// submitting transfers, orders, or swaps.
-    async fn preview(&self, context: &VenuePlanningContext, request: &SwapRequest)
-    -> Result<VenueRoutePreview, String>;
+    /// submitting transfers, orders, or swaps. `BelowMinimum` says that the quote shows the amount is too small.
+    async fn preview(
+        &self,
+        context: &VenuePlanningContext,
+        request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, VenueAmountError>;
 
     /// Advances the supplied leg as far as this venue considers immediately
     /// safe. Multi-step venues checkpoint every prepared intent before its

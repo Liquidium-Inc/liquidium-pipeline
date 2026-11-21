@@ -52,7 +52,7 @@ struct ContextRecordingAdapter {
     contexts: Arc<Mutex<Vec<String>>>,
 }
 
-type PreviewResponder = dyn Fn(&SwapRequest) -> Result<VenueRoutePreview, String> + Send + Sync;
+type PreviewResponder = dyn Fn(&SwapRequest) -> Result<VenueRoutePreview, VenueAmountError> + Send + Sync;
 
 struct PlannerAdapter {
     venue_id: &'static str,
@@ -94,7 +94,7 @@ impl MultiVenueAdapter for PlannerAdapter {
         &self,
         _context: &VenuePlanningContext,
         request: &SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         assert!(!self.preview_forbidden, "{} must not be previewed", self.venue_id);
         self.calls
             .lock()
@@ -130,9 +130,9 @@ impl MultiVenueAdapter for BarrierAdapter {
         &self,
         _context: &VenuePlanningContext,
         _request: &SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         self.barrier.wait().await;
-        Err(format!("{} unavailable", self.venue_id))
+        Err(format!("{} unavailable", self.venue_id).into())
     }
 
     async fn advance(
@@ -162,7 +162,7 @@ impl MultiVenueAdapter for ContextRecordingAdapter {
         &self,
         context: &VenuePlanningContext,
         request: &SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         self.contexts
             .lock()
             .expect("contexts lock")
@@ -371,6 +371,7 @@ fn proportional_preview(
     preview(request, venue_id, slippage_bps, receive, receive)
 }
 
+/// A venue whose quote failures are outages: its text becomes `VenueAmountError::Unavailable`.
 fn mock_adapter<F>(venue_id: &'static str, calls: Arc<Mutex<Vec<u64>>>, responder: F) -> PlannerAdapter
 where
     F: Fn(&SwapRequest) -> Result<VenueRoutePreview, String> + Send + Sync + 'static,
@@ -378,7 +379,7 @@ where
     PlannerAdapter {
         venue_id,
         calls,
-        responder: Box::new(responder),
+        responder: Box::new(move |request| responder(request).map_err(Into::into)),
         validation_error: None,
         preview_forbidden: false,
         minimum_pay: None,
@@ -530,7 +531,7 @@ fn registry_rejects_an_adapter_with_missing_runtime_configuration() {
     let adapter = PlannerAdapter {
         venue_id: MEXC_VENUE_ID,
         calls: Arc::new(Mutex::new(Vec::new())),
-        responder: Box::new(|_| Err("not used".to_string())),
+        responder: Box::new(|_| Err("not used".into())),
         validation_error: Some("token registry is required".to_string()),
         preview_forbidden: true,
         minimum_pay: None,
@@ -1894,7 +1895,7 @@ async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
     let icpswap = PlannerAdapter {
         venue_id: ICPSWAP_VENUE_ID,
         calls: Arc::new(Mutex::new(Vec::new())),
-        responder: Box::new(|_| Err("not used".to_string())),
+        responder: Box::new(|_| Err("not used".into())),
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,
@@ -1925,7 +1926,7 @@ async fn tiny_non_native_collateral_is_rejected_before_mexc_preview() {
     let mexc = PlannerAdapter {
         venue_id: MEXC_VENUE_ID,
         calls: mexc_calls.clone(),
-        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
+        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".into())),
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,
@@ -1955,7 +1956,7 @@ async fn tiny_collateral_does_not_preview_mexc_when_icpswap_is_unavailable() {
     let mexc = PlannerAdapter {
         venue_id: MEXC_VENUE_ID,
         calls: mexc_calls.clone(),
-        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
+        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".into())),
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,
@@ -1986,7 +1987,7 @@ async fn an_unlisted_pair_is_mexc_only_and_never_previews_icpswap() {
     let icpswap = PlannerAdapter {
         venue_id: ICPSWAP_VENUE_ID,
         calls: Arc::new(Mutex::new(Vec::new())),
-        responder: Box::new(|_| Err("not used".to_string())),
+        responder: Box::new(|_| Err("not used".into())),
         validation_error: None,
         preview_forbidden: true,
         minimum_pay: None,

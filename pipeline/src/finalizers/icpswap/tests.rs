@@ -500,7 +500,7 @@ async fn multi_venue_preview_requires_an_explicit_receive_address() {
         .await
         .expect_err("ICPSwap preparation must reject a missing receive address");
 
-    assert!(error.contains("missing receive_address"));
+    assert!(error.to_string().contains("missing receive_address"));
 }
 
 #[tokio::test]
@@ -511,7 +511,7 @@ async fn multi_venue_preview_rejects_unsupported_pair_at_adapter_boundary() {
         .await
         .expect_err("unsupported IC token pair must be rejected");
 
-    assert!(error.contains("ICPSwap does not list the pair"));
+    assert!(error.to_string().contains("ICPSwap does not list the pair"));
 }
 
 #[tokio::test]
@@ -672,7 +672,7 @@ async fn multi_venue_preview_rejects_non_icp_chain_tokens_at_adapter_boundary() 
         .await
         .expect_err("a non-ICP chain token must be rejected before any client call");
 
-    assert!(error.contains("ICPSwap does not list the pair"));
+    assert!(error.to_string().contains("ICPSwap does not list the pair"));
 }
 
 #[tokio::test]
@@ -688,7 +688,7 @@ async fn multi_venue_advance_rejects_leg_tagged_for_a_different_venue() {
         .await
         .expect_err("a leg tagged for another venue must not be advanced");
 
-    assert!(error.contains("cannot advance venue"));
+    assert!(error.to_string().contains("cannot advance venue"));
 }
 
 #[tokio::test]
@@ -704,7 +704,7 @@ async fn multi_venue_recover_rejects_a_leg_that_is_not_in_recovery() {
         .await
         .expect_err("a leg mid-flight must not be treated as recovering");
 
-    assert!(error.contains("is not in recovery"));
+    assert!(error.to_string().contains("is not in recovery"));
 }
 
 #[tokio::test]
@@ -728,7 +728,7 @@ async fn multi_venue_preview_rejects_trader_with_a_non_default_subaccount() {
         .await
         .expect_err("a non-default trader subaccount must be rejected");
 
-    assert!(error.contains("default ledger account"));
+    assert!(error.to_string().contains("default ledger account"));
 }
 
 #[tokio::test]

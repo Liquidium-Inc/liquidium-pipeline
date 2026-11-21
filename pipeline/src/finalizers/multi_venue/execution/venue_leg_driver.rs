@@ -307,7 +307,7 @@ impl<V: VenueLeg + 'static> MultiVenueAdapter for V {
         &self,
         context: &VenuePlanningContext,
         request: &SwapRequest,
-    ) -> Result<VenueRoutePreview, String> {
+    ) -> Result<VenueRoutePreview, VenueAmountError> {
         let preview = self.preview_leg(context, request).await?;
         let exec = self.new_execution(preview.state);
         Ok(VenueRoutePreview {
