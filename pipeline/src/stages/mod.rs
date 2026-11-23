@@ -1,4 +1,5 @@
 pub mod bridge_submit_lock;
+#[path = "executor/executor_stage.rs"]
 pub mod executor;
 pub mod export;
 pub mod finalize;
