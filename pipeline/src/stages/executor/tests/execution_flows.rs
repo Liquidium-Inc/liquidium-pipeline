@@ -207,14 +207,22 @@ async fn acceptance_failures_retry_only_persistence_and_preserve_the_receipt() {
         let mut intents = MockLiquidationIntentStore::new();
         intents.expect_create_submitting().times(1).returning(|_, _| Ok(()));
         let mut sequence = mockall::Sequence::new();
-        intents.expect_mark_accepted()
+        intents
+            .expect_mark_accepted()
             .times(if recover { 1 } else { 3 })
             .in_sequence(&mut sequence)
             .returning(|_, _, _| Err(anyhow::anyhow!("database locked")));
         if recover {
-            intents.expect_mark_accepted().times(1).in_sequence(&mut sequence).returning(|_, _, _| Ok(()));
+            intents
+                .expect_mark_accepted()
+                .times(1)
+                .in_sequence(&mut sequence)
+                .returning(|_, _, _| Ok(()));
         } else {
-            intents.expect_mark_ambiguous().times(1).in_sequence(&mut sequence)
+            intents
+                .expect_mark_ambiguous()
+                .times(1)
+                .in_sequence(&mut sequence)
                 .returning(|_, _, receipt| {
                     let receipt = receipt.expect("retain the successful chain receipt");
                     assert_eq!(receipt.liquidation_result.unwrap().id, Nat::from(77u64));
@@ -222,7 +230,8 @@ async fn acceptance_failures_retry_only_persistence_and_preserve_the_receipt() {
                 });
         }
         let mut agent = MockPipelineAgent::new();
-        agent.expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .times(1)
             .returning(|_, _, _| Ok(Ok(make_liquidation_result(77))));
         let watchdog = Arc::new(RecordingWatchdog::default());

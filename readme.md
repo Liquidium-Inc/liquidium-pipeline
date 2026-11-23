@@ -228,29 +228,32 @@ A collateral pool without free liquidity cannot pay the seized collateral as tok
 
 | Setting | Meaning |
 |---|---|
-| `SHARE_PAYOUT_ENABLED` | Default `true`. Set it to `false` while the lending canister does not support `collateral_as_shares`: an older canister ignores the flag and pays tokens to the main account, and a row with a swap then stops for an operator. Any value but `true` or `false` stops the startup. |
+| `SHARE_PAYOUT_ENABLED` | Default `true`: resolve/register the default ICP account’s lending profile at startup and allow share payouts when pool liquidity is low. Set `false` for underlying-token payouts only, with no profile setup. Any value but `true` or `false` stops startup. |
 | `SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS` | Default `500`. The bot asks for shares when the pool's free liquidity is below the expected seized collateral plus this margin. |
 
 How a row moves:
 
-1. The liquidation names the main (liquidator) account as receiver, because the canister pays shares only to the caller. The row gets the status `held_shares`.
-2. The bot reads the pool's liquidity, at most once per minute for a row that waits. When the pool can pay, it calls `withdraw` on the lending canister. The destination is the trader account when a swap follows, else the main account.
-3. The bot finds the payout on the ledger. Then the row goes to the normal swap flow with the amount that arrived.
-4. A held row swaps only when the swap is in profit. If every venue gave a price and none is in profit, the tokens go to the recovery account. If a venue gave no price, the bot tries again later.
+1. Startup queries `get_wallet_profile` using the canonical ICRC address of the actual caller’s default ICP account. If missing, it calls `register_profile` with a short expiry and `IcpCaller` authentication (`principal` is the caller, `subaccount` is `None`); `AccountAlreadyLinked` triggers another lookup. Setup failures stop startup.
+2. A share request sets `collateral_share_receiver = Some(profile)`. It credits a lending position without a collateral token transfer, and the row becomes `held_shares`. Underlying payouts set it to `None` and populate `receiver_address` with the trader account when a swap follows, otherwise the main account.
+3. The bot reads the pool's liquidity, at most once per minute for a row that waits. When the pool can pay, it calls `withdraw` on the lending canister. The destination is the trader account when a swap follows, else the main account.
+4. The bot finds the payout on the ledger. Then the row goes to the normal swap flow with the amount that arrived.
+5. A held row swaps only when the swap is in profit. If every venue gave a price and none is in profit, the tokens go to the recovery account. If a venue gave no price, the bot tries again later.
 
 What to know:
 
+- The result’s `collateral_share_receiver` identifies the credited profile. It may be `None` when no shares were seized; the bot does not wait for a collateral transfer in that case. The canister never creates profiles during liquidation and checks ownership before and after asynchronous repayment.
+- Missing-profile and ownership errors stop new liquidation calls until the default ICP profile is repaired and the bot restarts. Existing settlement and withdrawals continue.
 - **No cap.** Nothing limits how much the bot holds as shares. A pool that stays empty can take the bot's debt tokens one liquidation after another. Watch the log lines `share_holding_total` and `share_holding_total_usd`, and the low-balance alerts.
 - **Price exposure.** The bot keeps the collateral's price risk while it waits. The shares earn supply interest, and the last held row of a pool collects it.
 - **The switch decides only new liquidations.** The bot withdraws rows that already hold shares, also when the switch is off.
-- **Operator rows.** `liquidator reconcile <id>` shows the state and names the action. The bot parks a row as `operator` in four cases:
+- **Operator rows.** `liquidator reconcile <id>` shows the state and names the action. The bot parks a row as `operator` in these cases:
 
   | Case | What to check | Action |
   |---|---|---|
   | The outcome of a withdraw call is not known | Did the position of the liquidator's profile shrink? Is there a transfer from the pool to the destination? | `--landed <withdraw id>` if it ran (for example `withdraw_123`; the bot then looks for the payout), or `--absent` if it did not. A plain `--release` is refused, because it could withdraw twice. |
   | A payout is not on the ledger after 60 minutes | The pool canister and its ledger | `--release` waits for the payout again. The bot does not withdraw again. |
   | The position is empty, but the row still expects tokens | The position of the liquidator's profile in the pool, and the withdraws of that profile | `--absent` if the position is empty: the row goes to the swap with the amount that arrived. `--release` makes the bot look at the position again. |
-  | An older canister ignored the flag and paid tokens to the main account | The main account balance | Move the tokens to the trader account, then `--release` queues the row for the swap. |
+  | The credited profile differs from the requested profile, or nonzero collateral has no credited profile for a share request | The lending position and liquidation result | Reconcile the position and transfers before releasing the row. |
 
   A parked row with an open withdraw blocks new withdraws from its pool until an operator answers it.
 - **Rollback.** An older binary reads the status `held_shares` as permanently failed and does not withdraw. Before you go back to an older version, let this version finish all held rows.

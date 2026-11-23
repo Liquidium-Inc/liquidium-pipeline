@@ -1,6 +1,7 @@
 //! Table tests of the pure decisions of the recovery.
 use super::super::offer_matching::*;
 use super::*;
+use crate::liquidation::collateral_payout_utils::CollateralPayoutError;
 
 fn query() -> OfferQuery {
     OfferQuery {
@@ -115,10 +116,10 @@ fn confirms_follows_each_condition() {
         ("token payout", false, result(1833, None), Ok(())),
         ("share payout that was requested", true, result(1833, profile), Ok(())),
         (
-            "token payout for a share request (older canister)",
+            "missing credited profile with collateral",
             true,
             result(1833, None),
-            Ok(()),
+            Err(Mismatch::CollateralPayout(CollateralPayoutError::MissingShareProfile)),
         ),
         ("another id", false, result(1834, None), Err(Mismatch::LiquidationId)),
         ("another debt asset", false, other_debt, Err(Mismatch::DebtAsset)),
@@ -132,10 +133,22 @@ fn confirms_follows_each_condition() {
             "share payout that was not requested",
             false,
             result(1833, profile),
-            Err(Mismatch::SharesNotRequested),
+            Err(Mismatch::CollateralPayout(CollateralPayoutError::SharesNotRequested)),
         ),
     ];
     for (name, asked_for_shares, result, expected) in cases {
         assert_eq!(confirms(&request(asked_for_shares), 1833, &result), expected, "{name}");
     }
+}
+
+#[test]
+fn share_recovery_accepts_zero_seizure_and_rejects_another_profile() {
+    let mut empty = result(1833, None);
+    empty.amounts.collateral_received = Nat::from(0u8);
+    assert_eq!(confirms(&request(true), 1833, &empty), Ok(()));
+    let wrong = result(1833, Some(Principal::management_canister()));
+    assert!(matches!(
+        confirms(&request(true), 1833, &wrong),
+        Err(Mismatch::CollateralPayout(CollateralPayoutError::WrongProfile { .. }))
+    ));
 }

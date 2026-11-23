@@ -102,6 +102,11 @@ fn collateral_covers_repay(
         .is_ok_and(|denom_bps| collateral_value.clone() * Nat::from(BPS_ONE) >= repay_value.clone() * denom_bps)
 }
 
+struct SharePayoutConfig {
+    profile: Principal,
+    policy: Arc<dyn SharePayoutPolicy>,
+}
+
 pub struct SimpleLiquidationStrategy<C, R, U>
 where
     C: ConfigTrait,
@@ -118,7 +123,7 @@ where
     /// coverage and same-asset pairs still shape the ranking.
     venue_native_symbols: Vec<String>,
     /// Decides when a liquidation takes the collateral as supply shares. `None` keeps every payout in tokens.
-    share_payout: Option<Arc<dyn SharePayoutPolicy>>,
+    share_payout: Option<SharePayoutConfig>,
 }
 
 impl<C, R, U> SimpleLiquidationStrategy<C, R, U>
@@ -147,8 +152,8 @@ where
     }
 
     /// Turns on the share payout for pools that cannot pay the seized collateral.
-    pub fn with_share_payout(mut self, policy: Arc<dyn SharePayoutPolicy>) -> Self {
-        self.share_payout = Some(policy);
+    pub fn with_share_payout(mut self, profile: Principal, policy: Arc<dyn SharePayoutPolicy>) -> Self {
+        self.share_payout = Some(SharePayoutConfig { profile, policy });
         self
     }
 
@@ -163,17 +168,15 @@ where
         self
     }
 
-    /// True when the collateral pool cannot pay `seized` as tokens. The request then asks for supply shares.
-    async fn needs_share_payout(&self, pool: Principal, token: &ChainToken, seized: &Nat) -> bool {
-        let Some(policy) = &self.share_payout else {
-            return false;
-        };
-        if *seized == 0u8 || !policy.wants_shares(pool, seized.clone()).await {
-            return false;
+    /// Returns the configured profile when the collateral pool cannot pay `seized` as tokens.
+    async fn collateral_share_receiver(&self, pool: Principal, token: &ChainToken, seized: &Nat) -> Option<Principal> {
+        let payout = self.share_payout.as_ref()?;
+        if *seized == 0u8 || !payout.policy.wants_shares(pool, seized.clone()).await {
+            return None;
         }
         let amount = ChainTokenAmount::from_raw(token.clone(), seized.clone());
         info!("🧾 Share payout: pool {pool} cannot pay {} now", amount.formatted());
-        true
+        Some(payout.profile)
     }
 
     fn debt_approval_needed(&self, token: &ChainToken) -> bool {
@@ -528,7 +531,7 @@ where
                     // No swap follows, so the main account that paid gets it back directly (audit L03).
                     receiver_address: self.config.get_liquidator_principal(),
                     buy_bad_debt: true,
-                    collateral_as_shares: None,
+                    collateral_share_receiver: None,
                 },
                 ref_price: 0u32.into(),
                 debt_ref_price: 0u32.into(),
@@ -908,8 +911,8 @@ where
                 continue;
             }
 
-            let as_shares = self
-                .needs_share_payout(
+            let collateral_share_receiver = self
+                .collateral_share_receiver(
                     collateral_position.pool_id,
                     &collateral_token,
                     &gross_estimated_collateral,
@@ -917,8 +920,8 @@ where
                 .await;
 
             // The trader account receives collateral for a swap (audit L03).
-            // A share payout goes to the main account, because the canister pays shares only to the caller.
-            let pays_trader = swap_args.is_some() && !as_shares;
+            // A share payout credits the resolved lending profile; change still goes to the main account.
+            let pays_trader = swap_args.is_some() && collateral_share_receiver.is_none();
             let collateral_receiver = if pays_trader {
                 self.config.get_trader_principal()
             } else {
@@ -934,7 +937,7 @@ where
                     debt_amount: estimation.repaid_debt.clone(),
                     receiver_address: collateral_receiver,
                     buy_bad_debt,
-                    collateral_as_shares: as_shares.then_some(true),
+                    collateral_share_receiver,
                 },
                 ref_price: estimation.ref_price,
                 debt_ref_price: estimation.debt_price,
@@ -1490,9 +1493,9 @@ mod tests {
         (strategy, mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900))
     }
 
-    /// The canister pays shares only to the caller. Thus the request names the main account, not the trader account.
+    /// Credits shares to the resolved profile and sends change to the main account.
     #[tokio::test]
-    async fn a_share_payout_request_names_the_caller_as_receiver() {
+    async fn a_share_payout_request_names_the_resolved_profile() {
         let (strategy, user) = swap_case();
         let mut policy = MockSharePayoutPolicy::new();
         policy
@@ -1506,14 +1509,17 @@ mod tests {
             });
 
         let res = strategy
-            .with_share_payout(Arc::new(policy))
+            .with_share_payout(Principal::management_canister(), Arc::new(policy))
             .process(&vec![user])
             .await
             .unwrap();
 
         assert_eq!(res.len(), 1);
         let req = &res[0];
-        assert_eq!(req.liquidation.collateral_as_shares, Some(true));
+        assert_eq!(
+            req.liquidation.collateral_share_receiver,
+            Some(Principal::management_canister())
+        );
         assert_eq!(
             req.liquidation.receiver_address,
             p("2vxsx-fae"),
@@ -1530,12 +1536,12 @@ mod tests {
         policy.expect_wants_shares().times(1).returning(|_, _| false);
 
         let res = strategy
-            .with_share_payout(Arc::new(policy))
+            .with_share_payout(Principal::management_canister(), Arc::new(policy))
             .process(&vec![user])
             .await
             .unwrap();
 
-        assert_eq!(res[0].liquidation.collateral_as_shares, None);
+        assert_eq!(res[0].liquidation.collateral_share_receiver, None);
         assert_eq!(res[0].liquidation.receiver_address, p("aaaaa-aa"));
     }
 
@@ -1543,7 +1549,7 @@ mod tests {
     async fn without_the_feature_no_request_asks_for_shares() {
         let (strategy, user) = swap_case();
         let res = strategy.process(&vec![user]).await.unwrap();
-        assert_eq!(res[0].liquidation.collateral_as_shares, None);
+        assert_eq!(res[0].liquidation.collateral_share_receiver, None);
         assert_eq!(res[0].liquidation.receiver_address, p("aaaaa-aa"));
     }
 
@@ -2150,7 +2156,7 @@ mod tests {
             balance_service,
             Arc::new(ApprovalState::new()),
         )
-        .with_share_payout(Arc::new(never_asked_policy()));
+        .with_share_payout(Principal::management_canister(), Arc::new(never_asked_policy()));
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let borrower = p("user-pure-bad-debt");
@@ -2162,7 +2168,7 @@ mod tests {
         assert!(res[0].liquidation.buy_bad_debt);
         assert_eq!(res[0].min_collateral_amount, Nat::from(0u8));
         // A purchase of bad debt seizes nothing. Thus it never asks for shares.
-        assert_eq!(res[0].liquidation.collateral_as_shares, None);
+        assert_eq!(res[0].liquidation.collateral_share_receiver, None);
         // The offer is the debt plus the ckUSDC buffer. An offer of exactly the debt can be 1 unit short.
         assert_eq!(res[0].liquidation.debt_amount, Nat::from(2_000u64));
         // The expected loss is the debt plus two ledger fees. The buffer is not in it, because it comes back as change.

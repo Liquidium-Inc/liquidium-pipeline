@@ -444,7 +444,7 @@ fn receipt_input_uses_actual_collateral_received_not_estimated_swap_amount() {
                 debt_amount: Nat::from(DEBT_REPAID),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
-                collateral_as_shares: None,
+                collateral_share_receiver: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: collateral.asset_id(),
@@ -2566,7 +2566,7 @@ async fn legacy_receipt_without_debt_oracle_price_skips_only_the_oracle_guard() 
                 debt_amount: Nat::from(1_000_000u64),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
-                collateral_as_shares: None,
+                collateral_share_receiver: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: collateral.asset_id(),

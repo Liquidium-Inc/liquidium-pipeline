@@ -118,7 +118,7 @@ impl MultiVenueFinalizer {
         wrapper: &mut LiqMetaWrapper,
         request: &ReconcileRequest,
     ) -> Result<Option<String>, String> {
-        if wrapper.receipt.request.liquidation.collateral_as_shares != Some(true) {
+        if wrapper.receipt.request.liquidation.collateral_share_receiver.is_none() {
             return Ok(None);
         }
         let report = share_row_report(row, wrapper);

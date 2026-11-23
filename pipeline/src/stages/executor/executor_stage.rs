@@ -8,7 +8,11 @@ use tracing::{debug, info, warn};
 
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
-    liquidation::lending_queries::get_liquidation_inflow,
+    liquidation::{
+        collateral_payout_utils::{CollateralPayout, CollateralPayoutError, classify_collateral_payout},
+        lending_queries::get_liquidation_inflow,
+        share_profile_adapter::{ShareProfileError, liquidation_profile_error, verify_share_profile},
+    },
     persistance::LiquidationIntentStore,
     stage::PipelineStage,
     watchdog::WatchdogEvent,
@@ -25,6 +29,8 @@ pub enum ExecutionStatus {
     Success,
     LiquidationCallFailed(String),
     FailedLiquidation(String),
+    ShareProfileSetupError(ShareProfileError),
+    CollateralPayoutMismatch(CollateralPayoutError),
     CollateralTransferFailed(String),
     ChangeTransferFailed(String),
     SwapFailed(String),
@@ -36,6 +42,10 @@ impl ExecutionStatus {
             ExecutionStatus::Pending => "Pending".to_string(),
             ExecutionStatus::Success => "Success".to_string(),
             ExecutionStatus::LiquidationCallFailed(msg) => format!("LiquidationCallFailed: {}", msg),
+            ExecutionStatus::ShareProfileSetupError(error) => {
+                format!("Share profile setup error: {error}; verify profile setup and restart")
+            }
+            ExecutionStatus::CollateralPayoutMismatch(error) => format!("Collateral payout mismatch: {error}"),
             ExecutionStatus::FailedLiquidation(msg) => format!("FailedLiquidation: {}", msg),
             ExecutionStatus::CollateralTransferFailed(msg) => format!("CollateralTransferFailed: {}", msg),
             ExecutionStatus::ChangeTransferFailed(msg) => format!("ChangeTransferFailed: {}", msg),
@@ -58,11 +68,20 @@ impl ExecutionReceipt {
     /// Returns the receipt of a liquidation that the canister answered.
     /// The normal call and the recovery of an interrupted call both use it, so their rows are the same.
     pub fn from_result(request: ExecutorRequest, liquidation: LiquidationResult) -> Self {
-        let status = match (&liquidation.status, &liquidation.collateral_tx.status) {
-            (LiquidationStatus::FailedLiquidation(error), _) => ExecutionStatus::FailedLiquidation(error.clone()),
-            (_, TransferStatus::Success) => ExecutionStatus::Success,
-            (_, TransferStatus::Pending) => ExecutionStatus::CollateralTransferFailed("collateral pending".to_string()),
-            (_, TransferStatus::Failed(error)) => ExecutionStatus::CollateralTransferFailed(error.clone()),
+        let status = if let LiquidationStatus::FailedLiquidation(error) = &liquidation.status {
+            ExecutionStatus::FailedLiquidation(error.clone())
+        } else {
+            match classify_collateral_payout(request.liquidation.collateral_share_receiver, &liquidation) {
+                Ok(CollateralPayout::Shares(_) | CollateralPayout::NoCollateral) => ExecutionStatus::Success,
+                Ok(CollateralPayout::Underlying) => match &liquidation.collateral_tx.status {
+                    TransferStatus::Success => ExecutionStatus::Success,
+                    TransferStatus::Pending => {
+                        ExecutionStatus::CollateralTransferFailed("collateral pending".to_string())
+                    }
+                    TransferStatus::Failed(error) => ExecutionStatus::CollateralTransferFailed(error.clone()),
+                },
+                Err(error) => ExecutionStatus::CollateralPayoutMismatch(error),
+            }
         };
         // A failed liquidation keeps the default, as before. No retry reads this flag.
         let change_received = matches!(status, ExecutionStatus::FailedLiquidation(_))
@@ -84,7 +103,12 @@ impl ExecutionReceipt {
         {
             fresh.amounts.collateral_received = current.amounts.collateral_received.clone();
         }
-        let collateral_landed = matches!(fresh.collateral_tx.status, TransferStatus::Success);
+        let collateral_landed =
+            match classify_collateral_payout(self.request.liquidation.collateral_share_receiver, &fresh) {
+                Ok(CollateralPayout::Shares(_) | CollateralPayout::NoCollateral) => true,
+                Ok(CollateralPayout::Underlying) => matches!(fresh.collateral_tx.status, TransferStatus::Success),
+                Err(_) => false,
+            };
         let change_received = matches!(fresh.change_tx.status, TransferStatus::Success);
         let mut changed = false;
         if self.change_received != change_received {
@@ -109,6 +133,12 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
 {
     #[instrument(name = "executor.process", skip_all, err, fields(request_count = executor_requests.len()))]
     async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
+        if self.share_profile_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(
+                "liquidation setup stopped after a profile error; verify default ICP profile setup and restart"
+                    .to_string(),
+            );
+        }
         debug!("Executing request {:?}", executor_requests);
         // One future per request, all run concurrently
         let futures = executor_requests.iter().map(|executor_request| {
@@ -174,20 +204,32 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     Err(err) => {
                         warn!("[executor] liquidate_with_slippage rejected by canister | {summary} | err={err:?}");
                         let error = format!("{:?}", err);
-                        receipt.status = ExecutionStatus::FailedLiquidation(error.clone());
+                        if let Some(error) = liquidation_profile_error(liq_req.collateral_share_receiver, &err) {
+                            self.stop_for_profile_error(&mut receipt, error, &summary);
+                        } else {
+                            receipt.status = ExecutionStatus::FailedLiquidation(error.clone());
+                        }
                         return self.save_failed(&intent_id, None, receipt, &error).await;
                     }
                 };
 
                 // A missing change must not stop the receipt: the WAL is the only handoff of the
                 // collateral to the finalizer. The batch end reports the unpaid change (audit L04).
-                let receipt = ExecutionReceipt::from_result(executor_request.clone(), liq.clone());
+                let mut receipt = ExecutionReceipt::from_result(executor_request.clone(), liq.clone());
                 if let ExecutionStatus::FailedLiquidation(err) = &receipt.status {
                     warn!(
                         "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | {summary} | err={err}",
                         liq.id
                     );
                     let err = err.clone();
+                    if let Some(expected) = executor_request.liquidation.collateral_share_receiver {
+                        // Recheck ownership because failures after repayment carry only human-readable text.
+                        if let Err(error) = verify_share_profile(
+                            self.agent.as_ref(), &self.lending_canister, self.account_id.owner, expected,
+                        ).await {
+                            self.stop_for_profile_error(&mut receipt, error, &summary);
+                        }
+                    }
                     return self.save_failed(&intent_id, Some(liq.id.to_string()), receipt, &err).await;
                 }
                 if matches!(receipt.status, ExecutionStatus::CollateralTransferFailed(_)) {
@@ -245,6 +287,14 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
             .await;
     }
 
+    /// Stops new submissions and records the setup error while preserving the liquidation result.
+    fn stop_for_profile_error(&self, receipt: &mut ExecutionReceipt, error: ShareProfileError, summary: &str) {
+        self.share_profile_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::error!(%error, "Share profile setup invalid or unverifiable; new liquidations stopped until setup is repaired and the bot restarts | {summary}");
+        receipt.status = ExecutionStatus::ShareProfileSetupError(error);
+    }
+
     /// Saves a rejected liquidation on its intent and returns its receipt.
     async fn save_failed(
         &self,
@@ -289,13 +339,20 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
 fn request_summary(request: &ExecutorRequest) -> String {
     let liquidation = &request.liquidation;
     format!(
-        "borrower={} | debt_pool={} | collateral_pool={} | debt={} | bad_debt={} | min_collateral_amount={}",
+        "borrower={} | debt_pool={} | collateral_pool={} | debt={} | bad_debt={} | min_collateral_amount={} | collateral_payout={} | collateral_share_receiver={:?} | receiver_address={}",
         liquidation.borrower.to_text(),
         liquidation.debt_pool_id.to_text(),
         liquidation.collateral_pool_id.to_text(),
         liquidation.debt_amount,
         liquidation.buy_bad_debt,
-        request.min_collateral_amount
+        request.min_collateral_amount,
+        if liquidation.collateral_share_receiver.is_some() {
+            "shares"
+        } else {
+            "underlying"
+        },
+        liquidation.collateral_share_receiver,
+        liquidation.receiver_address,
     )
 }
 

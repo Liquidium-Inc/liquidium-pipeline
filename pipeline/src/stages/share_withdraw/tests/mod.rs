@@ -53,7 +53,7 @@ fn held_record(id: &str, seized: u64, created_at: i64, with_swap: bool) -> LiqRe
                 debt_amount: Nat::from(50_000_000u64),
                 receiver_address: liquidator(),
                 buy_bad_debt: false,
-                collateral_as_shares: Some(true),
+                collateral_share_receiver: Some(Principal::anonymous()),
             },
             swap_args: with_swap.then(|| SwapRequest {
                 pay_asset: collateral.asset_id(),

@@ -165,7 +165,7 @@ fn receipt() -> ExecutionReceipt {
                 debt_amount: Nat::from(100_000u64),
                 receiver_address: p(4),
                 buy_bad_debt: false,
-                collateral_as_shares: None,
+                collateral_share_receiver: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: collateral.asset_id(),

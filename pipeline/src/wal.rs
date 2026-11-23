@@ -181,7 +181,7 @@ mod tests {
                 debt_amount: Nat::from(1_000u64),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
-                collateral_as_shares: None,
+                collateral_share_receiver: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: collateral.asset_id(),

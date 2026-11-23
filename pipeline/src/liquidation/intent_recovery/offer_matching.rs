@@ -5,6 +5,7 @@ use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidationResult};
 
 use crate::executors::executor::ExecutorRequest;
+use crate::liquidation::collateral_payout_utils::{CollateralPayoutError, classify_collateral_payout};
 use crate::liquidation::ledger_party_utils::{is_default_account, is_owned_by};
 
 /// The canister writes the liquidation id into the memo of the offer transfer, as 16 bytes.
@@ -42,8 +43,7 @@ pub(super) enum Mismatch {
     LiquidationId,
     DebtAsset,
     CollateralAsset,
-    /// The result is a share payout, but the request did not ask for shares.
-    SharesNotRequested,
+    CollateralPayout(CollateralPayoutError),
 }
 
 /// Returns the liquidation id of a memo with exactly 16 bytes, for example the bytes of `1833`.
@@ -94,9 +94,7 @@ pub(super) fn confirms(request: &ExecutorRequest, id: u128, result: &Liquidation
     if !is_asset_of(&result.collateral_asset, &request.collateral_asset) {
         return Err(Mismatch::CollateralAsset);
     }
-    let asked_for_shares = request.liquidation.collateral_as_shares == Some(true);
-    if result.collateral_share_receiver.is_some() && !asked_for_shares {
-        return Err(Mismatch::SharesNotRequested);
-    }
+    classify_collateral_payout(request.liquidation.collateral_share_receiver, result)
+        .map_err(Mismatch::CollateralPayout)?;
     Ok(())
 }

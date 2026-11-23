@@ -383,10 +383,22 @@ async fn init(
     .with_venue_native_symbols(venue_native_symbols);
     // The switch decides only new liquidations. The bot withdraws rows that already hold shares, also when the switch is off.
     let strategy = if config.share_payout_enabled {
-        strategy.with_share_payout(Arc::new(LiquidityPayoutPolicy::new(
-            share_positions(&ctx),
-            config.share_payout_liquidity_margin_bps,
-        )))
+        let caller = agent.get_principal().map_err(|error| error.to_string())?;
+        let profile = crate::liquidation::share_profile_adapter::resolve_share_profile(
+            agent.as_ref(),
+            &config.lending_canister,
+            caller,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        info!(%profile, %caller, "Share payout profile ready; collateral shares credit this lending position without a token transfer");
+        strategy.with_share_payout(
+            profile,
+            Arc::new(LiquidityPayoutPolicy::new(
+                share_positions(&ctx),
+                config.share_payout_liquidity_margin_bps,
+            )),
+        )
     } else {
         strategy
     };
@@ -836,7 +848,7 @@ mod tests {
                     debt_amount: Nat::from(100_000u64),
                     receiver_address: Principal::from_slice(&[4]),
                     buy_bad_debt: false,
-                    collateral_as_shares: None,
+                    collateral_share_receiver: None,
                 },
                 swap_args: Some(request),
                 debt_asset: output,

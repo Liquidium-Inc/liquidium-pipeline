@@ -655,7 +655,7 @@ fn receipt_with_id(liquidation_id: u128) -> ExecutionReceipt {
                 debt_amount: Nat::from(DEBT_REPAID),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
-                collateral_as_shares: None,
+                collateral_share_receiver: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: collateral.asset_id(),
@@ -2490,7 +2490,7 @@ mod share_row_reconcile {
 
     fn share_request_receipt() -> ExecutionReceipt {
         let mut receipt = receipt();
-        receipt.request.liquidation.collateral_as_shares = Some(true);
+        receipt.request.liquidation.collateral_share_receiver = Some(Principal::anonymous());
         receipt
     }
 

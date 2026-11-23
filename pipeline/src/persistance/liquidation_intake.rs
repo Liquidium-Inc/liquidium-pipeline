@@ -15,37 +15,25 @@ use crate::{
     stages::executor::ExecutionReceipt,
 };
 
+use crate::liquidation::collateral_payout_utils::{CollateralPayout, classify_collateral_payout};
+
 use super::sqlite::SqliteWalStore;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, TransferStatus};
 
-/// The operator note of a row whose share flag the canister ignored.
-pub const SHARE_FLAG_IGNORED: &str = "the canister ignored the share flag and paid the collateral as tokens to the main account. \
-     Move the tokens to the trader account. Then release the row with `liquidator reconcile <id> --release`";
+/// Names a payout result that needs reconciliation before collateral can be spent.
+pub const SHARE_PROFILE_MISMATCH: &str = "collateral payout does not match the requested lending profile; reconcile the position and transfers before releasing this row";
 
-/// Returns the first status of an accepted liquidation, and the note for an operator when the row needs one.
-/// The rules go in order, and the first rule that matches decides.
+/// Returns the initial row status from the credited profile and token settlement.
 fn first_status(receipt: &ExecutionReceipt, liquidation: &LiquidationResult) -> (ResultStatus, Option<&'static str>) {
-    let paid_as_shares = liquidation.collateral_share_receiver.is_some();
-    let asked_for_shares = receipt.request.liquidation.collateral_as_shares == Some(true);
-    let collateral_paid = liquidation.amounts.collateral_received != 0u8;
-    let swap_follows = receipt.request.swap_args.is_some();
-    let transfer_done = matches!(liquidation.collateral_tx.status, TransferStatus::Success);
-
-    // Rule 1: the collateral is supply shares, and no token arrived. The withdraw step takes the row.
-    if paid_as_shares {
-        return (ResultStatus::HeldAsShares, None);
+    match classify_collateral_payout(receipt.request.liquidation.collateral_share_receiver, liquidation) {
+        Err(_) => (ResultStatus::OperatorRequired, Some(SHARE_PROFILE_MISMATCH)),
+        Ok(CollateralPayout::Shares(_)) => (ResultStatus::HeldAsShares, None),
+        Ok(CollateralPayout::NoCollateral) => (ResultStatus::Enqueued, None),
+        Ok(CollateralPayout::Underlying) if matches!(liquidation.collateral_tx.status, TransferStatus::Success) => {
+            (ResultStatus::Enqueued, None)
+        }
+        Ok(CollateralPayout::Underlying) => (ResultStatus::WaitingCollateral, None),
     }
-    // Rule 2: an older canister ignored the flag and paid tokens to the main account.
-    // The swap cannot use them, because it spends from the trader account.
-    if asked_for_shares && collateral_paid && swap_follows {
-        return (ResultStatus::OperatorRequired, Some(SHARE_FLAG_IGNORED));
-    }
-    // Rule 3: the token transfer is done. The finalizer takes the row, also without a swap (audit L03).
-    if transfer_done {
-        return (ResultStatus::Enqueued, None);
-    }
-    // Rule 4: the token transfer is not done. The settlement watcher waits for it.
-    (ResultStatus::WaitingCollateral, None)
 }
 
 impl SqliteWalStore {
@@ -360,7 +348,7 @@ mod tests {
                 debt_amount: Nat::from(100_000u64),
                 receiver_address: principal("2vxsx-fae"),
                 buy_bad_debt: false,
-                collateral_as_shares: None,
+                collateral_share_receiver: None,
             },
             swap_args: None,
             debt_asset: token.clone(),
@@ -400,6 +388,29 @@ mod tests {
             status: ExecutionStatus::Success,
             change_received: true,
         }
+    }
+
+    fn swap_request() -> crate::swappers::model::SwapRequest {
+        let token = request().collateral_asset;
+        crate::swappers::model::SwapRequest {
+            pay_asset: token.asset_id(),
+            pay_amount: liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount::from_raw(
+                token.clone(),
+                Nat::from(100_000u64),
+            ),
+            receive_asset: token.asset_id(),
+            receive_address: None,
+            max_slippage_bps: None,
+            venue_hint: None,
+        }
+    }
+
+    async fn accepted_row(receipt: ExecutionReceipt) -> crate::persistance::LiqResultRecord {
+        let temp = tempfile::NamedTempFile::new().expect("temporary database");
+        let store = SqliteWalStore::new(temp.path().to_str().expect("database path")).expect("store");
+        store.create_submitting("intent-1", &receipt.request).await.unwrap();
+        store.mark_accepted("intent-1", "42", &receipt).await.unwrap();
+        store.get_result("42").await.unwrap().unwrap()
     }
 
     #[tokio::test]
@@ -443,29 +454,6 @@ mod tests {
         assert_eq!(store.get_intent("intent-2").await.unwrap().unwrap().status, LiquidationIntentStatus::Submitting);
     }
 
-    fn swap_request() -> crate::swappers::model::SwapRequest {
-        let token = request().collateral_asset;
-        crate::swappers::model::SwapRequest {
-            pay_asset: token.asset_id(),
-            pay_amount: liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount::from_raw(
-                token.clone(),
-                Nat::from(100_000u64),
-            ),
-            receive_asset: token.asset_id(),
-            receive_address: None,
-            max_slippage_bps: None,
-            venue_hint: None,
-        }
-    }
-
-    async fn accepted_row(receipt: ExecutionReceipt) -> crate::persistance::LiqResultRecord {
-        let temp = tempfile::NamedTempFile::new().expect("temporary database");
-        let store = SqliteWalStore::new(temp.path().to_str().expect("database path")).expect("store");
-        store.create_submitting("intent-1", &receipt.request).await.unwrap();
-        store.mark_accepted("intent-1", "42", &receipt).await.unwrap();
-        store.get_result("42").await.unwrap().unwrap()
-    }
-
     /// One row for each case of each rule of `first_status`.
     #[test]
     fn first_status_follows_its_rules_in_order() {
@@ -485,17 +473,18 @@ mod tests {
         let cases = [
             Case { name: "rule 1: share payout with a swap", asked_for_shares: true, share_receiver: true, collateral_received: 100_000, swap: true, transfer: done(), status: ResultStatus::HeldAsShares, note: false },
             Case { name: "rule 1: share payout without a swap", asked_for_shares: true, share_receiver: true, collateral_received: 100_000, swap: false, transfer: done(), status: ResultStatus::HeldAsShares, note: false },
-            Case { name: "rule 2: flag ignored, swap follows", asked_for_shares: true, share_receiver: false, collateral_received: 100_000, swap: true, transfer: done(), status: ResultStatus::OperatorRequired, note: true },
-            Case { name: "rule 2: flag ignored, transfer not done", asked_for_shares: true, share_receiver: false, collateral_received: 100_000, swap: true, transfer: pending(), status: ResultStatus::OperatorRequired, note: true },
-            Case { name: "rule 3: flag ignored, no swap", asked_for_shares: true, share_receiver: false, collateral_received: 100_000, swap: false, transfer: done(), status: ResultStatus::Enqueued, note: false },
-            Case { name: "rule 3: flag ignored, no collateral", asked_for_shares: true, share_receiver: false, collateral_received: 0, swap: true, transfer: done(), status: ResultStatus::Enqueued, note: false },
+            Case { name: "rule 2: missing credited profile, swap follows", asked_for_shares: true, share_receiver: false, collateral_received: 100_000, swap: true, transfer: done(), status: ResultStatus::OperatorRequired, note: true },
+            Case { name: "rule 2: missing credited profile, transfer not done", asked_for_shares: true, share_receiver: false, collateral_received: 100_000, swap: true, transfer: pending(), status: ResultStatus::OperatorRequired, note: true },
+            Case { name: "missing credited profile without swap", asked_for_shares: true, share_receiver: false, collateral_received: 100_000, swap: false, transfer: done(), status: ResultStatus::OperatorRequired, note: true },
+            Case { name: "rule 3: missing credited profile, no collateral", asked_for_shares: true, share_receiver: false, collateral_received: 0, swap: true, transfer: done(), status: ResultStatus::Enqueued, note: false },
             Case { name: "rule 3: token payout done", asked_for_shares: false, share_receiver: false, collateral_received: 100_000, swap: true, transfer: done(), status: ResultStatus::Enqueued, note: false },
             Case { name: "rule 4: token payout not done", asked_for_shares: false, share_receiver: false, collateral_received: 100_000, swap: true, transfer: pending(), status: ResultStatus::WaitingCollateral, note: false },
             Case { name: "rule 4: token payout failed", asked_for_shares: false, share_receiver: false, collateral_received: 100_000, swap: true, transfer: TransferStatus::Failed("x".to_string()), status: ResultStatus::WaitingCollateral, note: false },
         ];
         for case in cases {
             let mut receipt = receipt(42);
-            receipt.request.liquidation.collateral_as_shares = case.asked_for_shares.then_some(true);
+            receipt.request.liquidation.collateral_share_receiver =
+                case.asked_for_shares.then_some(Principal::anonymous());
             receipt.request.swap_args = case.swap.then(swap_request);
             let liquidation = receipt.liquidation_result.as_mut().unwrap();
             liquidation.collateral_share_receiver = case.share_receiver.then(|| principal("2vxsx-fae"));
@@ -514,7 +503,7 @@ mod tests {
     async fn a_share_payout_starts_as_a_held_row_with_its_position() {
         let profile = principal("hnnn4-iyaaa-aaaar-qb4bq-cai");
         let mut receipt = receipt(42);
-        receipt.request.liquidation.collateral_as_shares = Some(true);
+        receipt.request.liquidation.collateral_share_receiver = Some(profile);
         receipt.request.swap_args = Some(swap_request());
         receipt.liquidation_result.as_mut().unwrap().collateral_share_receiver = Some(profile);
 
@@ -529,25 +518,28 @@ mod tests {
         assert_eq!(holding.open, None);
     }
 
-    /// An older canister ignores the flag and pays tokens to the main account. The swap cannot use tokens there.
+    /// Parks a nonzero payout with no credited profile for reconciliation.
     #[tokio::test]
-    async fn an_ignored_share_flag_parks_a_row_that_needs_a_swap() {
+    async fn a_missing_credited_profile_with_collateral_parks_the_row() {
         let mut receipt = receipt(42);
-        receipt.request.liquidation.collateral_as_shares = Some(true);
+        receipt.request.liquidation.collateral_share_receiver = Some(Principal::anonymous());
         receipt.request.swap_args = Some(swap_request());
 
         let row = accepted_row(receipt).await;
         assert_eq!(row.status, ResultStatus::OperatorRequired);
-        assert_eq!(row.last_error.as_deref(), Some(super::SHARE_FLAG_IGNORED));
+        assert_eq!(row.last_error.as_deref(), Some(super::SHARE_PROFILE_MISMATCH));
         let wrapper = crate::wal::decode_receipt_wrapper(&row).unwrap().unwrap();
         assert!(wrapper.share_holding.is_none());
     }
 
-    /// Without a swap, the tokens belong in the main account. Thus an ignored flag changes nothing.
+    /// Finishes a share request with no seized collateral even without a credited profile.
     #[tokio::test]
-    async fn an_ignored_share_flag_without_a_swap_runs_as_before() {
+    async fn a_share_request_without_seized_collateral_needs_no_transfer() {
         let mut receipt = receipt(42);
-        receipt.request.liquidation.collateral_as_shares = Some(true);
+        receipt.request.liquidation.collateral_share_receiver = Some(Principal::anonymous());
+        let result = receipt.liquidation_result.as_mut().unwrap();
+        result.amounts.collateral_received = Nat::from(0u8);
+        result.collateral_tx.status = TransferStatus::Pending;
 
         let row = accepted_row(receipt).await;
         assert_eq!(row.status, ResultStatus::Enqueued);

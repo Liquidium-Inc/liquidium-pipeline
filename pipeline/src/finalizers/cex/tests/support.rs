@@ -43,7 +43,7 @@ pub(super) fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         debt_amount: Nat::from(0u32),
         receiver_address: Principal::from_text("aaaaa-aa").unwrap(),
         buy_bad_debt: false,
-        collateral_as_shares: None,
+        collateral_share_receiver: None,
     };
 
     let liq_result = LiquidationResult {
@@ -100,7 +100,7 @@ pub(super) fn make_execution_receipt_with_assets(
         debt_amount: Nat::from(0u32),
         receiver_address: Principal::from_text("aaaaa-aa").unwrap(),
         buy_bad_debt: false,
-        collateral_as_shares: None,
+        collateral_share_receiver: None,
     };
 
     let liq_result = LiquidationResult {

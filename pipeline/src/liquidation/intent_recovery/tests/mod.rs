@@ -46,7 +46,7 @@ fn token(ledger: Principal, symbol: &str, decimals: u8) -> ChainToken {
 }
 
 /// A request for a ckETH collateral and a ckUSDT debt, with a swap.
-pub(super) fn request(collateral_as_shares: bool) -> ExecutorRequest {
+pub(super) fn request(collateral_share_receiver: bool) -> ExecutorRequest {
     let debt = token(debt_ledger(), "ckUSDT", 6);
     let collateral = token(collateral_ledger(), "ckETH", 18);
     ExecutorRequest {
@@ -57,7 +57,8 @@ pub(super) fn request(collateral_as_shares: bool) -> ExecutorRequest {
             debt_amount: Nat::from(OFFER),
             receiver_address: liquidator(),
             buy_bad_debt: false,
-            collateral_as_shares: collateral_as_shares.then_some(true),
+            collateral_share_receiver: collateral_share_receiver
+                .then_some(Principal::from_text("g4oj7-diaaa-aaaaa-aaaaa-aaaaa-aaaaa-phai").unwrap()),
         },
         swap_args: Some(SwapRequest {
             pay_asset: collateral.asset_id(),

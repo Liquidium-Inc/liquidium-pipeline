@@ -142,12 +142,12 @@ mod tests {
             debt_amount: Nat::from(7u8),
             receiver_address: Principal::anonymous(),
             buy_bad_debt: false,
-            collateral_as_shares: Some(true),
+            collateral_share_receiver: Some(Principal::anonymous()),
         };
         let mut json = serde_json::to_value(&request).unwrap();
-        json.as_object_mut().unwrap().remove("collateral_as_shares");
+        json.as_object_mut().unwrap().remove("collateral_share_receiver");
         let read: LiquidationRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(read.collateral_as_shares, None);
+        assert_eq!(read.collateral_share_receiver, None);
 
         let tx = || TxStatus {
             tx_id: None,
