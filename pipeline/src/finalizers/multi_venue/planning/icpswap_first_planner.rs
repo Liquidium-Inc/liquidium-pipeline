@@ -67,6 +67,8 @@ pub struct IcpswapFirstPlannerConfig {
     /// met and would leave the collateral stranded. `-10000` recycles it
     /// whatever the shortfall; the quote is still bounded by the oracle guard.
     pub bad_debt_min_net_edge_bps: i32,
+    /// Edge floor for collateral that the bot held as supply shares. The row uses this or its normal floor, whichever is higher.
+    pub held_shares_min_net_edge_bps: i32,
     pub max_oracle_discount_bps: u32,
     /// How old a recorded price may be, in seconds, before the guard stops using
     /// it as a fallback for a live oracle read.
@@ -165,6 +167,11 @@ impl IcpswapFirstPlannerConfig {
             return Err(IcpswapFirstPlannerError::InvalidInput(format!(
                 "bad-debt minimum net edge {} bps must stay within ±{} bps",
                 self.bad_debt_min_net_edge_bps, BPS_DENOMINATOR
+            )));
+        }
+        if !is_valid_settlement_floor(self.held_shares_min_net_edge_bps) {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "held-shares minimum net edge must be greater than -{bps_limit} and at most {bps_limit} bps"
             )));
         }
         // A discount of exactly BPS_DENOMINATOR permits any output at all, which
@@ -1405,9 +1412,11 @@ impl IcpswapFirstPlanner {
         let combined_net_edge_bps = edge_bps(&net_receive, &input.debt_repaid)?;
 
         // Every quote is still held to the oracle by `validate_venue_preview`.
-        // A held row gets no loss allowance: the output must cover the repaid debt.
+        // A held row uses the held-shares floor when it is higher than the row's normal floor.
         let required_edge_bps = if input.held_as_shares {
-            self.config.required_edge_bps(input.buy_bad_debt).max(0)
+            self.config
+                .required_edge_bps(input.buy_bad_debt)
+                .max(self.config.held_shares_min_net_edge_bps)
         } else {
             self.config.required_edge_bps(input.buy_bad_debt)
         };

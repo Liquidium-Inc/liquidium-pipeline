@@ -758,6 +758,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         settlement_min_net_edge_bps: None,
         buy_bad_debt: false,
         bad_debt_min_net_edge_bps: 150,
+        held_shares_min_net_edge_bps: 0,
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
