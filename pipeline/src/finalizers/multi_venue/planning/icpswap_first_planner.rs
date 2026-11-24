@@ -67,8 +67,6 @@ pub struct IcpswapFirstPlannerConfig {
     /// met and would leave the collateral stranded. `-10000` recycles it
     /// whatever the shortfall; the quote is still bounded by the oracle guard.
     pub bad_debt_min_net_edge_bps: i32,
-    /// Edge floor for collateral that the bot held as supply shares. The row uses this or its normal floor, whichever is higher.
-    pub held_shares_min_net_edge_bps: i32,
     pub max_oracle_discount_bps: u32,
     /// How old a recorded price may be, in seconds, before the guard stops using
     /// it as a fallback for a live oracle read.
@@ -169,11 +167,6 @@ impl IcpswapFirstPlannerConfig {
                 self.bad_debt_min_net_edge_bps, BPS_DENOMINATOR
             )));
         }
-        if !is_valid_settlement_floor(self.held_shares_min_net_edge_bps) {
-            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
-                "held-shares minimum net edge must be greater than -{bps_limit} and at most {bps_limit} bps"
-            )));
-        }
         // A discount of exactly BPS_DENOMINATOR permits any output at all, which
         // silently disables the guard rather than loosening it.
         if self.max_oracle_discount_bps >= BPS_DENOMINATOR {
@@ -252,7 +245,7 @@ pub struct IcpswapFirstPlanInput {
     /// floor rather than the profitable-liquidation one.
     pub buy_bad_debt: bool,
     /// True when the bot held the collateral as supply shares and withdrew it later.
-    /// Such a row swaps only in profit, because its price changed while it waited.
+    /// Below its floor, such a row goes to the recovery account when every venue gave a price.
     pub held_as_shares: bool,
 }
 
@@ -481,9 +474,9 @@ pub enum IcpswapFirstPlannerError {
     /// overflow preview through a venue failure downgrade it to `NoViableRoute`.
     #[error("no venue can execute this amount: {0}")]
     BelowVenueMinimum(String),
-    /// Collateral that the bot held as supply shares would swap at a loss.
+    /// Collateral that the bot held as supply shares would swap below its floor.
     /// The caller moves it to the recovery account and does not try again.
-    #[error("held collateral is not in profit: {0}")]
+    #[error("held collateral is below its swap floor: {0}")]
     NotInProfit(String),
 }
 
@@ -1412,14 +1405,8 @@ impl IcpswapFirstPlanner {
         let combined_net_edge_bps = edge_bps(&net_receive, &input.debt_repaid)?;
 
         // Every quote is still held to the oracle by `validate_venue_preview`.
-        // A held row uses the held-shares floor when it is higher than the row's normal floor.
-        let required_edge_bps = if input.held_as_shares {
-            self.config
-                .required_edge_bps(input.buy_bad_debt)
-                .max(self.config.held_shares_min_net_edge_bps)
-        } else {
-            self.config.required_edge_bps(input.buy_bad_debt)
-        };
+        // A held row uses the same floor as other rows, because its debt is already repaid.
+        let required_edge_bps = self.config.required_edge_bps(input.buy_bad_debt);
 
         if !meets_minimum_edge(&net_receive, &input.debt_repaid, required_edge_bps)? {
             warn!(

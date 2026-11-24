@@ -230,7 +230,6 @@ A collateral pool without free liquidity cannot pay the seized collateral as tok
 |---|---|
 | `SHARE_PAYOUT_ENABLED` | Default `true`: resolve/register the default ICP account’s lending profile at startup and allow share payouts when pool liquidity is low. Set `false` for underlying-token payouts only, with no profile setup. Any value but `true` or `false` stops startup. |
 | `SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS` | Default `500`. The bot asks for shares when the pool's free liquidity is below the expected seized collateral plus this margin. |
-| `MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS` | Default `0`. The edge floor for the swap of a held row, checked on the conservative output after side costs. The row uses this value or its normal floor, whichever is higher. Set it to `-150` to treat held rows like other rows. |
 
 How a row moves:
 
@@ -238,7 +237,7 @@ How a row moves:
 2. A share request sets `collateral_share_receiver = Some(profile)`. It credits a lending position without a collateral token transfer, and the row becomes `held_shares`. Underlying payouts set it to `None` and populate `receiver_address` with the trader account when a swap follows, otherwise the main account.
 3. The bot reads the pool's liquidity, at most once per minute for a row that waits. When the pool can pay, it calls `withdraw` on the lending canister. The destination is the trader account when a swap follows, else the main account.
 4. The bot finds the payout on the ledger. Then the row goes to the normal swap flow with the amount that arrived.
-5. A held row swaps only when the swap meets `MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS` (default `0`, in profit). If every venue gave a price and none meets it, the tokens go to the recovery account. If a venue gave no price, the bot tries again later.
+5. A held row swaps with the same floor as other rows: `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS`, or `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` when bad debt is on. If every venue gave a price and none meets the floor, the tokens go to the recovery account. If a venue gave no price, the bot tries again later.
 
 What to know:
 
@@ -350,8 +349,6 @@ CEX_RETRY_MAX_SECS=120
 MULTI_VENUE_MIN_NET_EDGE_BPS=150
 # Normal-settlement floor after liquidation; -150 allows up to 1.5% shortfall (the default)
 MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
-# Swap floor for collateral held as supply shares; 0 swaps only in profit (the default)
-MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS=0
 # Reject a venue quote this far below the oracle-implied output (bps)
 MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=500
 # How long a price recorded on a receipt may stand in for a live oracle read (seconds)
@@ -384,7 +381,6 @@ Quick reference:
 | `MULTI_VENUE_MIN_NET_EDGE_BPS` | Recorded on each plan. Only plans saved before the settlement floor existed still settle against it. |
 | `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Signed floor for normal settlement after liquidation. The default `-150` allows up to 1.5% conservative shortfall, because the debt is already repaid. Valid range is greater than `-10000` through `10000`; an absent value uses `-150`, and an invalid value also uses `-150` with a warning in the log. Does not change liquidation-entry checks or already committed plans. |
 | `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` | Existing signed floor used for all new settlement plans when `BUY_BAD_DEBT=true`, and for saved bad-debt rows even when global mode is off. Defaults to `-500` (up to 5% shortfall) and takes precedence over the normal-settlement override. |
-| `MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS` | Signed floor for collateral the bot held as supply shares. Defaults to `0`. A held row uses this value or its normal floor (settlement or bad-debt), whichever is higher. Valid range is greater than `-10000` through `10000`; an absent or invalid value uses `0`. |
 | `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |

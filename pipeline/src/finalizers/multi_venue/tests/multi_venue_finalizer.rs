@@ -758,7 +758,6 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         settlement_min_net_edge_bps: None,
         buy_bad_debt: false,
         bad_debt_min_net_edge_bps: 150,
-        held_shares_min_net_edge_bps: 0,
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
@@ -1444,10 +1443,10 @@ fn held_receipt(debt_repaid: Option<u64>) -> ExecutionReceipt {
     receipt
 }
 
-/// The loss floor for bad debt would let this row swap at a loss. A held row gets no such allowance.
+/// A held row below its bad-debt floor goes to the recovery account, and no venue swaps it.
 #[tokio::test]
-async fn held_collateral_that_is_not_in_profit_goes_to_recovery_and_is_not_swapped() {
-    // The repaid debt is above every quote. Thus the swap would return less than the debt.
+async fn held_collateral_below_its_floor_goes_to_recovery_and_is_not_swapped() {
+    // Every quote gives 200M for 250M of debt, which is -2,000 bps and below the -500 floor.
     let mut receipt = held_receipt(Some(250_000_000));
     receipt.request.liquidation.buy_bad_debt = true;
     let wal = TestWal::with_receipt(&receipt);
@@ -1460,7 +1459,7 @@ async fn held_collateral_that_is_not_in_profit_goes_to_recovery_and_is_not_swapp
         .times(1)
         .returning(|_, _, _| Ok("recovery-block-9".to_string()));
     let config = IcpswapFirstPlannerConfig {
-        bad_debt_min_net_edge_bps: -6000,
+        bad_debt_min_net_edge_bps: -500,
         ..planner_config()
     };
     let finalizer = MultiVenueFinalizer::new(vec![icpswap.clone(), mexc.clone()], config)
@@ -1479,7 +1478,7 @@ async fn held_collateral_that_is_not_in_profit_goes_to_recovery_and_is_not_swapp
     let state = committed_recovery_state(&wal);
     assert_eq!(state.status, RecoverySweepStatus::Completed);
     assert!(
-        state.reason.contains("held collateral is not in profit"),
+        state.reason.contains("held collateral is below its swap floor"),
         "{}",
         state.reason
     );
@@ -1502,18 +1501,21 @@ async fn held_collateral_in_profit_is_planned_for_a_swap() {
     assert!(matches!(meta.payload, FinalizerMetaPayload::MultiVenueSwap(_)));
 }
 
-/// Without a recovery account the row fails once and does not swap at a loss.
+/// Without a recovery account, a held row below its floor fails once and does not swap.
 #[tokio::test]
-async fn held_collateral_not_in_profit_without_a_recovery_account_fails_once() {
+async fn held_collateral_below_its_floor_without_a_recovery_account_fails_once() {
     let receipt = held_receipt(Some(199_000_000));
     let wal = TestWal::with_receipt(&receipt);
     let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
     let finalizer = finalizer(vec![icpswap.clone()]);
 
-    let error = finalizer.finalize(&wal, receipt).await.expect_err("no swap at a loss");
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("no swap below the floor");
 
     assert!(matches!(error, FinalizerError::Permanent(_)), "{error:?}");
-    assert!(error.message().contains("held collateral is not in profit"));
+    assert!(error.message().contains("held collateral is below its swap floor"));
     assert_eq!(icpswap.calls(), 0);
 }
 

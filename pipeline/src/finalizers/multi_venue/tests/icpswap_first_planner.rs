@@ -298,7 +298,6 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         settlement_min_net_edge_bps: None,
         buy_bad_debt: false,
         bad_debt_min_net_edge_bps: 150,
-        held_shares_min_net_edge_bps: 0,
         // Must stay above the 150 bps dust fallback and 200 bps CEX impact caps,
         // which already include the venue fee.
         max_oracle_discount_bps: 250,
@@ -1643,25 +1642,22 @@ async fn collateral_that_was_not_held_is_retried_as_before() {
     assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)), "{error}");
 }
 
-/// A held row uses the held-shares floor, or the normal floor when that is higher.
+/// A held row swaps with the normal floor, and with the bad-debt floor when bad debt is on.
 #[tokio::test]
-async fn held_collateral_uses_the_higher_of_the_held_shares_and_normal_floors() {
-    for (held_floor, output, enforced) in [
-        (0, TOTAL_PAY, Some(0)),
-        (0, TOTAL_PAY * 990 / 1000, None),
-        (-150, TOTAL_PAY * 985 / 1000, Some(-150)),
-        (-150, TOTAL_PAY * 985 / 1000 - 1, None),
-        (-300, TOTAL_PAY * 985 / 1000, Some(-150)),
-        (-300, TOTAL_PAY * 980 / 1000, None),
-        (50, TOTAL_PAY * 1005 / 1000, Some(50)),
-        (50, TOTAL_PAY, None),
+async fn held_collateral_uses_the_same_floor_as_other_rows() {
+    for (buy_bad_debt, output, enforced) in [
+        (false, TOTAL_PAY * 985 / 1000, Some(-150)),
+        (false, TOTAL_PAY * 985 / 1000 - 1, None),
+        (true, TOTAL_PAY * 950 / 1000, Some(-500)),
+        (true, TOTAL_PAY * 950 / 1000 - 1, None),
     ] {
         let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
             Ok(preview(request, ICPSWAP_VENUE_ID, 0.0, output, output))
         });
         let planner_config = IcpswapFirstPlannerConfig {
             settlement_min_net_edge_bps: Some(-150),
-            held_shares_min_net_edge_bps: held_floor,
+            buy_bad_debt,
+            bad_debt_min_net_edge_bps: -500,
             ..config(1.1)
         };
         let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], planner_config).expect("valid planner");
@@ -1670,24 +1666,12 @@ async fn held_collateral_uses_the_higher_of_the_held_shares_and_normal_floors() 
         let result = planner.plan(&input, QUOTED_AT).await;
         match enforced {
             Some(floor) => {
-                let state = result.expect("output meets the held row's floor");
-                assert_eq!(state.plan.enforced_min_net_edge_bps, Some(floor), "held floor {held_floor}");
+                let state = result.expect("output meets the floor of other rows");
+                assert_eq!(state.plan.enforced_min_net_edge_bps, Some(floor), "bad debt {buy_bad_debt}");
             }
-            None => assert!(result.is_err(), "held floor {held_floor}, output {output}"),
+            None => assert!(result.is_err(), "bad debt {buy_bad_debt}, output {output}"),
         }
     }
-}
-
-#[test]
-fn a_held_shares_floor_that_accepts_any_output_is_rejected() {
-    let planner_config = IcpswapFirstPlannerConfig {
-        held_shares_min_net_edge_bps: -10_000,
-        ..config(1.1)
-    };
-    assert!(matches!(
-        IcpswapFirstPlanner::new(vec![Arc::new(unprofitable_icpswap())], planner_config),
-        Err(IcpswapFirstPlannerError::InvalidInput(_))
-    ));
 }
 
 // Venue availability

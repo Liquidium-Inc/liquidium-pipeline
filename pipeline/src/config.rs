@@ -82,9 +82,6 @@ pub struct Config {
     /// Signed settlement floor for global bad-debt mode or saved bad-debt rows. See
     /// `parse_multi_venue_bad_debt_min_net_edge_bps_from_env`.
     pub multi_venue_bad_debt_min_net_edge_bps: i32,
-    /// Signed settlement floor for collateral held as supply shares. See
-    /// `parse_multi_venue_held_shares_min_net_edge_bps_from_env`.
-    pub multi_venue_held_shares_min_net_edge_bps: i32,
     /// Maximum downside from the oracle-implied output allowed for any venue
     /// quote, in bps. Applied centrally after venue quote normalization.
     pub multi_venue_max_oracle_discount_bps: u32,
@@ -475,7 +472,6 @@ impl Config {
             multi_venue_settlement_min_net_edge_bps: parse_multi_venue_settlement_min_net_edge_bps_from_env()
                 .or(Some(DEFAULT_MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS)),
             multi_venue_bad_debt_min_net_edge_bps: parse_multi_venue_bad_debt_min_net_edge_bps_from_env(),
-            multi_venue_held_shares_min_net_edge_bps: parse_multi_venue_held_shares_min_net_edge_bps_from_env(),
             multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
             multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
             cycles_usd_per_trillion: parse_cycles_usd_per_trillion_from_env(),
@@ -589,8 +585,6 @@ const DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS: i32 = -500;
 /// After a liquidation the debt is already repaid, so the swap may return up to
 /// this much less (audit L17). The entry margin here would hold the collateral after an ordinary price move.
 const DEFAULT_MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS: i32 = -150;
-/// Collateral held as supply shares swaps only when the output covers the repaid debt.
-const DEFAULT_MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS: i32 = 0;
 const DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS: u32 = 500;
 const DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
@@ -662,16 +656,6 @@ fn parse_multi_venue_bad_debt_min_net_edge_bps_from_env() -> i32 {
     let limit = i32::try_from(MAX_BPS).unwrap_or(i32::MAX);
     parse_signed_bps_from_env("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", |bps| bps >= -limit && bps <= limit)
         .unwrap_or(DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS)
-}
-
-/// Returns the settlement floor for collateral held as supply shares, or 0 when unset or invalid.
-/// A held row uses this or its normal floor, whichever is higher.
-fn parse_multi_venue_held_shares_min_net_edge_bps_from_env() -> i32 {
-    parse_signed_bps_from_env(
-        "MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS",
-        crate::finalizers::multi_venue::is_valid_settlement_floor,
-    )
-    .unwrap_or(DEFAULT_MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS)
 }
 
 /// A discount of `MAX_BPS` accepts any output at all, so out-of-range values
@@ -1116,7 +1100,6 @@ mod tests {
             "MULTI_VENUE_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS",
-            "MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS",
             "CEX_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS",
             "MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS",
@@ -1151,7 +1134,6 @@ mod tests {
         // The same 150 bps, mirrored: a profitable liquidation must clear the
         // debt by that much, bad debt may fall short of it by that much.
         assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
-        assert_eq!(parse_multi_venue_held_shares_min_net_edge_bps_from_env(), 0);
         assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
     }
 
@@ -1221,22 +1203,6 @@ mod tests {
         assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
 
         unsafe { env::remove_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS") };
-    }
-
-    #[test]
-    fn held_shares_edge_floor_accepts_negatives_and_rejects_out_of_range() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-
-        unsafe { env::set_var("MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS", "-150") };
-        assert_eq!(parse_multi_venue_held_shares_min_net_edge_bps_from_env(), -150);
-
-        unsafe { env::set_var("MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS", "-10000") };
-        assert_eq!(parse_multi_venue_held_shares_min_net_edge_bps_from_env(), 0);
-
-        unsafe { env::set_var("MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS", "not-a-number") };
-        assert_eq!(parse_multi_venue_held_shares_min_net_edge_bps_from_env(), 0);
-
-        unsafe { env::remove_var("MULTI_VENUE_HELD_SHARES_MIN_NET_EDGE_BPS") };
     }
 
     #[test]
