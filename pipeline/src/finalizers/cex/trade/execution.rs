@@ -113,8 +113,8 @@ where
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
             let pending = self.prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
 
-            // The exchange enforces the limit with an IOC order. Only if the
-            // exchange refuses IOC outright does the slice go out as a market order.
+            // The exchange enforces the limit with an IOC order. If it refuses
+            // the IOC order, the slice fails and nothing trades without the limit.
             let sent = self
                 .backend
                 .execute_swap_detailed_with_options(

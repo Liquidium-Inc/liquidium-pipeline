@@ -44,15 +44,19 @@ fn parse_u32(v: &Value, key: &str) -> Option<u32> {
     v.get(key).and_then(|raw| raw.as_u64()).map(|v| v as u32)
 }
 
-/// Reads the advertised order types of one exchangeInfo symbol entry.
+/// The order types a slice can use: `LIMIT` for a priced slice (MEXC lists no
+/// IOC type; an IOC order is a limit order) and `MARKET` for an unpriced one.
+const REQUIRED_ORDER_TYPES: [&str; 2] = ["LIMIT", "MARKET"];
+
+/// The required order type the exchangeInfo symbol entry does not advertise.
 ///
 /// The live API always returns the list, so a missing list is treated as
 /// supported only to stay compatible with older or partial metadata.
-fn supports_market_orders(info: &Value) -> bool {
-    match info.get("orderTypes").and_then(Value::as_array) {
-        Some(types) => types.iter().any(|kind| kind.as_str() == Some("MARKET")),
-        None => true,
-    }
+fn missing_order_type(info: &Value) -> Option<&'static str> {
+    let types = info.get("orderTypes").and_then(Value::as_array)?;
+    REQUIRED_ORDER_TYPES
+        .into_iter()
+        .find(|required| !types.iter().any(|kind| kind.as_str() == Some(*required)))
 }
 
 impl MexcClient {
@@ -161,7 +165,7 @@ impl MexcClient {
             debug!("[mexc] resolved symbol filters {} -> {}", symbol, resolved_symbol);
         }
 
-        Self::validate_market_order_support(&info, &resolved_symbol)?;
+        Self::validate_order_type_support(&info, &resolved_symbol)?;
 
         let mut filters = Self::symbol_filters_from_info(&info);
         filters.resolved_symbol = Some(resolved_symbol.clone());
@@ -219,9 +223,9 @@ impl MexcClient {
 
     /// An order without a price limit is a MARKET order, so a listed market is
     /// only usable when its metadata advertises them. IOC is accepted unlisted.
-    pub(super) fn validate_market_order_support(info: &Value, symbol: &str) -> Result<(), String> {
-        if !supports_market_orders(info) {
-            return Err(format!("MEXC market {symbol} does not support MARKET orders"));
+    pub(super) fn validate_order_type_support(info: &Value, symbol: &str) -> Result<(), String> {
+        if let Some(missing) = missing_order_type(info) {
+            return Err(format!("MEXC market {symbol} does not support {missing} orders"));
         }
         Ok(())
     }
