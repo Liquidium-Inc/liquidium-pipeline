@@ -123,6 +123,21 @@ pub struct CexTradeState {
     /// rather than restarted by every retry.
     #[serde(default)]
     pub trade_settlement_waiting_since_ts: Option<i64>,
+    /// When the book first sat past the oracle bound in the current hold, so
+    /// a hold that lasts reaches an operator.
+    #[serde(default)]
+    pub trade_oracle_hold_since_ts: Option<i64>,
+    /// The share of oracle value the finished legs kept, so later legs get
+    /// only what is left of the route's oracle discount. `None` counts as 1.
+    #[serde(default)]
+    pub trade_oracle_route_keep: Option<f64>,
+    /// The current leg's fills valued at the oracle price, in its output asset.
+    #[serde(default)]
+    pub trade_progress_oracle_out: Option<f64>,
+    /// The oracle bound the pending order went out with, so its fill read
+    /// back after a restart is judged by the price it had to meet.
+    #[serde(default)]
+    pub trade_pending_oracle_bound: Option<f64>,
     /// Client order ids whose fills are already in the leg totals.
     ///
     /// MEXC answers a reused id with the original fill, so a reused id would
@@ -306,6 +321,10 @@ mod tests {
                 trade_inverse_retry_count: 0,
                 trade_unexecutable_residual_in: None,
                 trade_settlement_waiting_since_ts: None,
+                trade_oracle_hold_since_ts: None,
+                trade_oracle_route_keep: None,
+                trade_progress_oracle_out: None,
+                trade_pending_oracle_bound: None,
                 trade_applied_client_order_ids: Vec::new(),
             },
             withdraw: CexWithdrawState {

@@ -9,6 +9,7 @@ use crate::{
     config::ConfigTrait,
     context::PipelineContext,
     finalizers::cex::{finalizer::CexVenueFinalizer, profile::CexVenueProfile},
+    price_oracle::price_oracle::LiquidationPriceOracle,
     swappers::{
         kraken::KrakenClient,
         mexc::mexc_adapter::MexcClient,
@@ -44,7 +45,12 @@ fn build_cex_finalizer<C: CexBackend>(
     .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
     .with_outbound(ctx.trader_outbound.clone())
     .with_route_config(available_pairs, max_hops as usize)
-    .with_transport_impact_cap_bps(config.cex_max_price_impact_bps);
+    .with_transport_impact_cap_bps(config.cex_max_price_impact_bps)
+    // The same oracle and bound the planner holds each quote to.
+    .with_price_oracle(
+        Arc::new(LiquidationPriceOracle::new(ctx.agent.clone(), config.lending_canister)),
+        config.multi_venue_max_oracle_discount_bps,
+    );
     match bridge {
         Some(bridge) => finalizer.with_bridge_runtime(bridge),
         None => finalizer,
