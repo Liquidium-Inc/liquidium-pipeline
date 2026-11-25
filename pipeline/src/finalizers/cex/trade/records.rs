@@ -65,6 +65,8 @@ where
         state.trade.trade_leg_index = Some((leg_idx + 1) as u32);
         state.trade.trade_progress_remaining_in = None;
         state.trade.trade_progress_total_out = None;
+        // Clears the finished leg's oracle hold, so the next leg gets a full timeout.
+        state.trade.trade_oracle_hold_since_ts = None;
         // The leg's share of oracle value carries the rest of the route's discount.
         if let Some(at_oracle) = state.trade.trade_progress_oracle_out.take()
             && at_oracle > 0.0

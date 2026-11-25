@@ -236,6 +236,23 @@ async fn a_leg_that_beat_the_oracle_gives_the_next_no_extra_room() {
 }
 
 #[tokio::test]
+async fn a_leg_that_ends_with_nothing_left_clears_its_oracle_hold() {
+    // A leg saved with its input spent advances without trading; the next leg
+    // must not inherit the 20 minutes this one held.
+    let (finalizer, orders) = finalizer_with_bid(1.0);
+    let mut state = trade_state(&finalizer).await;
+    state.trade.trade_progress_remaining_in = Some(0.0);
+    state.trade.trade_progress_total_out = Some(1.0);
+    state.trade.trade_oracle_hold_since_ts = Some(now_ts() - 20 * 60);
+
+    finalizer.trade(&mut state).await.expect("the leg advances");
+
+    assert!(orders.lock().unwrap().is_empty());
+    assert_eq!(state.trade.trade_leg_index, Some(1));
+    assert_eq!(state.trade.trade_oracle_hold_since_ts, None);
+}
+
+#[tokio::test]
 async fn a_fill_past_both_limits_parks_before_the_slippage_error() {
     // 8% under the book and past the oracle bound: the plain slippage error
     // would let a retry find no input left and advance.
