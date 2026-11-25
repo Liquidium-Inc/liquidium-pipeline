@@ -91,7 +91,8 @@ the requested subaccount is preserved.
 
 Discovery and venue execution run independently but share `DB_PATH`. Accepting a
 liquidation records its receipt and creates execution work in one SQLite
-transaction. Interrupted submissions remain ambiguous rather than being replayed;
+transaction. Interrupted submissions remain ambiguous rather than being replayed
+(see [Recovery of an Interrupted Liquidation Call](#recovery-of-an-interrupted-liquidation-call));
 there is no second intake database, handoff importer or import cursor. The daemon
 lock is scoped to `DB_PATH`, and the TUI reads pause state from that same database.
 
@@ -216,7 +217,67 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 BOT_NAME=prod-liquidator
 LOW_BALANCE_THRESHOLDS=ckBTC=0.001,ckUSDT=100,ckUSDC=100,ICP=5,ETH=0.05
 BALANCE_CHECK_EXCLUDE=ckETH,ETH
+# Share payout: take the collateral as supply shares when the pool cannot pay tokens
+SHARE_PAYOUT_ENABLED=true
+SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS=500
 ```
+
+### Share Payout (collateral held as supply shares)
+
+A collateral pool without free liquidity cannot pay the seized collateral as tokens. Then the bot takes the collateral as supply shares of that pool and withdraws it later. Without this feature, the canister makes the liquidation smaller, or the liquidation fails after the deposit.
+
+| Setting | Meaning |
+|---|---|
+| `SHARE_PAYOUT_ENABLED` | Default `true`: resolve/register the default ICP account’s lending profile at startup and allow share payouts when pool liquidity is low. Set `false` for underlying-token payouts only, with no profile setup. Any value but `true` or `false` stops startup. |
+| `SHARE_PAYOUT_LIQUIDITY_MARGIN_BPS` | Default `500`. The bot asks for shares when the pool's free liquidity is below the expected seized collateral plus this margin. |
+
+How a row moves:
+
+1. Startup queries `get_wallet_profile` using the canonical ICRC address of the actual caller’s default ICP account. If missing, it calls `register_profile` with a short expiry and `IcpCaller` authentication (`principal` is the caller, `subaccount` is `None`); `AccountAlreadyLinked` triggers another lookup. Setup failures stop startup.
+2. A share request sets `collateral_share_receiver = Some(profile)`. It credits a lending position without a collateral token transfer, and the row becomes `held_shares`. Underlying payouts set it to `None` and populate `receiver_address` with the trader account when a swap follows, otherwise the main account.
+3. The bot reads the pool's liquidity, at most once per minute for a row that waits. When the pool can pay, it calls `withdraw` on the lending canister. The destination is the trader account when a swap follows, else the main account.
+4. The bot finds the payout on the ledger. Then the row goes to the normal swap flow with the amount that arrived.
+5. A held row swaps with the same floor as other rows: `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS`, or `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` when bad debt is on. If every venue gave a price and none meets the floor, the tokens go to the recovery account. If a venue gave no price, the bot tries again later.
+
+What to know:
+
+- The result’s `collateral_share_receiver` identifies the credited profile. It may be `None` when no shares were seized; the bot does not wait for a collateral transfer in that case. The canister never creates profiles during liquidation and checks ownership before and after asynchronous repayment.
+- Missing-profile and ownership errors stop new liquidation calls until the default ICP profile is repaired and the bot restarts. Existing settlement and withdrawals continue.
+- **No cap.** Nothing limits how much the bot holds as shares. A pool that stays empty can take the bot's debt tokens one liquidation after another. Watch the log lines `share_holding_total` and `share_holding_total_usd`, and the low-balance alerts.
+- **Price exposure.** The bot keeps the collateral's price risk while it waits. The shares earn supply interest, and the last held row of a pool collects it.
+- **The switch decides only new liquidations.** The bot withdraws rows that already hold shares, also when the switch is off.
+- **Operator rows.** `liquidator reconcile <id>` shows the state and names the action. The bot parks a row as `operator` in these cases:
+
+  | Case | What to check | Action |
+  |---|---|---|
+  | The outcome of a withdraw call is not known | Did the position of the liquidator's profile shrink? Is there a transfer from the pool to the destination? | `--landed <withdraw id>` if it ran (for example `withdraw_123`; the bot then looks for the payout), or `--absent` if it did not. A plain `--release` is refused, because it could withdraw twice. |
+  | A payout is not on the ledger after 60 minutes | The pool canister and its ledger | `--release` waits for the payout again. The bot does not withdraw again. |
+  | The position is empty, but the row still expects tokens | The position of the liquidator's profile in the pool, and the withdraws of that profile | `--absent` if the position is empty: the row goes to the swap with the amount that arrived. `--release` makes the bot look at the position again. |
+  | The credited profile differs from the requested profile, or nonzero collateral has no credited profile for a share request | The lending position and liquidation result | Reconcile the position and transfers before releasing the row. |
+
+  A parked row with an open withdraw blocks new withdraws from its pool until an operator answers it.
+- **Rollback.** An older binary reads the status `held_shares` as permanently failed and does not withdraw. Before you go back to an older version, let this version finish all held rows.
+- **Log events:** `share_holding_held`, `share_withdraw_accepted`, `share_withdraw_arrived`, `share_holding_released`. The `liquidation_outcome` line has `collateral_payout=shares` for these rows.
+
+### Recovery of an Interrupted Liquidation Call
+
+The bot saves a journal entry before each liquidation call. If the bot stops before the answer arrives, the entry has an unknown outcome (`ambiguous`). The canister possibly ran the liquidation, and the bot has no row for it. The bot never sends the call again.
+
+The recovery runs when the execution worker starts, and then one time each hour. It needs no setting. For each ambiguous entry:
+
+1. The bot reads the newest 200 transfers of the main account on the debt ledger. It looks for the offer transfer to the debt pool: the same amount, sent after the entry was saved, with the liquidation id in the memo.
+2. It ignores a liquidation id that already has a row.
+3. If exactly one transfer fits, the bot reads that liquidation from the lending canister. The debt asset and the collateral asset must agree with the saved request, and a share payout is accepted only if the request asked for shares.
+4. Then the bot makes the row, as for a normal answer. Collateral that the canister paid as shares gets the status `held_shares`, and the withdraw step continues from there.
+
+What to know:
+
+- **No transfer found.** The entry stays ambiguous, and the next run looks again. The ledger index can be behind.
+- **More than one transfer fits, or the canister data does not agree.** The entry stays ambiguous, and the log has a `[recovery] entry stays open` warning. An operator must look at it.
+- **A liquidation that failed in the canister.** The bot closes the entry as failed and makes no row.
+- **Age limit.** The recovery does not touch an entry that is older than 7 days. An operator possibly moved its collateral by hand already.
+- **Debt on an ICP ledger only.** An entry with a native SOL debt stays ambiguous.
+- **Log events:** `liquidation_recovered` for each recovered liquidation, and one summary line `Interrupted liquidation calls checked` with the counts `recovered`, `failed` and `open`. A recovered liquidation also sends a watchdog notice.
 
 ### Swap Configuration
 

@@ -14,6 +14,10 @@ pub struct LiquidationRequest {
     pub debt_amount: Nat,              // Amount of debt to repay
     pub receiver_address: Principal,   // Account that receives collateral and change
     pub buy_bad_debt: bool,
+    /// Credits collateral supply shares to this existing profile of the caller’s default ICP account.
+    /// Pays underlying tokens to `receiver_address` when absent.
+    #[serde(default)]
+    pub collateral_share_receiver: Option<Principal>,
 }
 
 pub trait Asset {
@@ -88,6 +92,59 @@ pub struct LiquidationResult {
     pub change_tx: TxStatus,
     pub collateral_tx: TxStatus,
     pub id: u128, // The liquidation id
+    /// Identifies the profile credited with collateral shares, or `None` when no shares were seized.
+    #[serde(default)]
+    pub collateral_share_receiver: Option<Principal>,
+}
+
+/// The destination of a lending `withdraw`. The bot uses only the `Native` kind of the canister.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum WithdrawDestination {
+    Native(Principal),
+}
+
+/// Identifies the signer of a lending request as the caller of the call.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct IcpCallerAuth {
+    pub principal: Principal,
+    pub subaccount: Option<Vec<u8>>,
+}
+
+/// The signature kinds of a lending request that the bot uses.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum LendingSignature {
+    IcpCaller(IcpCallerAuth),
+}
+
+/// A lending `withdraw` request. An `amount` of 0 withdraws the whole position.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LendingWithdrawRequest {
+    pub expiry_timestamp: u64, // Seconds since Unix epoch, at most 300 s ahead
+    pub account: WithdrawDestination,
+    pub pool_id: Principal,
+    pub amount: Nat,
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SignedLendingWithdraw {
+    pub data: LendingWithdrawRequest,
+    pub signature_info: LendingSignature,
+}
+
+/// The part of the canister's `OutflowDetails` that the bot reads.
+/// `id` is also the memo of the ledger transfer that pays the withdraw.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LendingOutflow {
+    pub id: String,
+    pub amount: Nat,
+}
+
+/// The part of the canister's `PositionView` that the bot reads.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LendingPositionView {
+    pub deposited_native_now: Nat,
+    /// The supply shares. Interest does not change this number.
+    pub deposit_scaled: Nat,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -100,12 +157,15 @@ pub enum TransferStatus {
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum SignatureVerificationError {
     InvalidEthSignature,
+    IcpCallerMismatch,
     UnsupportedChain,
     InvalidSolSignature,
     InvalidEthAddress,
+    AnonymousIcpCaller,
     CouldNotDecode(String),
     ProfileNotFound,
     InvalidBtcSignature,
+    InvalidIcpSubaccount,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -127,15 +187,16 @@ pub enum ProtocolError {
     HealthFactorTooLow,
     NoLiquidity,
     SignatureExpired,
-    PoolNotfound(String),
+    PoolNotFound(String),
     BorrowingDisabled,
+    SameAssetBorrowingDisabled,
     BorrowCapExceeded,
     PoolFrozen,
     TransferFailed(String),
     AccountAlreadyLinked,
     CannotRemoveSoleAccount,
     InsufficientFunds,
-    LiquidationNotfound(String),
+    LiquidationNotFound(String),
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -198,4 +259,55 @@ pub struct LiquidatebleUser {
     pub weighted_liquidation_threshold: Nat,  // Weighted liquidation threshold (bps)
     pub positions: Vec<LiquidateblePosition>, // The user's positions
     pub total_debt: Nat,                      // Users total debt in $
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct InitializeAccountRequest {
+    pub expiry_timestamp: u64,
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SignedInitializeAccountRequest {
+    pub data: InitializeAccountRequest,
+    pub signature_info: LendingSignature,
+}
+
+#[cfg(test)]
+mod share_payout_tests {
+    use super::*;
+    use candid::{Decode, Encode};
+
+    // Matches the liquidation request in lending.did at 334c66ac.
+    #[derive(CandidType, Deserialize)]
+    struct LendingRequest {
+        borrower: Principal,
+        debt_pool_id: Principal,
+        collateral_pool_id: Principal,
+        debt_amount: Nat,
+        receiver_address: Principal,
+        buy_bad_debt: bool,
+        collateral_share_receiver: Option<Principal>,
+    }
+
+    #[test]
+    fn both_payout_modes_encode_the_explicit_optional_profile() {
+        let profile = Principal::self_authenticating(b"lending profile");
+        let receiver = Principal::self_authenticating(b"token receiver");
+        for payout in [None, Some(profile)] {
+            let request = LiquidationRequest {
+                borrower: Principal::anonymous(),
+                debt_pool_id: Principal::management_canister(),
+                collateral_pool_id: Principal::management_canister(),
+                debt_amount: Nat::from(7u8),
+                receiver_address: receiver,
+                buy_bad_debt: false,
+                collateral_share_receiver: payout,
+            };
+            let wire = Decode!(&Encode!(&request).unwrap(), LendingRequest).unwrap();
+            assert_eq!(wire.collateral_share_receiver, payout);
+            assert_eq!(wire.receiver_address, receiver);
+            let decoded = Decode!(&Encode!(&wire).unwrap(), LiquidationRequest).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
 }

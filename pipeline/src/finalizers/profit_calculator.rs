@@ -29,10 +29,11 @@ impl ProfitCalculator for SimpleProfitCalculator {
         if req.debt_approval_needed {
             fee_total += req.debt_asset.fee();
         }
-        // The protocol returns the unspent debt in a second transfer, and its fee
-        // comes out of that change (liquidation 1614 was overstated by one fee).
+        // Adds the loss on the change, which is the smaller amount of the change and the fee.
+        // Example: the pool keeps all of a 0.001 ckUSDC change when the fee is 0.01 ckUSDC.
         if req.liquidation.debt_amount > liq.amounts.debt_repaid {
-            fee_total += req.debt_asset.fee();
+            let change = req.liquidation.debt_amount.clone() - liq.amounts.debt_repaid.clone();
+            fee_total += change.min(req.debt_asset.fee());
         }
 
         let receive_amount = match swap {
@@ -102,6 +103,7 @@ mod tests {
                 debt_amount: Nat::from(0u8),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
+                collateral_share_receiver: None,
             },
             swap_args: None,
             debt_asset,
@@ -134,6 +136,7 @@ mod tests {
                 tx_id: None,
                 status: TransferStatus::Success,
             },
+            collateral_share_receiver: None,
         }
     }
 
@@ -206,6 +209,22 @@ mod tests {
 
         let realized = SimpleProfitCalculator.realized(&req, &liq, Some(&swap_receiving(8_654_620)));
         assert_eq!(realized, 2_830_225);
+    }
+
+    /// The pool keeps a change that is not more than the fee. Thus the loss is the change, not the fee.
+    #[test]
+    fn realized_charges_only_the_change_when_it_is_below_the_fee() {
+        let ledger = Principal::anonymous();
+        let mut req = request(
+            icp_token("ckUSDC", 6, 10_000, ledger),
+            icp_token("ICP", 8, 10_000, ledger),
+        );
+        // The offer is the repaid debt plus a buffer of 1,000. The buffer is less than the fee of 10,000.
+        req.liquidation.debt_amount = Nat::from(5_815_395u64);
+        let liq = liquidation(416_949_805, 5_814_395);
+
+        let realized = SimpleProfitCalculator.realized(&req, &liq, Some(&swap_receiving(8_654_620)));
+        assert_eq!(realized, 2_829_225);
     }
 
     /// Audit L19: MEXC approval bumps are paid from the deposit reserve, so the

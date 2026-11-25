@@ -210,36 +210,14 @@ impl MultiVenueFinalizer {
         // No swap, transfer, or order side effect is submitted by `plan`.
         let state = match self.planner.plan(&input, now_ts()).await {
             Ok(state) => state,
-            Err(IcpswapFirstPlannerError::BelowVenueMinimum(reason)) => {
-                let recovery = self.recovery.as_ref().ok_or_else(|| {
-                    FinalizerError::Permanent(format!(
-                        "no venue can execute this amount and recovery sweep is unavailable: {reason}"
-                    ))
-                })?;
-                let destination = recovery_destination(&input.total_pay.token, &recovery.recovery_account)?;
-                let fee = input.total_pay.token.fee();
-                let amount = if input.total_pay.value > fee {
-                    input.total_pay.value.clone() - fee
-                } else {
-                    Nat::from(0u8)
-                };
-                let recovery_state = RecoverySweepState {
-                    liquidation_id: liquidation_id.clone(),
-                    reason: format!("no venue can execute this amount: {reason}"),
-                    amount: ChainTokenAmount::from_raw(input.total_pay.token.clone(), amount.clone()),
-                    destination,
-                    // Collateral that cannot pay its own transfer fee never
-                    // moves, so the sweep is finished the moment it is planned.
-                    status: if amount == 0u8 {
-                        RecoverySweepStatus::Completed
-                    } else {
-                        RecoverySweepStatus::ReadyToSubmit
-                    },
-                    txid: None,
-                    last_error: None,
-                };
+            // Collateral that no venue can take, or held collateral that would swap at a loss, leaves the swap path.
+            Err(
+                unroutable
+                @ (IcpswapFirstPlannerError::BelowVenueMinimum(_) | IcpswapFirstPlannerError::NotInProfit(_)),
+            ) => {
+                let recovery_state = self.recovery_sweep(&liquidation_id, &input.total_pay, &unroutable)?;
                 wrapper.finalizer_decision = Some(recovery_decision_snapshot(&recovery_state));
-                // The exact transfer is durable before the caller submits it.
+                // The bot saves the exact transfer before the caller sends it.
                 self.persist_state(wal, &mut row, &mut wrapper, recovery_state.clone())
                     .await?;
                 return Ok(LoadedFinalization {
@@ -270,6 +248,43 @@ impl MultiVenueFinalizer {
             wrapper,
             payload: FinalizerMetaPayload::MultiVenueSwap(state),
             freshly_planned: true,
+        })
+    }
+
+    /// Returns the transfer that moves collateral to the recovery account, when no swap may take it.
+    /// Fails when the bot has no recovery account, or when the collateral has no recovery destination.
+    fn recovery_sweep(
+        &self,
+        liquidation_id: &str,
+        collateral: &ChainTokenAmount,
+        reason: &IcpswapFirstPlannerError,
+    ) -> Result<RecoverySweepState, FinalizerError> {
+        let recovery = self
+            .recovery
+            .as_ref()
+            .ok_or_else(|| FinalizerError::Permanent(format!("{reason}; recovery sweep is unavailable")))?;
+        let destination = recovery_destination(&collateral.token, &recovery.recovery_account)?;
+        // The transfer pays one ledger fee from the collateral.
+        let fee = collateral.token.fee();
+        let amount = if collateral.value > fee {
+            collateral.value.clone() - fee
+        } else {
+            Nat::from(0u8)
+        };
+        // Collateral that cannot pay its own fee does not move. Its sweep is complete when it is planned.
+        let status = if amount == 0u8 {
+            RecoverySweepStatus::Completed
+        } else {
+            RecoverySweepStatus::ReadyToSubmit
+        };
+        Ok(RecoverySweepState {
+            liquidation_id: liquidation_id.to_string(),
+            reason: reason.to_string(),
+            amount: ChainTokenAmount::from_raw(collateral.token.clone(), amount),
+            destination,
+            status,
+            txid: None,
+            last_error: None,
         })
     }
 

@@ -131,6 +131,7 @@ impl TestWal {
                 version: FINALIZER_META_V2_VERSION,
                 payload: FinalizerMetaPayload::RecoverySweep(state),
             }),
+            share_holding: None,
         })
     }
 
@@ -654,6 +655,7 @@ fn receipt_with_id(liquidation_id: u128) -> ExecutionReceipt {
                 debt_amount: Nat::from(DEBT_REPAID),
                 receiver_address: Principal::anonymous(),
                 buy_bad_debt: false,
+                collateral_share_receiver: None,
             },
             swap_args: Some(SwapRequest {
                 pay_asset: collateral.asset_id(),
@@ -690,6 +692,7 @@ fn receipt_with_id(liquidation_id: u128) -> ExecutionReceipt {
                 tx_id: None,
                 status: TransferStatus::Success,
             },
+            collateral_share_receiver: None,
         }),
         status: ExecutionStatus::Success,
         change_received: true,
@@ -1429,6 +1432,93 @@ async fn bad_debt_below_minimum_edge_never_advances_a_venue_leg() {
     assert!(wal.wrapper().meta_v2.is_none(), "a rejected plan must not be committed");
 }
 
+/// A receipt of collateral that the bot held as supply shares and then withdrew.
+fn held_receipt(debt_repaid: Option<u64>) -> ExecutionReceipt {
+    let mut receipt = receipt();
+    let liquidation = receipt.liquidation_result.as_mut().expect("liquidation result");
+    liquidation.collateral_share_receiver = Some(Principal::management_canister());
+    if let Some(debt_repaid) = debt_repaid {
+        liquidation.amounts.debt_repaid = Nat::from(debt_repaid);
+    }
+    receipt
+}
+
+/// A held row below its bad-debt floor goes to the recovery account, and no venue swaps it.
+#[tokio::test]
+async fn held_collateral_below_its_floor_goes_to_recovery_and_is_not_swapped() {
+    // Every quote gives 200M for 250M of debt, which is -2,000 bps and below the -500 floor.
+    let mut receipt = held_receipt(Some(250_000_000));
+    receipt.request.liquidation.buy_bad_debt = true;
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer()
+        .withf(|_, _, amount| amount == &Nat::from(TOTAL_PAY - 10_000))
+        .times(1)
+        .returning(|_, _, _| Ok("recovery-block-9".to_string()));
+    let config = IcpswapFirstPlannerConfig {
+        bad_debt_min_net_edge_bps: -500,
+        ..planner_config()
+    };
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap.clone(), mexc.clone()], config)
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let completed = finalizer.finalize(&wal, receipt).await.expect("sweep to recovery");
+
+    assert!(completed.finalized);
+    assert_eq!(completed.swapper.as_deref(), Some("recovery"));
+    // Both venues gave a price, and the bot used neither.
+    assert_eq!(icpswap.previews(), 1);
+    assert_eq!(mexc.previews(), 1);
+    assert_eq!(icpswap.calls(), 0);
+    assert_eq!(mexc.calls(), 0);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.status, RecoverySweepStatus::Completed);
+    assert!(
+        state.reason.contains("held collateral is below its swap floor"),
+        "{}",
+        state.reason
+    );
+}
+
+#[tokio::test]
+async fn held_collateral_in_profit_is_planned_for_a_swap() {
+    let receipt = held_receipt(None);
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(0);
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap], planner_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    finalizer.finalize(&wal, receipt).await.expect("a swap plan");
+
+    let meta = wal.wrapper().meta_v2.expect("committed meta_v2");
+    assert!(matches!(meta.payload, FinalizerMetaPayload::MultiVenueSwap(_)));
+}
+
+/// Without a recovery account, a held row below its floor fails once and does not swap.
+#[tokio::test]
+async fn held_collateral_below_its_floor_without_a_recovery_account_fails_once() {
+    let receipt = held_receipt(Some(199_000_000));
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap.clone()]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("no swap below the floor");
+
+    assert!(matches!(error, FinalizerError::Permanent(_)), "{error:?}");
+    assert!(error.message().contains("held collateral is below its swap floor"));
+    assert_eq!(icpswap.calls(), 0);
+}
+
 /// Bad debt repays more than the collateral is worth by construction, so a
 /// non-negative floor strands it forever. A negative floor opts into recycling
 /// that collateral, and applies only to rows actually bought as bad debt.
@@ -1842,6 +1932,7 @@ async fn committed_legacy_state_is_rejected_without_being_upgraded() {
         profit_snapshot: None,
         venue_execution: None,
         meta_v2: None,
+        share_holding: None,
     };
     wrapper.venue_execution = Some(VenueExecutionState {
         venue: MEXC_VENUE_ID.to_string(),
@@ -2365,4 +2456,186 @@ async fn a_committed_plan_drops_the_route_search_strikes() {
     let mut strikes = 0;
     wal.update_row(ROW_ID, |row| strikes = row.error_count);
     assert_eq!(strikes, 1, "only the error after the commit counts");
+}
+
+mod share_row_reconcile {
+    use super::*;
+    use crate::operator::{ReconcileAction, ReconcileRequest};
+    use crate::outbound::driver::OperatorDecision;
+    use crate::persistance::{OpenWithdraw, ShareHolding};
+
+    fn parked(wrapper: LiqMetaWrapper) -> TestWal {
+        let wal = TestWal::with_wrapper(wrapper);
+        {
+            let mut guard = wal.row.lock().expect("WAL lock");
+            let row = guard.as_mut().expect("WAL row");
+            row.status = ResultStatus::OperatorRequired;
+            row.last_error = Some("parked".to_string());
+        }
+        wal
+    }
+
+    fn status(wal: &TestWal) -> ResultStatus {
+        wal.row.lock().expect("WAL lock").as_ref().expect("WAL row").status
+    }
+
+    fn request(receipt: &ExecutionReceipt, action: ReconcileAction) -> ReconcileRequest {
+        ReconcileRequest {
+            liq_id: liq_id_from_receipt(receipt).expect("liquidation id"),
+            leg_id: None,
+            action,
+        }
+    }
+
+    fn one_venue_finalizer() -> MultiVenueFinalizer {
+        finalizer(vec![Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()))])
+    }
+
+    fn share_request_receipt() -> ExecutionReceipt {
+        let mut receipt = receipt();
+        receipt.request.liquidation.collateral_share_receiver = Some(Principal::anonymous());
+        receipt
+    }
+
+    fn unknown_withdraw() -> OpenWithdraw {
+        OpenWithdraw::Submitting {
+            amount: Nat::from(40_000u64),
+            shares_before: Nat::from(777u64),
+            after_index: 5,
+            at: 1,
+        }
+    }
+
+    fn parked_holding(open: Option<OpenWithdraw>) -> (ExecutionReceipt, TestWal) {
+        let receipt = share_request_receipt();
+        let mut holding = ShareHolding::new(Principal::anonymous(), Principal::anonymous(), Nat::from(TOTAL_PAY), 1);
+        holding.open = open;
+        holding.next_try_at = i64::MAX;
+        let wal = parked(LiqMetaWrapper {
+            share_holding: Some(holding),
+            ..LiqMetaWrapper::new(receipt.clone())
+        });
+        (receipt, wal)
+    }
+
+    #[tokio::test]
+    async fn a_release_puts_held_shares_back_to_the_withdraw_step() {
+        let (receipt, wal) = parked_holding(None);
+        let finalizer = one_venue_finalizer();
+
+        let report = finalizer
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Show))
+            .await
+            .expect("show");
+        assert!(report.contains("held as shares"), "{report}");
+        assert_eq!(status(&wal), ResultStatus::OperatorRequired, "show changes nothing");
+
+        finalizer
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .expect("release");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert_eq!(wal.wrapper().share_holding.expect("share holding").next_try_at, 0);
+    }
+
+    /// A plain release would let the bot withdraw again, but the first withdraw possibly ran.
+    #[tokio::test]
+    async fn a_withdraw_with_an_unknown_outcome_needs_an_answer() {
+        let (receipt, wal) = parked_holding(Some(unknown_withdraw()));
+        let error = one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .unwrap_err();
+        assert!(error.contains("--landed"), "{error}");
+        assert_eq!(status(&wal), ResultStatus::OperatorRequired);
+        assert_eq!(
+            wal.wrapper().share_holding.expect("share holding").open,
+            Some(unknown_withdraw())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_absent_drops_the_withdraw_and_keeps_the_whole_amount_held() {
+        let (receipt, wal) = parked_holding(Some(unknown_withdraw()));
+        one_venue_finalizer()
+            .reconcile(
+                &wal,
+                &request(&receipt, ReconcileAction::Answer(OperatorDecision::Absent)),
+            )
+            .await
+            .expect("absent");
+        let holding = wal.wrapper().share_holding.expect("share holding");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert_eq!(holding.open, None);
+        assert_eq!(holding.remaining(), Nat::from(TOTAL_PAY));
+    }
+
+    #[tokio::test]
+    async fn the_answer_landed_counts_the_withdraw_and_waits_for_its_payout() {
+        let (receipt, wal) = parked_holding(Some(unknown_withdraw()));
+        let answer = ReconcileAction::Answer(OperatorDecision::Landed {
+            receipt: "withdraw_9".to_string(),
+        });
+        one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, answer))
+            .await
+            .expect("landed");
+        let holding = wal.wrapper().share_holding.expect("share holding");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert_eq!(holding.withdrawn, Nat::from(40_000u64));
+        assert!(matches!(
+            holding.open,
+            Some(OpenWithdraw::Accepted { ref outflow_id, ref amount, after_index: 5, .. })
+                if outflow_id == "withdraw_9" && *amount == Nat::from(40_000u64)
+        ));
+    }
+
+    /// The amount already left the position. Thus a release waits for the payout, without a new withdraw.
+    #[tokio::test]
+    async fn a_release_of_a_late_payout_waits_for_it_again() {
+        let late = OpenWithdraw::Accepted {
+            outflow_id: "withdraw_3".to_string(),
+            amount: Nat::from(40_000u64),
+            after_index: 5,
+            at: 1,
+        };
+        let (receipt, wal) = parked_holding(Some(late));
+        one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .expect("release");
+        let holding = wal.wrapper().share_holding.expect("share holding");
+        assert_eq!(status(&wal), ResultStatus::HeldAsShares);
+        assert!(matches!(
+            holding.open,
+            Some(OpenWithdraw::Accepted { ref outflow_id, at, .. }) if outflow_id == "withdraw_3" && at > 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_release_queues_a_row_whose_share_flag_the_canister_ignored() {
+        let receipt = share_request_receipt();
+        let wal = parked(LiqMetaWrapper::new(receipt.clone()));
+        let finalizer = one_venue_finalizer();
+
+        let report = finalizer
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .expect("release");
+        assert!(report.contains("paid the collateral as tokens"), "{report}");
+        assert_eq!(status(&wal), ResultStatus::Enqueued);
+    }
+
+    /// A row that never asked for shares keeps the existing rule: no swap state, no reconcile.
+    #[tokio::test]
+    async fn a_row_without_the_share_flag_is_not_released_this_way() {
+        let receipt = receipt();
+        let wal = parked(LiqMetaWrapper::new(receipt.clone()));
+        let error = one_venue_finalizer()
+            .reconcile(&wal, &request(&receipt, ReconcileAction::Release))
+            .await
+            .unwrap_err();
+        assert!(error.contains("no multi-venue swap state"), "{error}");
+        assert_eq!(status(&wal), ResultStatus::OperatorRequired);
+    }
 }

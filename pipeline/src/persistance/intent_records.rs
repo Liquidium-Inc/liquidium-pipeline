@@ -56,5 +56,7 @@ pub trait LiquidationIntentStore: Send + Sync {
     ) -> Result<()>;
     async fn mark_ambiguous(&self, intent_id: &str, error: &str, receipt: Option<ExecutionReceipt>) -> Result<()>;
     async fn recover_submitting_as_ambiguous(&self, reason: &str) -> Result<usize>;
+    /// Returns the entries whose call outcome the bot does not know, oldest first.
+    async fn list_ambiguous(&self) -> Result<Vec<LiquidationIntentRecord>>;
     async fn get_intent(&self, intent_id: &str) -> Result<Option<LiquidationIntentRecord>>;
 }

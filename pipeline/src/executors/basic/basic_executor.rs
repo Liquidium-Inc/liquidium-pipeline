@@ -48,6 +48,7 @@ pub struct BasicExecutor<A: PipelineAgent, D: LiquidationIntentStore + Sync + Se
     pub approval_state: Arc<ApprovalState>,
     /// Where a liquidation that may have run without a WAL row is reported.
     pub(crate) watchdog: Arc<dyn Watchdog>,
+    pub(crate) share_profile_failed: std::sync::atomic::AtomicBool,
     low_balance_allowance_warned_ledgers: Mutex<HashSet<Principal>>,
 }
 
@@ -66,6 +67,7 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
             intents,
             approval_state,
             watchdog: noop_watchdog(),
+            share_profile_failed: std::sync::atomic::AtomicBool::new(false),
             low_balance_allowance_warned_ledgers: Mutex::new(HashSet::new()),
         }
     }

@@ -244,6 +244,9 @@ pub struct IcpswapFirstPlanInput {
     /// than the collateral is worth by design, so it is held to its own edge
     /// floor rather than the profitable-liquidation one.
     pub buy_bad_debt: bool,
+    /// True when the bot held the collateral as supply shares and withdrew it later.
+    /// Below its floor, such a row goes to the recovery account when every venue gave a price.
+    pub held_as_shares: bool,
 }
 
 impl IcpswapFirstPlanInput {
@@ -298,6 +301,7 @@ impl IcpswapFirstPlanInput {
             receive_reference_price_ray,
             reference_price_captured_at: (receipt.request.ref_price_at > 0).then_some(receipt.request.ref_price_at),
             buy_bad_debt: receipt.request.liquidation.buy_bad_debt,
+            held_as_shares: liquidation.collateral_share_receiver.is_some(),
         };
         input.validate()?;
         Ok(input)
@@ -381,7 +385,7 @@ impl IcpswapFirstPlanInput {
 /// Converts a RAY-scaled receipt price into USD, or `None` when it cannot size a
 /// notional. Zero, negative, and values `to_f64` cannot represent (it saturates
 /// to infinity) are all absent prices, not cheap ones.
-pub(in crate::finalizers::multi_venue) fn reference_price_usd(ref_price_ray: &Nat) -> Option<f64> {
+pub(crate) fn reference_price_usd(ref_price_ray: &Nat) -> Option<f64> {
     let price = ref_price_ray.0.to_f64()? / RAY_PRICE_SCALE;
     (price.is_finite() && price > 0.0).then_some(price)
 }
@@ -470,6 +474,10 @@ pub enum IcpswapFirstPlannerError {
     /// overflow preview through a venue failure downgrade it to `NoViableRoute`.
     #[error("no venue can execute this amount: {0}")]
     BelowVenueMinimum(String),
+    /// Collateral that the bot held as supply shares would swap below its floor.
+    /// The caller moves it to the recovery account and does not try again.
+    #[error("held collateral is below its swap floor: {0}")]
+    NotInProfit(String),
 }
 
 /// Returns ICPSwap's refusal when its exact re-quote of a split leg failed. A later try can work.
@@ -863,7 +871,8 @@ impl IcpswapFirstPlanner {
         let reason = Self::overflow_reason(&overflow, |venue_id| MultiVenueAllocationReason::SingleVenue {
             venue_id,
         });
-        self.build_state(input, overflow, reason, quoted_at)
+        // ICPSwap does not carry this asset. Thus the overflow venues are all the venues.
+        self.build_state_final(input, overflow, reason, quoted_at)
     }
 
     /// Builds the plan from a candidate that includes ICPSwap. If its profit or
@@ -876,16 +885,24 @@ impl IcpswapFirstPlanner {
         allocation_reason: MultiVenueAllocationReason,
         quoted_at: i64,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
-        let rejected = match self.build_state(input, previews, allocation_reason, quoted_at) {
-            Err(IcpswapFirstPlannerError::NoViableRoute(reason)) if !self.overflow_venue_ids.is_empty() => reason,
+        let has_overflow = !self.overflow_venue_ids.is_empty();
+        let (rejected, first_not_in_profit) = match self.build_state_final(input, previews, allocation_reason, quoted_at)
+        {
+            Err(IcpswapFirstPlannerError::NoViableRoute(reason)) if has_overflow => (reason, false),
+            Err(IcpswapFirstPlannerError::NotInProfit(reason)) if has_overflow => (reason, true),
             built => return built,
         };
         let error = IcpswapFirstPlannerError::NoViableRoute(rejected.clone());
-        self.plan_full_overflow_without_icpswap(input, quoted_at, exact_quote_refusal(&error))
+        // Held collateral goes to recovery only when both plans have a price and neither is in profit.
+        // If the first plan failed for another reason, a new try can still find a route.
+        self.plan_full_overflow(input, quoted_at, exact_quote_refusal(&error), first_not_in_profit)
             .await
             .map_err(|fallback| match fallback {
                 IcpswapFirstPlannerError::NoViableRoute(reason) => {
                     IcpswapFirstPlannerError::NoViableRoute(format!("{rejected}; {reason}"))
+                }
+                IcpswapFirstPlannerError::NotInProfit(reason) => {
+                    IcpswapFirstPlannerError::NotInProfit(format!("{rejected}; {reason}"))
                 }
                 other => other,
             })
@@ -900,6 +917,19 @@ impl IcpswapFirstPlanner {
         quoted_at: i64,
         refusal: VenueAmountError,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        // ICPSwap gave no usable price here. Thus a held row below its floor gets a new try.
+        self.plan_full_overflow(input, quoted_at, refusal, false).await
+    }
+
+    /// Plans the whole amount on the overflow venues.
+    /// A held row below its floor goes to recovery only when `every_venue_priced` is true, else it gets a new try.
+    async fn plan_full_overflow(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        quoted_at: i64,
+        refusal: VenueAmountError,
+        every_venue_priced: bool,
+    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
         let overflow = self.full_amount_overflow(input, Some(refusal)).await?;
         let reason = Self::overflow_reason(&overflow, |selected_venue_id| {
             MultiVenueAllocationReason::VenueUnavailable {
@@ -907,7 +937,11 @@ impl IcpswapFirstPlanner {
                 unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
             }
         });
-        self.build_state(input, overflow, reason, quoted_at)
+        if every_venue_priced {
+            self.build_state_final(input, overflow, reason, quoted_at)
+        } else {
+            self.build_state(input, overflow, reason, quoted_at)
+        }
     }
 
     // Finds the largest safe ICPSwap leg, then either sends the remainder to
@@ -1321,9 +1355,26 @@ impl IcpswapFirstPlanner {
         )))
     }
 
+    /// Builds the plan, and returns `NoViableRoute` for a held row below its floor, so that the row gets a new try.
+    /// A caller that knows that every venue gave a price uses `build_state_final`.
+    fn build_state(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        previews: Vec<VenueRoutePreview>,
+        allocation_reason: MultiVenueAllocationReason,
+        quoted_at: i64,
+    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        self.build_state_final(input, previews, allocation_reason, quoted_at)
+            .map_err(|error| match error {
+                IcpswapFirstPlannerError::NotInProfit(reason) => IcpswapFirstPlannerError::NoViableRoute(reason),
+                other => other,
+            })
+    }
+
     // Converts selected previews into persisted legs, enforces the combined
     // conservative edge, and validates the complete execution state.
-    fn build_state(
+    // For a held row below its floor, it returns `NotInProfit`, which sends the row to recovery.
+    fn build_state_final(
         &self,
         input: &IcpswapFirstPlanInput,
         previews: Vec<VenueRoutePreview>,
@@ -1354,6 +1405,7 @@ impl IcpswapFirstPlanner {
         let combined_net_edge_bps = edge_bps(&net_receive, &input.debt_repaid)?;
 
         // Every quote is still held to the oracle by `validate_venue_preview`.
+        // A held row uses the same floor as other rows, because its debt is already repaid.
         let required_edge_bps = self.config.required_edge_bps(input.buy_bad_debt);
 
         if !meets_minimum_edge(&net_receive, &input.debt_repaid, required_edge_bps)? {
@@ -1405,10 +1457,15 @@ impl IcpswapFirstPlanner {
                     );
                 }
             }
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+            let reason = format!(
                 "combined conservative output has {:.2} bps edge, below required {} bps",
                 combined_net_edge_bps, required_edge_bps
-            )));
+            );
+            return Err(if input.held_as_shares {
+                IcpswapFirstPlannerError::NotInProfit(reason)
+            } else {
+                IcpswapFirstPlannerError::NoViableRoute(reason)
+            });
         }
 
         let state = MultiVenueExecutionState {

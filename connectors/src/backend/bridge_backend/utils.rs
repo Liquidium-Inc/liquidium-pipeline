@@ -39,7 +39,7 @@ pub(super) struct AccountTransactionsError {
 pub(super) type AccountTransactionsAnswer = Result<AccountTransactions, AccountTransactionsError>;
 
 /// The index canister of `ledger`, as the ledger itself declares it (ICRC-106).
-pub(super) async fn ledger_index<A: PipelineAgent + ?Sized>(agent: &A, ledger: Principal) -> Result<Principal, String> {
+pub async fn ledger_index<A: PipelineAgent + ?Sized>(agent: &A, ledger: Principal) -> Result<Principal, String> {
     let arg = Encode!().map_err(|error| error.to_string())?;
     let answer: Result<Principal, Icrc106Error> = agent
         .call_query(&ledger, "icrc106_get_index_principal", arg)
@@ -49,7 +49,7 @@ pub(super) async fn ledger_index<A: PipelineAgent + ?Sized>(agent: &A, ledger: P
 
 /// The newest `max_results` transactions of `account` with their block
 /// indexes, newest first, from the ledger's index canister.
-pub(super) async fn account_transactions<A: PipelineAgent + ?Sized>(
+pub async fn account_transactions<A: PipelineAgent + ?Sized>(
     agent: &A,
     index: Principal,
     account: &Account,
