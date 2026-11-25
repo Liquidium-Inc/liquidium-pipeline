@@ -458,6 +458,7 @@ fn receipt_input_uses_actual_collateral_received_not_estimated_swap_amount() {
             debt_ref_price: Nat::from(RAY),
             ref_price_at: 0,
             debt_approval_needed: false,
+            supply_funded: false,
             min_collateral_amount: Nat::from(0u8),
         },
         liquidation_result: Some(LiquidationResult {
@@ -481,6 +482,7 @@ fn receipt_input_uses_actual_collateral_received_not_estimated_swap_amount() {
         }),
         status: ExecutionStatus::Success,
         change_received: true,
+        collateral_held_as_supply: false,
     };
 
     let input = IcpswapFirstPlanInput::from_receipt(&receipt).expect("planner input");
@@ -2533,6 +2535,7 @@ async fn legacy_receipt_without_debt_oracle_price_skips_only_the_oracle_guard() 
             debt_ref_price: Nat::from(0u8),
             ref_price_at: 0,
             debt_approval_needed: false,
+            supply_funded: false,
             min_collateral_amount: Nat::from(0u8),
         },
         liquidation_result: Some(LiquidationResult {
@@ -2556,6 +2559,7 @@ async fn legacy_receipt_without_debt_oracle_price_skips_only_the_oracle_guard() 
         }),
         status: ExecutionStatus::Success,
         change_received: true,
+        collateral_held_as_supply: false,
     };
     let input = IcpswapFirstPlanInput::from_receipt(&receipt).expect("legacy planner input");
     assert_eq!(input.pay_reference_price_ray, None);

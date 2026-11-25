@@ -5,6 +5,7 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::liquidation::lending_queries::get_liquidation;
+use crate::liquidation::supply_funding::{claim_collateral, pool_free_liquidity};
 use crate::persistance::{LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::wal::{decode_receipt_wrapper, wal_save_receipt};
@@ -105,6 +106,10 @@ where
             self.update_receipt_meta(&row, &receipt, touch_meta).await?;
         }
 
+        if receipt.collateral_held_as_supply {
+            self.claim_held_collateral(&row, &mut receipt).await?;
+        }
+
         let liq = receipt
             .liquidation_result
             .as_ref()
@@ -127,6 +132,52 @@ where
             .await
             .map_err(|e| e.to_string())?;
         info!("[settlement] ✅ liq_id={} -> enqueued for finalization", liq.id);
+        Ok(())
+    }
+
+    /// Claims collateral that the liquidation left in the liquidator's supply, once the
+    /// collateral pool can pay it. The canister pays a liquidation out once, so a claim whose
+    /// answer was lost is simply asked again on the next pass.
+    async fn claim_held_collateral(&self, row: &LiqResultRecord, receipt: &mut ExecutionReceipt) -> Result<(), String> {
+        let Some(liq) = receipt.liquidation_result.clone() else {
+            return Ok(());
+        };
+        if !matches!(liq.collateral_tx.status, TransferStatus::Pending) {
+            return Ok(());
+        }
+
+        // Read-only check first, so an illiquid pool costs a query per pass and not an update call.
+        let needed = liq.amounts.collateral_received.clone() + receipt.request.collateral_asset.fee();
+        let pool = receipt.request.liquidation.collateral_pool_id;
+        match pool_free_liquidity(self.agent.as_ref(), &self.lending_canister, pool).await {
+            Ok(free) if free >= needed => {}
+            Ok(free) => {
+                info!(
+                    "[settlement] liq_id={} collateral stays supplied: pool has {free} free, {needed} needed",
+                    liq.id
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                warn!("[settlement] liq_id={} pool liquidity read failed: {err}", liq.id);
+                return Ok(());
+            }
+        }
+
+        match claim_collateral(self.agent.as_ref(), &self.lending_canister, liq.id).await {
+            Ok(Ok(fresh)) => {
+                info!("[settlement] liq_id={} held collateral claimed", liq.id);
+                if receipt.apply_pool_view(fresh) {
+                    self.update_receipt_meta(row, receipt, true).await?;
+                }
+            }
+            // Refused: nothing changed, so the next pass asks again.
+            Ok(Err(refusal)) => info!("[settlement] liq_id={} collateral claim refused: {refusal:?}", liq.id),
+            Err(reason) => warn!(
+                "[settlement] liq_id={} collateral claim got no answer: {reason}",
+                liq.id
+            ),
+        }
         Ok(())
     }
 
@@ -193,6 +244,7 @@ mod tests {
             debt_ref_price: Nat::from(0u8),
             ref_price_at: 0,
             debt_approval_needed: false,
+            supply_funded: false,
             min_collateral_amount: Nat::from(0u8),
         }
     }
@@ -279,6 +331,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
         let row_id = row.id.clone();
@@ -314,6 +367,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
         let row_id = row.id.clone();
@@ -350,6 +404,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt);
         let row_id = row.id.clone();
@@ -439,6 +494,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
         let row_id = row.id.clone();
@@ -479,6 +535,7 @@ mod tests {
                 liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
                 status: ExecutionStatus::Success,
                 change_received: true,
+                collateral_held_as_supply: false,
             },
         );
         let row_id = row.id.clone();
@@ -512,12 +569,14 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Pending)),
             status: ExecutionStatus::CollateralTransferFailed("pending".to_string()),
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let new_receipt = ExecutionReceipt {
             request: make_request(false, Some(make_swap_args())),
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
 
         let mut row = make_row(ResultStatus::WaitingCollateral, old_receipt.clone());
@@ -573,5 +632,151 @@ mod tests {
             .update_receipt_meta(&row, &new_receipt, true)
             .await
             .expect("receipt meta update should succeed");
+    }
+
+    mod held_collateral {
+        use super::*;
+        use crate::liquidation::supply_funding::LendingPoolView;
+        use liquidium_pipeline_core::types::protocol_types::AssetType;
+
+        const LIQ_ID: u128 = 77;
+        const NET_COLLATERAL: u64 = 500_000;
+        const FEE: u64 = 1_000;
+
+        fn held_result(collateral: TransferStatus) -> LiquidationResult {
+            let mut liq = make_liq_result(LIQ_ID, collateral);
+            liq.amounts.collateral_received = Nat::from(NET_COLLATERAL);
+            liq
+        }
+
+        fn held_row() -> LiqResultRecord {
+            let receipt = ExecutionReceipt {
+                request: make_request(false, Some(make_swap_args())),
+                liquidation_result: Some(held_result(TransferStatus::Pending)),
+                status: ExecutionStatus::CollateralTransferFailed("collateral pending".to_string()),
+                change_received: true,
+                collateral_held_as_supply: true,
+            };
+            make_row(ResultStatus::WaitingCollateral, receipt)
+        }
+
+        /// An agent whose lending canister still shows the collateral leg pending, and whose
+        /// collateral pool has `free` cash.
+        fn agent_with_pool_liquidity(free: u64) -> MockPipelineAgent {
+            let ray = Nat::from(1_000_000_000_000_000_000_000_000_000u128);
+            let mut agent = MockPipelineAgent::new();
+            agent
+                .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
+                .returning(|_, _, _| Ok(Ok(held_result(TransferStatus::Pending))));
+            agent
+                .expect_call_query::<Vec<LendingPoolView>>()
+                .returning(move |_, _, _| {
+                    Ok(vec![LendingPoolView {
+                        principal: Principal::anonymous(),
+                        asset_type: AssetType::Unknown,
+                        // One unit above `free`: the debt side is rounded up by one.
+                        total_supply_at_last_sync: Nat::from(1_000_000u64 + free + 1),
+                        total_debt_at_last_sync: Nat::from(1_000_000u64),
+                        lending_index: ray.clone(),
+                        borrow_index: ray.clone(),
+                    }])
+                });
+            agent
+        }
+
+        #[tokio::test]
+        async fn held_collateral_is_claimed_once_the_pool_is_liquid() {
+            // given a pool that can pay the collateral plus its transfer fee
+            let row = held_row();
+            let row_id = row.id.clone();
+            let mut wal = MockWalStore::new();
+            expect_pages(&mut wal, vec![row], vec![]);
+            wal.expect_upsert_result().times(1).returning(|row| {
+                let receipt = decode_receipt_wrapper(&row).unwrap().unwrap().receipt;
+                let liq = receipt.liquidation_result.unwrap();
+                assert!(matches!(liq.collateral_tx.status, TransferStatus::Success));
+                assert_eq!(liq.amounts.collateral_received, Nat::from(NET_COLLATERAL - 7));
+                Ok(())
+            });
+            wal.expect_update_status()
+                .with(eq(row_id), eq(ResultStatus::Enqueued), eq(true))
+                .times(1)
+                .returning(|_, _, _| Ok(()));
+
+            let mut agent = agent_with_pool_liquidity(NET_COLLATERAL + FEE);
+            let args = Encode!(&LIQ_ID).unwrap();
+            agent
+                .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+                .with(eq(Principal::anonymous()), eq("claim_liquidation_collateral"), eq(args))
+                .times(1)
+                .returning(|_, _, _| {
+                    // The canister reports what it actually paid out.
+                    let mut paid = held_result(TransferStatus::Success);
+                    paid.amounts.collateral_received = Nat::from(NET_COLLATERAL - 7);
+                    Ok(Ok(paid))
+                });
+
+            // when
+            let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
+            watcher.tick().await.expect("tick should succeed");
+        }
+
+        #[tokio::test]
+        async fn held_collateral_is_not_claimed_while_the_pool_is_illiquid() {
+            // given a pool one unit short
+            let mut wal = MockWalStore::new();
+            expect_pages(&mut wal, vec![held_row()], vec![]);
+            wal.expect_upsert_result().times(0);
+            wal.expect_update_status().times(0);
+            let mut agent = agent_with_pool_liquidity(NET_COLLATERAL + FEE - 1);
+            agent
+                .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+                .times(0);
+
+            // when / then the row keeps waiting and no update call is made
+            let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
+            watcher.tick().await.expect("tick should succeed");
+        }
+
+        #[tokio::test]
+        async fn a_claim_without_an_answer_leaves_the_row_waiting_for_the_next_pass() {
+            // given
+            let mut wal = MockWalStore::new();
+            expect_pages(&mut wal, vec![held_row()], vec![]);
+            wal.expect_upsert_result().times(0);
+            wal.expect_update_status().times(0);
+            let mut agent = agent_with_pool_liquidity(NET_COLLATERAL + FEE);
+            agent
+                .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+                .times(1)
+                .returning(|_, _, _| Err("request timed out".to_string()));
+
+            // when / then nothing is recorded; the canister pays once however often it is asked
+            let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
+            watcher.tick().await.expect("tick should succeed");
+        }
+
+        #[tokio::test]
+        async fn an_ordinary_pending_collateral_transfer_is_never_claimed() {
+            // given a cash payout that is still in flight
+            let mut row_receipt = decode_receipt_wrapper(&held_row()).unwrap().unwrap().receipt;
+            row_receipt.collateral_held_as_supply = false;
+            let mut wal = MockWalStore::new();
+            expect_pages(
+                &mut wal,
+                vec![make_row(ResultStatus::WaitingCollateral, row_receipt)],
+                vec![],
+            );
+            wal.expect_upsert_result().times(0);
+            wal.expect_update_status().times(0);
+            let mut agent = MockPipelineAgent::new();
+            agent
+                .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
+                .returning(|_, _, _| Ok(Ok(held_result(TransferStatus::Pending))));
+
+            // when / then no liquidity read and no claim happen
+            let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
+            watcher.tick().await.expect("tick should succeed");
+        }
     }
 }

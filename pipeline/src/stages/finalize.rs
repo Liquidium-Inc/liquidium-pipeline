@@ -838,6 +838,7 @@ mod tests {
             debt_ref_price: Nat::from(0u8),
             ref_price_at: 0,
             debt_approval_needed: false,
+            supply_funded: false,
             min_collateral_amount: Nat::from(0u8),
         }
     }
@@ -885,6 +886,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         }
     }
 
@@ -1490,6 +1492,7 @@ mod tests {
             liquidation_result: Some(initial_liq.clone()),
             status: ExecutionStatus::CollateralTransferFailed("collateral pending".to_string()),
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(liq_id, receipt.clone());
         let row_pending = row.clone();
@@ -1546,6 +1549,7 @@ mod tests {
             liquidation_result: Some(initial_liq.clone()),
             status: ExecutionStatus::CollateralTransferFailed("collateral pending".to_string()),
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(liq_id, receipt.clone());
         let row_pending = row.clone();
@@ -1612,6 +1616,7 @@ mod tests {
             liquidation_result: Some(initial_liq),
             status: ExecutionStatus::Success,
             change_received: false,
+            collateral_held_as_supply: false,
         };
         let row = make_row(liq_id, receipt.clone());
         let row_pending = row.clone();
@@ -1870,12 +1875,14 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Pending, 0)),
             status: ExecutionStatus::CollateralTransferFailed("pending".to_string()),
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let new_receipt = ExecutionReceipt {
             request: make_request(),
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Pending, 1)),
             status: ExecutionStatus::CollateralTransferFailed("pending".to_string()),
             change_received: true,
+            collateral_held_as_supply: false,
         };
 
         let mut row = LiqResultRecord {
@@ -1952,6 +1959,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(liq_id, receipt.clone());
         let row_for_pending = row.clone();
@@ -2005,6 +2013,7 @@ mod tests {
             liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
             status: ExecutionStatus::Success,
             change_received: true,
+            collateral_held_as_supply: false,
         };
         let row = make_row(liq_id, receipt.clone());
         let row_for_pending = row.clone();
